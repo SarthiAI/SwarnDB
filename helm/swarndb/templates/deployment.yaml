@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "swarndb.fullname" . }}
+  labels:
+    {{- include "swarndb.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "swarndb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.auth.enabled }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "swarndb.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+              protocol: TCP
+            - name: rest
+              containerPort: {{ .Values.service.restPort }}
+              protocol: TCP
+          env:
+            - name: SWARNDB_HOST
+              value: "0.0.0.0"
+            - name: SWARNDB_GRPC_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: grpc-port
+            - name: SWARNDB_REST_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: rest-port
+            - name: SWARNDB_DATA_DIR
+              value: /data
+            - name: SWARNDB_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: log-level
+            - name: SWARNDB_MAX_CONNECTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-connections
+            {{- if .Values.auth.enabled }}
+            - name: SWARNDB_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: api-keys
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: rest
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: rest
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: rest
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "swarndb.fullname" . }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

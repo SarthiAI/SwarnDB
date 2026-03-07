@@ -1,0 +1,50 @@
+SwarnDB has been deployed successfully!
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+1. Get the application endpoints:
+
+{{- if eq .Values.service.type "ClusterIP" }}
+
+  # gRPC endpoint (port-forward)
+  kubectl port-forward svc/{{ include "swarndb.fullname" . }} {{ .Values.service.grpcPort }}:{{ .Values.service.grpcPort }} -n {{ .Release.Namespace }}
+
+  # REST endpoint (port-forward)
+  kubectl port-forward svc/{{ include "swarndb.fullname" . }} {{ .Values.service.restPort }}:{{ .Values.service.restPort }} -n {{ .Release.Namespace }}
+
+{{- else if eq .Values.service.type "NodePort" }}
+
+  export NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+  echo "gRPC: $NODE_IP:$(kubectl get svc {{ include "swarndb.fullname" . }} -o jsonpath='{.spec.ports[?(@.name=="grpc")].nodePort}')"
+  echo "REST: $NODE_IP:$(kubectl get svc {{ include "swarndb.fullname" . }} -o jsonpath='{.spec.ports[?(@.name=="rest")].nodePort}')"
+
+{{- else if eq .Values.service.type "LoadBalancer" }}
+
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+  kubectl get svc {{ include "swarndb.fullname" . }} -n {{ .Release.Namespace }} -w
+
+{{- end }}
+
+2. Verify the deployment:
+
+  kubectl get pods -l app.kubernetes.io/name={{ include "swarndb.name" . }} -n {{ .Release.Namespace }}
+
+3. Check health:
+
+  curl http://localhost:{{ .Values.service.restPort }}/healthz
+
+{{- if .Values.auth.enabled }}
+
+4. Authentication is ENABLED. Use the configured API keys in the X-API-Key header.
+{{- end }}
+
+{{- if .Values.persistence.enabled }}
+
+5. Persistent storage is ENABLED ({{ .Values.persistence.size }}).
+{{- end }}
+
+{{- if .Values.autoscaling.enabled }}
+
+6. Autoscaling is ENABLED ({{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas).
+{{- end }}

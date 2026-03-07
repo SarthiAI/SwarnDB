@@ -1,0 +1,36 @@
+syntax = "proto3";
+package swarndb.v1;
+
+message Vector {
+  repeated float values = 1;
+}
+
+message Metadata {
+  map<string, MetadataValue> fields = 1;
+}
+
+message MetadataValue {
+  oneof value {
+    string string_value = 1;
+    int64 int_value = 2;
+    double float_value = 3;
+    bool bool_value = 4;
+    StringList string_list_value = 5;
+  }
+}
+
+message StringList {
+  repeated string values = 1;
+}
+
+message RelatedEdge {
+  uint64 target_id = 1;
+  float similarity = 2;
+}
+
+message ScoredResult {
+  uint64 id = 1;
+  float score = 2;
+  Metadata metadata = 3;
+  repeated RelatedEdge graph_edges = 4;
+}

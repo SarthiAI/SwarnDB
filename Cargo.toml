@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vf-core",
+    "crates/vf-storage",
+    "crates/vf-index",
+    "crates/vf-query",
+    "crates/vf-quantization",
+    "crates/vf-graph",
+    "crates/vf-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Chirotpal Das"]
+license = "BSL-1.1"
+publish = false
+
+[workspace.dependencies]
+# Core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+thiserror = "2"
+anyhow = "1"
+
+# Numeric / Collections
+ordered-float = "4"
+num-traits = "0.2"
+half = { version = "2", features = ["serde"] }
+bitflags = "2"
+dashmap = "6"
+
+# Concurrency
+parking_lot = "0.12"
+crossbeam = "0.8"
+rayon = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Networking
+tonic = "0.12"
+prost = "0.13"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
+
+# Storage
+memmap2 = "0.9"
+crc32fast = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
+
+# Data structures
+roaring = "0.10"
+
+# Build / Codegen
+tonic-build = "0.12"
+prost-build = "0.13"
+
+# Testing / Benchmarks
+rand = "0.8"
+tempfile = "3"
+criterion = "0.5"
+
+[profile.release]
+debug = true  # Enable debug symbols for flamegraph
+
+[profile.bench]
+debug = true

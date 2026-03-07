@@ -1,0 +1,21 @@
+[package]
+name = "vf-query"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Query planning, filtering, and scoring for SwarnDB"
+
+[dependencies]
+vf-core = { path = "../vf-core" }
+vf-index = { path = "../vf-index" }
+ordered-float = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+roaring = { workspace = true }
+rayon = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

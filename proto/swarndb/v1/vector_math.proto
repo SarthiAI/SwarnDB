@@ -1,0 +1,175 @@
+syntax = "proto3";
+package swarndb.v1;
+
+import "swarndb/v1/common.proto";
+
+service VectorMathService {
+  rpc DetectGhosts(DetectGhostsRequest) returns (DetectGhostsResponse);
+  rpc ConeSearch(ConeSearchRequest) returns (ConeSearchResponse);
+  rpc ComputeCentroid(ComputeCentroidRequest) returns (ComputeCentroidResponse);
+  rpc Interpolate(InterpolateRequest) returns (InterpolateResponse);
+  rpc DetectDrift(DetectDriftRequest) returns (DetectDriftResponse);
+  rpc Cluster(ClusterRequest) returns (ClusterResponse);
+  rpc ReduceDimensions(ReduceDimensionsRequest) returns (ReduceDimensionsResponse);
+  rpc ComputeAnalogy(ComputeAnalogyRequest) returns (ComputeAnalogyResponse);
+  rpc DiversitySample(DiversitySampleRequest) returns (DiversitySampleResponse);
+}
+
+// Ghost detection
+message DetectGhostsRequest {
+  string collection = 1;
+  float threshold = 2;
+  repeated Vector centroids = 3;  // if empty, auto-cluster with k
+  uint32 auto_k = 4;  // k for auto-clustering, default 8
+  string metric = 5;  // "euclidean", "cosine", etc.
+}
+
+message GhostVector {
+  uint64 id = 1;
+  float isolation_score = 2;
+}
+
+message DetectGhostsResponse {
+  repeated GhostVector ghosts = 1;
+  uint64 compute_time_us = 2;
+}
+
+// Cone search
+message ConeSearchRequest {
+  string collection = 1;
+  Vector direction = 2;
+  float aperture_radians = 3;
+}
+
+message ConeSearchResult {
+  uint64 id = 1;
+  float cosine_similarity = 2;
+  float angle_radians = 3;
+}
+
+message ConeSearchResponse {
+  repeated ConeSearchResult results = 1;
+  uint64 compute_time_us = 2;
+}
+
+// Centroid
+message ComputeCentroidRequest {
+  string collection = 1;
+  repeated uint64 vector_ids = 2;  // if empty, use all vectors
+  repeated float weights = 3;  // if empty, unweighted
+}
+
+message ComputeCentroidResponse {
+  Vector centroid = 1;
+  uint64 compute_time_us = 2;
+}
+
+// Interpolation
+message InterpolateRequest {
+  Vector a = 1;
+  Vector b = 2;
+  float t = 3;
+  string method = 4;  // "lerp" or "slerp"
+  uint32 sequence_count = 5;  // if > 0, generate sequence of n points
+}
+
+message InterpolateResponse {
+  repeated Vector results = 1;  // single result or sequence
+  uint64 compute_time_us = 2;
+}
+
+// Drift detection
+message DetectDriftRequest {
+  string collection = 1;
+  repeated uint64 window1_ids = 2;
+  repeated uint64 window2_ids = 3;
+  string metric = 4;
+  float threshold = 5;  // optional, if set returns has_drifted
+}
+
+message DetectDriftResponse {
+  float centroid_shift = 1;
+  float mean_distance_window1 = 2;
+  float mean_distance_window2 = 3;
+  float spread_change = 4;
+  bool has_drifted = 5;
+  uint64 compute_time_us = 6;
+}
+
+// Clustering
+message ClusterRequest {
+  string collection = 1;
+  uint32 k = 2;
+  uint32 max_iterations = 3;
+  float tolerance = 4;
+  string metric = 5;
+}
+
+message ClusterAssignmentProto {
+  uint64 id = 1;
+  uint32 cluster = 2;
+  float distance_to_centroid = 3;
+}
+
+message ClusterResponse {
+  repeated Vector centroids = 1;
+  repeated ClusterAssignmentProto assignments = 2;
+  uint32 iterations = 3;
+  bool converged = 4;
+  uint64 compute_time_us = 5;
+}
+
+// PCA
+message ReduceDimensionsRequest {
+  string collection = 1;
+  uint32 n_components = 2;
+  repeated uint64 vector_ids = 3;  // if empty, use all
+}
+
+message ReduceDimensionsResponse {
+  repeated Vector components = 1;
+  repeated float explained_variance = 2;
+  Vector mean = 3;
+  repeated Vector projected = 4;
+  uint64 compute_time_us = 5;
+}
+
+// Analogy
+message ComputeAnalogyRequest {
+  Vector a = 1;
+  Vector b = 2;
+  Vector c = 3;
+  bool normalize = 4;
+  // OR general arithmetic
+  repeated ArithmeticTerm terms = 5;
+}
+
+message ArithmeticTerm {
+  Vector vector = 1;
+  float weight = 2;
+}
+
+message ComputeAnalogyResponse {
+  Vector result = 1;
+  uint64 compute_time_us = 2;
+}
+
+// Diversity sampling
+message DiversitySampleRequest {
+  string collection = 1;
+  Vector query = 2;
+  uint32 k = 3;
+  float lambda = 4;  // 0.0 = pure diversity, 1.0 = pure relevance
+  repeated uint64 candidate_ids = 5;  // if empty, use all
+}
+
+message DiversitySampleResult {
+  uint64 id = 1;
+  float relevance_score = 2;
+  float mmr_score = 3;
+}
+
+message DiversitySampleResponse {
+  repeated DiversitySampleResult results = 1;
+  uint64 compute_time_us = 2;
+}

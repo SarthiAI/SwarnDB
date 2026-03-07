@@ -1,0 +1,63 @@
+syntax = "proto3";
+package swarndb.v1;
+
+import "swarndb/v1/common.proto";
+
+service SearchService {
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc BatchSearch(BatchSearchRequest) returns (BatchSearchResponse);
+}
+
+message FilterExpression {
+  oneof filter {
+    AndFilter and = 1;
+    OrFilter or = 2;
+    NotFilter not = 3;
+    FieldFilter field = 4;
+  }
+}
+
+message AndFilter {
+  repeated FilterExpression filters = 1;
+}
+
+message OrFilter {
+  repeated FilterExpression filters = 1;
+}
+
+message NotFilter {
+  FilterExpression filter = 1;
+}
+
+message FieldFilter {
+  string field = 1;
+  string op = 2;  // "eq", "ne", "gt", "gte", "lt", "lte", "in", "between", "exists", "contains"
+  MetadataValue value = 3;
+  repeated MetadataValue values = 4;  // for "in" and "between" ops
+}
+
+message SearchRequest {
+  string collection = 1;
+  Vector query = 2;
+  uint32 k = 3;
+  FilterExpression filter = 4;
+  string strategy = 5;  // "auto", "pre_filter", "post_filter"
+  bool include_metadata = 6;
+  bool include_graph = 7;
+  float graph_threshold = 8;
+  uint32 max_graph_edges = 9;
+}
+
+message SearchResponse {
+  repeated ScoredResult results = 1;
+  uint64 search_time_us = 2;
+}
+
+message BatchSearchRequest {
+  repeated SearchRequest queries = 1;
+}
+
+message BatchSearchResponse {
+  repeated SearchResponse results = 1;
+  uint64 total_time_us = 2;
+}

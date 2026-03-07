@@ -1,0 +1,72 @@
+# SwarnDB Helm Chart - Default Values
+
+# Container image configuration
+image:
+  repository: swarndb
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Number of replicas
+replicaCount: 1
+
+# Image pull secrets for private registries
+imagePullSecrets: []
+
+# Override chart name
+nameOverride: ""
+fullnameOverride: ""
+
+# Service configuration
+service:
+  type: ClusterIP
+  grpcPort: 50051
+  restPort: 8080
+
+# Resource requests and limits
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+# Persistent volume configuration
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilization: 70
+
+# SwarnDB configuration
+config:
+  logLevel: info
+  maxConnections: 1000
+  requestTimeoutMs: 30000
+
+# Authentication
+auth:
+  enabled: false
+  apiKeys: []
+
+# Pod scheduling constraints
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod annotations
+podAnnotations: {}
+
+# Service account
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}

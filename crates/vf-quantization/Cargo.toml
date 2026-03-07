@@ -1,0 +1,25 @@
+[package]
+name = "vf-quantization"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Quantization codecs (scalar, product, binary) for SwarnDB"
+
+[dependencies]
+vf-core = { path = "../vf-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "quantization"
+harness = false

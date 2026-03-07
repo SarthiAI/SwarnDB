@@ -1,0 +1,60 @@
+syntax = "proto3";
+package swarndb.v1;
+
+import "swarndb/v1/common.proto";
+
+service VectorService {
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Get(GetVectorRequest) returns (GetVectorResponse);
+  rpc Update(UpdateRequest) returns (UpdateResponse);
+  rpc Delete(DeleteVectorRequest) returns (DeleteVectorResponse);
+  rpc BulkInsert(stream InsertRequest) returns (BulkInsertResponse);
+}
+
+message InsertRequest {
+  string collection = 1;
+  Vector vector = 2;
+  Metadata metadata = 3;
+  uint64 id = 4;  // 0 = auto-assign
+}
+
+message InsertResponse {
+  uint64 id = 1;
+  bool success = 2;
+}
+
+message GetVectorRequest {
+  string collection = 1;
+  uint64 id = 2;
+}
+
+message GetVectorResponse {
+  uint64 id = 1;
+  Vector vector = 2;
+  Metadata metadata = 3;
+}
+
+message UpdateRequest {
+  string collection = 1;
+  uint64 id = 2;
+  optional Vector vector = 3;
+  Metadata metadata = 4;
+}
+
+message UpdateResponse {
+  bool success = 1;
+}
+
+message DeleteVectorRequest {
+  string collection = 1;
+  uint64 id = 2;
+}
+
+message DeleteVectorResponse {
+  bool success = 1;
+}
+
+message BulkInsertResponse {
+  uint64 inserted_count = 1;
+  repeated string errors = 2;
+}

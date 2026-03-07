@@ -1,0 +1,50 @@
+syntax = "proto3";
+package swarndb.v1;
+
+import "swarndb/v1/common.proto";
+
+service CollectionService {
+  rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+  rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
+  rpc GetCollection(GetCollectionRequest) returns (GetCollectionResponse);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+}
+
+message CreateCollectionRequest {
+  string name = 1;
+  uint32 dimension = 2;
+  string distance_metric = 3;  // "cosine", "euclidean", "dot_product", "manhattan"
+  float default_threshold = 4;
+  uint64 max_vectors = 5;
+}
+
+message CreateCollectionResponse {
+  string name = 1;
+  bool success = 2;
+}
+
+message DeleteCollectionRequest {
+  string name = 1;
+}
+
+message DeleteCollectionResponse {
+  bool success = 1;
+}
+
+message GetCollectionRequest {
+  string name = 1;
+}
+
+message GetCollectionResponse {
+  string name = 1;
+  uint32 dimension = 2;
+  string distance_metric = 3;
+  uint64 vector_count = 4;
+  float default_threshold = 5;
+}
+
+message ListCollectionsRequest {}
+
+message ListCollectionsResponse {
+  repeated GetCollectionResponse collections = 1;
+}

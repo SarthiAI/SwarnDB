@@ -1,0 +1,35 @@
+[package]
+name = "vf-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "gRPC and REST server for SwarnDB"
+
+[dependencies]
+vf-core = { path = "../vf-core" }
+vf-storage = { path = "../vf-storage" }
+vf-index = { path = "../vf-index" }
+vf-query = { path = "../vf-query" }
+vf-graph = { path = "../vf-graph" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

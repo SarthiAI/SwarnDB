@@ -1,0 +1,16 @@
+target/
+.git/
+.gitignore
+.github/
+*.md
+LICENSE
+tests/
+benches/
+examples/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Dockerfile
+.dockerignore

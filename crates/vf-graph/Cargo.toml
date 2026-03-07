@@ -1,0 +1,21 @@
+[package]
+name = "vf-graph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Virtual graph layer for similarity-based vector relationships in SwarnDB"
+
+[dependencies]
+vf-core = { path = "../vf-core" }
+vf-index = { path = "../vf-index" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }

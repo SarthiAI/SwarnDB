@@ -1,0 +1,55 @@
+syntax = "proto3";
+package swarndb.v1;
+
+import "swarndb/v1/common.proto";
+
+service GraphService {
+  rpc GetRelated(GetRelatedRequest) returns (GetRelatedResponse);
+  rpc Traverse(TraverseRequest) returns (TraverseResponse);
+  rpc SetThreshold(SetThresholdRequest) returns (SetThresholdResponse);
+}
+
+message GetRelatedRequest {
+  string collection = 1;
+  uint64 vector_id = 2;
+  float threshold = 3;
+  uint32 max_results = 4;
+}
+
+message GraphEdge {
+  uint64 target_id = 1;
+  float similarity = 2;
+}
+
+message GetRelatedResponse {
+  repeated GraphEdge edges = 1;
+}
+
+message TraverseRequest {
+  string collection = 1;
+  uint64 start_id = 2;
+  uint32 depth = 3;
+  float threshold = 4;
+  uint32 max_results = 5;
+}
+
+message TraversalNode {
+  uint64 id = 1;
+  uint32 depth = 2;
+  float path_similarity = 3;
+  repeated uint64 path = 4;
+}
+
+message TraverseResponse {
+  repeated TraversalNode nodes = 1;
+}
+
+message SetThresholdRequest {
+  string collection = 1;
+  uint64 vector_id = 2;  // 0 = collection-level
+  float threshold = 3;
+}
+
+message SetThresholdResponse {
+  bool success = 1;
+}

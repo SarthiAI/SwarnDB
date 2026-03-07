@@ -1,0 +1,33 @@
+[package]
+name = "vf-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "HNSW and other index implementations for SwarnDB"
+
+[dependencies]
+vf-core = { path = "../vf-core" }
+vf-quantization = { path = "../vf-quantization" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ordered-float = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }
+vf-core = { path = "../vf-core" }
+
+[[bench]]
+name = "concurrency"
+harness = false
+
+[[example]]
+name = "ann_benchmark"
+path = "examples/ann_benchmark.rs"

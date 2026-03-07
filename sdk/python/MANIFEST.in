@@ -1,0 +1,4 @@
+include LICENSE
+include src/swarndb/_proto/*.py
+include src/swarndb/_proto/*.pyi
+recursive-include proto *.proto

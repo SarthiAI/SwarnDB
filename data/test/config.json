@@ -1,0 +1,8 @@
+{
+  "name": "test",
+  "dimension": 4,
+  "distance_metric": "Cosine",
+  "default_similarity_threshold": null,
+  "max_vectors": 0,
+  "data_type": "F32"
+}

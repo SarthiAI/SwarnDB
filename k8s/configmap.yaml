@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swarndb-config
+  namespace: swarndb
+  labels:
+    app.kubernetes.io/name: swarndb
+    app.kubernetes.io/component: config
+data:
+  SWARNDB_HOST: "0.0.0.0"
+  SWARNDB_GRPC_PORT: "50051"
+  SWARNDB_REST_PORT: "8080"
+  SWARNDB_DATA_DIR: "/data"
+  SWARNDB_LOG_LEVEL: "info"
+  SWARNDB_MAX_CONNECTIONS: "1000"
+  SWARNDB_REQUEST_TIMEOUT_MS: "30000"
