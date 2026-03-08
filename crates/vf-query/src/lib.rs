@@ -6,18 +6,18 @@
 pub mod batch;
 pub mod eval;
 pub mod filter;
+pub mod index_bitmap;
 pub mod index_btree;
 pub mod index_hash;
-pub mod index_bitmap;
 pub mod index_manager;
 pub mod strategy;
 pub mod vector_math;
 
 pub use batch::{BatchExecutor, BatchQuery, BatchResult};
-pub use eval::FilterEvaluator;
+pub use eval::{CompiledFilter, FilterEvaluator};
 pub use filter::{FilterExpression, QueryError};
+pub use index_bitmap::BitmapIndex;
 pub use index_btree::BTreeIndex;
 pub use index_hash::HashIndex;
-pub use index_bitmap::BitmapIndex;
-pub use index_manager::{IndexManager, IndexConfig, MetadataIndex};
-pub use strategy::{QueryExecutor, FilterStrategy};
+pub use index_manager::{IndexConfig, IndexManager, MetadataIndex};
+pub use strategy::{FilterStrategy, QueryExecutor};

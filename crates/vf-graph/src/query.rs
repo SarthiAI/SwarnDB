@@ -96,6 +96,43 @@ impl RelationshipQueryEngine {
         Ok(results)
     }
 
+    /// Batch lookup of related edges for multiple vector IDs at once.
+    /// Returns a HashMap keyed by VectorId with each entry containing
+    /// the sorted, truncated list of (target_id, similarity) pairs.
+    /// IDs not found in the graph get an empty Vec (no error).
+    pub fn get_related_batch(
+        graph: &VirtualGraph,
+        ids: &[VectorId],
+        threshold: Option<f32>,
+        max_edges: u32,
+    ) -> HashMap<VectorId, Vec<(VectorId, f32)>> {
+        let nodes = graph.nodes();
+        let mut result = HashMap::with_capacity(ids.len());
+
+        for &id in ids {
+            let edges = match nodes.get(&id) {
+                Some(node) => {
+                    let effective_threshold = graph.resolve_threshold(id, threshold);
+                    let mut edges: Vec<(VectorId, f32)> = node
+                        .edges_above_threshold(effective_threshold)
+                        .into_iter()
+                        .map(|e| (e.target, e.similarity))
+                        .collect();
+                    edges.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    edges.truncate(max_edges as usize);
+                    edges
+                }
+                None => Vec::new(),
+            };
+            result.insert(id, edges);
+        }
+
+        result
+    }
+
     pub fn query(
         graph: &VirtualGraph,
         query: &RelationshipQuery,

@@ -14,7 +14,7 @@ use crate::proto::swarndb::v1::{
     DeleteCollectionResponse, GetCollectionRequest, GetCollectionResponse,
     ListCollectionsRequest, ListCollectionsResponse,
 };
-use crate::state::{AppState, CollectionState};
+use crate::state::{AppState, CollectionState, MetadataCache};
 use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{CollectionConfig, DataTypeConfig};
 use vf_graph::VirtualGraph;
@@ -104,6 +104,7 @@ impl CollectionService for CollectionServiceImpl {
             index,
             index_manager,
             graph,
+            metadata_cache: MetadataCache::new(),
         };
 
         let mut collections = self.state.collections.write();

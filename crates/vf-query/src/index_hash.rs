@@ -94,10 +94,7 @@ impl HashIndex {
         let Some(key) = HashKey::from_metadata(value) else {
             return RoaringBitmap::new();
         };
-        self.map
-            .get(&key)
-            .cloned()
-            .unwrap_or_default()
+        self.map.get(&key).cloned().unwrap_or_default()
     }
 
     /// Check if a value exists in the index (O(1)).

@@ -1,4 +1,4 @@
-use vf_core::distance::{get_distance_fn, DistanceFunction};
+use vf_core::distance::DistanceMetric;
 use vf_core::types::{DistanceMetricType, VectorId};
 
 pub struct GhostResult {
@@ -8,14 +8,14 @@ pub struct GhostResult {
 
 pub struct GhostDetector {
     threshold: f32,
-    distance_fn: Box<dyn DistanceFunction>,
+    distance_fn: DistanceMetric,
 }
 
 impl GhostDetector {
     pub fn new(threshold: f32, metric: DistanceMetricType) -> Self {
         Self {
             threshold,
-            distance_fn: get_distance_fn(metric),
+            distance_fn: DistanceMetric::from_metric_type(metric),
         }
     }
 

@@ -44,6 +44,26 @@ pub struct ServerConfig {
     /// Request timeout in milliseconds.
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
+
+    /// Minimum concurrency limit for adaptive sizing.
+    #[serde(default = "default_min_concurrency")]
+    pub min_concurrency: usize,
+
+    /// Maximum concurrency limit for adaptive sizing.
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+
+    /// Target p99 latency in milliseconds for adaptive concurrency control.
+    #[serde(default = "default_target_p99_latency_ms")]
+    pub target_p99_latency_ms: u64,
+
+    /// Search-specific request timeout in milliseconds.
+    #[serde(default = "default_search_timeout_ms")]
+    pub search_timeout_ms: u64,
+
+    /// Bulk operation timeout in milliseconds.
+    #[serde(default = "default_bulk_timeout_ms")]
+    pub bulk_timeout_ms: u64,
 }
 
 fn default_host() -> String {
@@ -71,6 +91,26 @@ fn default_max_connections() -> usize {
 }
 
 fn default_request_timeout_ms() -> u64 {
+    10000
+}
+
+fn default_min_concurrency() -> usize {
+    10
+}
+
+fn default_max_concurrency() -> usize {
+    200
+}
+
+fn default_target_p99_latency_ms() -> u64 {
+    500
+}
+
+fn default_search_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_bulk_timeout_ms() -> u64 {
     30000
 }
 
@@ -85,6 +125,11 @@ impl Default for ServerConfig {
             api_keys: Vec::new(),
             max_connections: default_max_connections(),
             request_timeout_ms: default_request_timeout_ms(),
+            min_concurrency: default_min_concurrency(),
+            max_concurrency: default_max_concurrency(),
+            target_p99_latency_ms: default_target_p99_latency_ms(),
+            search_timeout_ms: default_search_timeout_ms(),
+            bulk_timeout_ms: default_bulk_timeout_ms(),
         }
     }
 }
@@ -136,6 +181,11 @@ impl ServerConfig {
     /// - `SWARNDB_API_KEYS` -> api_keys (comma-separated)
     /// - `SWARNDB_MAX_CONNECTIONS` -> max_connections
     /// - `SWARNDB_REQUEST_TIMEOUT_MS` -> request_timeout_ms
+    /// - `SWARNDB_MIN_CONCURRENCY` -> min_concurrency
+    /// - `SWARNDB_MAX_CONCURRENCY` -> max_concurrency
+    /// - `SWARNDB_TARGET_P99_LATENCY_MS` -> target_p99_latency_ms
+    /// - `SWARNDB_SEARCH_TIMEOUT_MS` -> search_timeout_ms
+    /// - `SWARNDB_BULK_TIMEOUT_MS` -> bulk_timeout_ms
     pub fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("SWARNDB_HOST") {
             self.host = val;
@@ -184,6 +234,46 @@ impl ServerConfig {
                 tracing::warn!("Invalid SWARNDB_REQUEST_TIMEOUT_MS value: {}", val);
             }
         }
+
+        if let Ok(val) = env::var("SWARNDB_MIN_CONCURRENCY") {
+            if let Ok(n) = val.parse::<usize>() {
+                self.min_concurrency = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_MIN_CONCURRENCY value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_MAX_CONCURRENCY") {
+            if let Ok(n) = val.parse::<usize>() {
+                self.max_concurrency = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_MAX_CONCURRENCY value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_TARGET_P99_LATENCY_MS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.target_p99_latency_ms = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_TARGET_P99_LATENCY_MS value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_SEARCH_TIMEOUT_MS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.search_timeout_ms = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_SEARCH_TIMEOUT_MS value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_BULK_TIMEOUT_MS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.bulk_timeout_ms = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_BULK_TIMEOUT_MS value: {}", val);
+            }
+        }
     }
 
     /// Returns the gRPC socket address string (e.g., "0.0.0.0:50051").
@@ -223,7 +313,12 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert!(config.api_keys.is_empty());
         assert_eq!(config.max_connections, 1000);
-        assert_eq!(config.request_timeout_ms, 30000);
+        assert_eq!(config.request_timeout_ms, 10000);
+        assert_eq!(config.min_concurrency, 10);
+        assert_eq!(config.max_concurrency, 200);
+        assert_eq!(config.target_p99_latency_ms, 500);
+        assert_eq!(config.search_timeout_ms, 5000);
+        assert_eq!(config.bulk_timeout_ms, 30000);
     }
 
     #[test]

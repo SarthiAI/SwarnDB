@@ -14,6 +14,15 @@ pub trait DistanceFunction: Send + Sync {
     /// Higher values = more similar for similarity metrics (cosine, dot product).
     fn compute(&self, a: &[f32], b: &[f32]) -> f32;
 
+    /// Compute distances from one query to multiple targets.
+    /// Default implementation loops over `compute`; specialized impls can batch for cache reuse.
+    fn compute_batch(&self, query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+        debug_assert_eq!(targets.len(), results.len());
+        for (i, target) in targets.iter().enumerate() {
+            results[i] = self.compute(query, target);
+        }
+    }
+
     /// Returns the metric type
     fn metric_type(&self) -> DistanceMetricType;
 
@@ -30,10 +39,8 @@ impl DistanceFunction for CosineDistance {
     fn compute(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
 
-        let dispatcher = simd::get_dispatcher();
-        let dot = dispatcher.dot_product(a, b);
-        let norm_a = dispatcher.dot_product(a, a);
-        let norm_b = dispatcher.dot_product(b, b);
+        // Fused kernel computes dot(a,b), ||a||^2, ||b||^2 in a single pass
+        let (dot, norm_a, norm_b) = simd::fused_cosine_f32(a, b);
 
         let denom = (norm_a * norm_b).sqrt();
         if denom == 0.0 {
@@ -137,6 +144,169 @@ pub fn get_distance_fn(metric: DistanceMetricType) -> Box<dyn DistanceFunction> 
         DistanceMetricType::Euclidean => Box::new(EuclideanDistance),
         DistanceMetricType::DotProduct => Box::new(DotProductDistance),
         DistanceMetricType::Manhattan => Box::new(ManhattanDistance),
+    }
+}
+
+/// Enum-based distance dispatch — avoids vtable overhead of `Box<dyn DistanceFunction>`.
+///
+/// All methods are `#[inline]` so the compiler can inline the match arms directly
+/// into hot loops (HNSW search, brute-force scan, k-means, etc.), yielding a
+/// measurable improvement over trait-object dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceMetric {
+    Cosine,
+    Euclidean,
+    SquaredEuclidean,
+    DotProduct,
+    Manhattan,
+}
+
+impl DistanceMetric {
+    /// Create a `DistanceMetric` from a `DistanceMetricType`.
+    #[inline]
+    pub fn from_metric_type(metric: DistanceMetricType) -> Self {
+        match metric {
+            DistanceMetricType::Cosine => DistanceMetric::Cosine,
+            DistanceMetricType::Euclidean => DistanceMetric::Euclidean,
+            DistanceMetricType::DotProduct => DistanceMetric::DotProduct,
+            DistanceMetricType::Manhattan => DistanceMetric::Manhattan,
+        }
+    }
+
+    /// Compute distance/similarity between two vectors.
+    #[inline]
+    pub fn compute(&self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            DistanceMetric::Cosine => {
+                debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+                let (dot, norm_a, norm_b) = simd::fused_cosine_f32(a, b);
+                let denom = (norm_a * norm_b).sqrt();
+                if denom == 0.0 { 1.0 } else { 1.0 - (dot / denom) }
+            }
+            DistanceMetric::Euclidean => {
+                debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+                simd::get_dispatcher().squared_l2(a, b).sqrt()
+            }
+            DistanceMetric::SquaredEuclidean => {
+                debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+                simd::get_dispatcher().squared_l2(a, b)
+            }
+            DistanceMetric::DotProduct => {
+                debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+                -simd::get_dispatcher().dot_product(a, b)
+            }
+            DistanceMetric::Manhattan => {
+                debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
+                simd::get_dispatcher().manhattan(a, b)
+            }
+        }
+    }
+
+    /// Returns the metric type.
+    #[inline]
+    pub fn metric_type(&self) -> DistanceMetricType {
+        match self {
+            DistanceMetric::Cosine => DistanceMetricType::Cosine,
+            DistanceMetric::Euclidean | DistanceMetric::SquaredEuclidean => DistanceMetricType::Euclidean,
+            DistanceMetric::DotProduct => DistanceMetricType::DotProduct,
+            DistanceMetric::Manhattan => DistanceMetricType::Manhattan,
+        }
+    }
+
+    /// Whether lower scores mean more similar.
+    #[inline]
+    pub fn lower_is_better(&self) -> bool {
+        true // all metrics use lower-is-better convention
+    }
+
+    /// Compute distances from one query vector to multiple target vectors.
+    ///
+    /// Keeps the query vector hot in L1 cache while iterating over targets,
+    /// yielding better throughput than individual `compute` calls when
+    /// evaluating many candidates (e.g. HNSW neighbor expansion).
+    ///
+    /// `results` must have the same length as `targets`.
+    #[inline]
+    pub fn compute_batch(&self, query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+        debug_assert_eq!(targets.len(), results.len());
+        let dispatcher = simd::get_dispatcher();
+        match self {
+            DistanceMetric::Cosine => {
+                // Use stack arrays for small batches, heap for large
+                let n = targets.len();
+                if n <= 32 {
+                    let mut dots = [0.0f32; 32];
+                    let mut norms_a = [0.0f32; 32];
+                    let mut norms_b = [0.0f32; 32];
+                    dispatcher.batch_fused_cosine(
+                        query,
+                        targets,
+                        &mut dots[..n],
+                        &mut norms_a[..n],
+                        &mut norms_b[..n],
+                    );
+                    for i in 0..n {
+                        let denom = (norms_a[i] * norms_b[i]).sqrt();
+                        results[i] = if denom == 0.0 { 1.0 } else { 1.0 - (dots[i] / denom) };
+                    }
+                } else {
+                    let mut dots = vec![0.0f32; n];
+                    let mut norms_a = vec![0.0f32; n];
+                    let mut norms_b = vec![0.0f32; n];
+                    dispatcher.batch_fused_cosine(
+                        query,
+                        targets,
+                        &mut dots,
+                        &mut norms_a,
+                        &mut norms_b,
+                    );
+                    for i in 0..n {
+                        let denom = (norms_a[i] * norms_b[i]).sqrt();
+                        results[i] = if denom == 0.0 { 1.0 } else { 1.0 - (dots[i] / denom) };
+                    }
+                }
+            }
+            DistanceMetric::Euclidean => {
+                dispatcher.batch_squared_l2(query, targets, results);
+                for r in results.iter_mut() {
+                    *r = r.sqrt();
+                }
+            }
+            DistanceMetric::SquaredEuclidean => {
+                dispatcher.batch_squared_l2(query, targets, results);
+            }
+            DistanceMetric::DotProduct => {
+                dispatcher.batch_dot_product(query, targets, results);
+                for r in results.iter_mut() {
+                    *r = -*r; // negate so lower = more similar
+                }
+            }
+            DistanceMetric::Manhattan => {
+                dispatcher.batch_manhattan(query, targets, results);
+            }
+        }
+    }
+}
+
+impl DistanceFunction for DistanceMetric {
+    #[inline]
+    fn compute(&self, a: &[f32], b: &[f32]) -> f32 {
+        DistanceMetric::compute(self, a, b)
+    }
+
+    #[inline]
+    fn compute_batch(&self, query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+        DistanceMetric::compute_batch(self, query, targets, results)
+    }
+
+    #[inline]
+    fn metric_type(&self) -> DistanceMetricType {
+        DistanceMetric::metric_type(self)
+    }
+
+    #[inline]
+    fn lower_is_better(&self) -> bool {
+        DistanceMetric::lower_is_better(self)
     }
 }
 

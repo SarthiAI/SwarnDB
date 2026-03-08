@@ -13,7 +13,7 @@ use std::mem;
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
-use vf_core::distance::{get_distance_fn, DistanceFunction};
+use vf_core::distance::DistanceMetric;
 use vf_core::types::{DistanceMetricType, ScoredResult, VectorId};
 use vf_quantization::product::ProductQuantizer;
 use vf_quantization::pq_distance::PqDistanceTable;
@@ -82,8 +82,8 @@ pub struct QuantizedHnswIndex {
     metric: DistanceMetricType,
     /// Vector dimension.
     dimension: usize,
-    /// Cached distance function to avoid per-call allocation.
-    distance_fn: Box<dyn DistanceFunction>,
+    /// Cached distance function — enum dispatch avoids vtable overhead.
+    distance_fn: DistanceMetric,
 }
 
 impl QuantizedHnswIndex {
@@ -105,7 +105,7 @@ impl QuantizedHnswIndex {
         rerank_factor: usize,
     ) -> Self {
         let rerank_factor = rerank_factor.max(1);
-        let distance_fn = get_distance_fn(metric);
+        let distance_fn = DistanceMetric::from_metric_type(metric);
         Self {
             hnsw: HnswIndex::new(dimension, metric, params),
             quantization,

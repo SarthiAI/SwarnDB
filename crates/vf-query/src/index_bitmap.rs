@@ -237,8 +237,12 @@ mod tests {
 
         idx.remove(1);
         assert_eq!(idx.len(), 1);
-        assert!(!idx.eq_lookup(&MetadataValue::String("x".into())).contains(1));
-        assert!(idx.eq_lookup(&MetadataValue::String("x".into())).contains(2));
+        assert!(!idx
+            .eq_lookup(&MetadataValue::String("x".into()))
+            .contains(1));
+        assert!(idx
+            .eq_lookup(&MetadataValue::String("x".into()))
+            .contains(2));
     }
 
     #[test]

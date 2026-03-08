@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use vf_core::store::{InMemoryVectorStore, VectorRecord};
-use vf_core::types::CollectionConfig;
+use vf_core::types::{CollectionConfig, Metadata, VectorId};
 use vf_core::vector::VectorData;
 use vf_graph::VirtualGraph;
 use vf_index::hnsw::HnswIndex;
@@ -18,6 +18,36 @@ use vf_query::IndexManager;
 use vf_storage::collection::CollectionManager;
 use vf_storage::StorageError;
 
+/// Cached metadata store that avoids rebuilding the HashMap on every query.
+/// Only rebuilds when the store's generation counter has changed.
+/// Uses Arc internally so concurrent readers get a cheap reference-count bump
+/// instead of cloning the entire HashMap.
+pub struct MetadataCache {
+    cache: Mutex<(u64, Arc<HashMap<VectorId, Metadata>>)>,
+}
+
+impl MetadataCache {
+    pub fn new() -> Self {
+        Self {
+            cache: Mutex::new((u64::MAX, Arc::new(HashMap::new()))),
+        }
+    }
+
+    /// Returns a shared reference to the cached metadata store, rebuilding
+    /// only if the store's generation has changed since the last build.
+    /// Uses `iter_metadata` to avoid cloning vector data during rebuild.
+    pub fn get_or_rebuild(&self, store: &InMemoryVectorStore) -> Arc<HashMap<VectorId, Metadata>> {
+        let current_gen = store.generation();
+        let mut guard = self.cache.lock();
+        if guard.0 != current_gen {
+            let metadata_store: HashMap<VectorId, Metadata> =
+                store.iter_metadata().into_iter().collect();
+            *guard = (current_gen, Arc::new(metadata_store));
+        }
+        Arc::clone(&guard.1)
+    }
+}
+
 /// Per-collection state holding all components needed for vector operations.
 pub struct CollectionState {
     pub config: CollectionConfig,
@@ -25,6 +55,7 @@ pub struct CollectionState {
     pub index: HnswIndex,
     pub index_manager: IndexManager,
     pub graph: VirtualGraph,
+    pub metadata_cache: MetadataCache,
 }
 
 /// Global application state shared across all gRPC services.
@@ -130,6 +161,7 @@ impl AppState {
                 index,
                 index_manager,
                 graph,
+                metadata_cache: MetadataCache::new(),
             };
 
             collections.insert(name.clone(), collection_state);

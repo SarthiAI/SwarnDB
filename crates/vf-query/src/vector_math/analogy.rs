@@ -61,7 +61,10 @@ mod tests {
         let b = [1.0, 0.0, 0.0];
         let c = [0.0, 0.0, 1.0];
         // a - b + c = [0, 2, 4]
-        assert_eq!(AnalogyComputer::analogy(&a, &b, &c).unwrap(), vec![0.0, 2.0, 4.0]);
+        assert_eq!(
+            AnalogyComputer::analogy(&a, &b, &c).unwrap(),
+            vec![0.0, 2.0, 4.0]
+        );
     }
 
     #[test]

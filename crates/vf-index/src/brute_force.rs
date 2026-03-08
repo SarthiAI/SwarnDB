@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
-use vf_core::distance::{get_distance_fn, DistanceFunction};
+use vf_core::distance::DistanceMetric;
 use vf_core::types::{DistanceMetricType, ScoredResult, VectorId};
 
 use crate::traits::{IndexError, VectorIndex};
@@ -18,7 +18,7 @@ use crate::traits::{IndexError, VectorIndex};
 pub struct BruteForceIndex {
     vectors: RwLock<HashMap<VectorId, Vec<f32>>>,
     dimension: usize,
-    distance_fn: Box<dyn DistanceFunction>,
+    distance_fn: DistanceMetric,
 }
 
 impl BruteForceIndex {
@@ -27,7 +27,7 @@ impl BruteForceIndex {
         Self {
             vectors: RwLock::new(HashMap::new()),
             dimension,
-            distance_fn: get_distance_fn(metric),
+            distance_fn: DistanceMetric::from_metric_type(metric),
         }
     }
 

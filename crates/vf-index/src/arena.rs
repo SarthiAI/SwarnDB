@@ -169,6 +169,122 @@ impl NodeArena {
     }
 }
 
+// ── VectorArena: contiguous f32 storage for HNSW node vectors ──────────
+
+/// Contiguous arena for storing fixed-dimension f32 vectors.
+///
+/// All vectors are packed end-to-end in a single `Vec<f32>` buffer so that
+/// sequential access patterns (e.g., during HNSW search) benefit from CPU
+/// cache prefetching. Each vector occupies exactly `dimension` f32 slots,
+/// and is addressed by a zero-based slot index.
+///
+/// The arena supports:
+/// - O(1) allocation (append to the end of the buffer)
+/// - O(1) access by slot index
+/// - Slot reuse via a free-list to handle deletions without compaction
+pub struct VectorArena {
+    /// Flat buffer: slot `i` occupies `[i*dim .. (i+1)*dim]`.
+    data: Vec<f32>,
+    /// Number of f32 elements per vector.
+    dimension: usize,
+    /// Total number of allocated slots (including freed ones still in buffer).
+    slot_count: usize,
+    /// Free-list of reusable slot indices from prior deletions.
+    free_slots: Vec<usize>,
+}
+
+impl VectorArena {
+    /// Creates a new vector arena for the given dimension.
+    pub fn new(dimension: usize) -> Self {
+        assert!(dimension > 0, "VectorArena dimension must be > 0");
+        Self {
+            data: Vec::new(),
+            dimension,
+            slot_count: 0,
+            free_slots: Vec::new(),
+        }
+    }
+
+    /// Creates a new vector arena pre-allocated for `capacity` vectors.
+    pub fn with_capacity(dimension: usize, capacity: usize) -> Self {
+        assert!(dimension > 0, "VectorArena dimension must be > 0");
+        Self {
+            data: Vec::with_capacity(dimension * capacity),
+            dimension,
+            slot_count: 0,
+            free_slots: Vec::new(),
+        }
+    }
+
+    /// Stores a vector in the arena and returns its slot index.
+    ///
+    /// Reuses a previously freed slot if available, otherwise appends.
+    ///
+    /// # Panics
+    /// Panics if `vector.len() != self.dimension`.
+    pub fn push(&mut self, vector: &[f32]) -> usize {
+        assert_eq!(
+            vector.len(),
+            self.dimension,
+            "VectorArena::push: expected dimension {}, got {}",
+            self.dimension,
+            vector.len()
+        );
+
+        if let Some(slot) = self.free_slots.pop() {
+            // Reuse a freed slot — overwrite in place.
+            let start = slot * self.dimension;
+            self.data[start..start + self.dimension].copy_from_slice(vector);
+            slot
+        } else {
+            // Append a new slot.
+            let slot = self.slot_count;
+            self.data.extend_from_slice(vector);
+            self.slot_count += 1;
+            slot
+        }
+    }
+
+    /// Returns an immutable slice to the vector at the given slot.
+    ///
+    /// # Panics
+    /// Panics if `slot >= slot_count`.
+    #[inline]
+    pub fn get(&self, slot: usize) -> &[f32] {
+        let start = slot * self.dimension;
+        &self.data[start..start + self.dimension]
+    }
+
+    /// Marks a slot as free for future reuse.
+    ///
+    /// The underlying memory is not reclaimed — it will be overwritten by the
+    /// next `push` that reuses this slot. Callers must not access the slot
+    /// after freeing it.
+    pub fn free(&mut self, slot: usize) {
+        debug_assert!(slot < self.slot_count, "VectorArena::free: slot out of bounds");
+        self.free_slots.push(slot);
+    }
+
+    /// Returns the vector dimension.
+    #[inline]
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Returns the number of active (non-freed) vectors.
+    #[inline]
+    pub fn active_count(&self) -> usize {
+        self.slot_count - self.free_slots.len()
+    }
+
+    /// Drops all data and resets the arena.
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.free_slots.clear();
+        self.slot_count = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +373,51 @@ mod tests {
         for level_neighbors in &node.neighbors {
             assert!(level_neighbors.capacity() >= 16);
         }
+    }
+
+    // ── VectorArena tests ──────────────────────────────────────────────
+
+    #[test]
+    fn vector_arena_push_and_get() {
+        let mut va = VectorArena::new(3);
+        let s0 = va.push(&[1.0, 2.0, 3.0]);
+        let s1 = va.push(&[4.0, 5.0, 6.0]);
+        assert_eq!(va.get(s0), &[1.0, 2.0, 3.0]);
+        assert_eq!(va.get(s1), &[4.0, 5.0, 6.0]);
+        assert_eq!(va.active_count(), 2);
+    }
+
+    #[test]
+    fn vector_arena_free_and_reuse() {
+        let mut va = VectorArena::new(2);
+        let s0 = va.push(&[1.0, 2.0]);
+        let s1 = va.push(&[3.0, 4.0]);
+        va.free(s0);
+        assert_eq!(va.active_count(), 1);
+        let s2 = va.push(&[5.0, 6.0]);
+        assert_eq!(s2, s0); // reuses freed slot
+        assert_eq!(va.get(s2), &[5.0, 6.0]);
+        assert_eq!(va.get(s1), &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn vector_arena_clear() {
+        let mut va = VectorArena::new(2);
+        va.push(&[1.0, 2.0]);
+        va.clear();
+        assert_eq!(va.active_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "dimension must be > 0")]
+    fn vector_arena_zero_dim_panics() {
+        VectorArena::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected dimension 3, got 2")]
+    fn vector_arena_wrong_dim_panics() {
+        let mut va = VectorArena::new(3);
+        va.push(&[1.0, 2.0]);
     }
 }

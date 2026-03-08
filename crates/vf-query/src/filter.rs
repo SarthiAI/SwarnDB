@@ -79,6 +79,12 @@ impl FilterExpression {
         FilterExpression::Contains(field.into(), value.into())
     }
 
+    /// Compile this filter expression into a flat instruction list for
+    /// efficient repeated evaluation. Avoids recursive AST traversal.
+    pub fn compile(&self) -> crate::eval::CompiledFilter {
+        crate::eval::CompiledFilter::compile(self)
+    }
+
     pub fn referenced_fields(&self) -> Vec<&str> {
         let mut fields = Vec::new();
         self.collect_fields(&mut fields);

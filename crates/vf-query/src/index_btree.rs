@@ -3,8 +3,8 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
-use std::collections::HashMap;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::ops::Bound;
 
 use ordered_float::OrderedFloat;
@@ -98,18 +98,14 @@ impl BTreeIndex {
         let Some(key) = IndexKey::from_metadata(value) else {
             return RoaringBitmap::new();
         };
-        self.tree
-            .get(&key)
-            .cloned()
-            .unwrap_or_default()
+        self.tree.get(&key).cloned().unwrap_or_default()
     }
 
     /// Range query: all IDs where field value is in [low, high] (inclusive).
     pub fn range(&self, low: &MetadataValue, high: &MetadataValue) -> RoaringBitmap {
-        let (Some(low_key), Some(high_key)) = (
-            IndexKey::from_metadata(low),
-            IndexKey::from_metadata(high),
-        ) else {
+        let (Some(low_key), Some(high_key)) =
+            (IndexKey::from_metadata(low), IndexKey::from_metadata(high))
+        else {
             return RoaringBitmap::new();
         };
         let mut result = RoaringBitmap::new();

@@ -38,14 +38,10 @@ fn proto_to_vec(v: &proto::Vector) -> Vec<f32> {
 
 fn get_vectors_from_store(store: &InMemoryVectorStore, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
     if ids.is_empty() {
-        store
-            .iter_cloned()
-            .into_iter()
-            .map(|(id, record)| (id, record.data.to_f32_vec()))
-            .collect()
+        store.iter_vector_data()
     } else {
         ids.iter()
-            .filter_map(|&id| store.get(id).ok().map(|record| (id, record.data.to_f32_vec())))
+            .filter_map(|&id| store.get_f32_data(id).ok().map(|data| (id, data)))
             .collect()
     }
 }

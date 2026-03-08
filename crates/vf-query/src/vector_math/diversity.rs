@@ -131,7 +131,10 @@ impl DiversitySampler {
             }
         }
 
-        selected_indices.into_iter().map(|i| candidates[i].0).collect()
+        selected_indices
+            .into_iter()
+            .map(|i| candidates[i].0)
+            .collect()
     }
 }
 
@@ -145,7 +148,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         norm_b += bi * bi;
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 { 0.0 } else { dot / denom }
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 #[cfg(test)]
@@ -154,7 +161,11 @@ mod tests {
 
     fn normalize(v: &[f32]) -> Vec<f32> {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm == 0.0 { v.to_vec() } else { v.iter().map(|x| x / norm).collect() }
+        if norm == 0.0 {
+            v.to_vec()
+        } else {
+            v.iter().map(|x| x / norm).collect()
+        }
     }
 
     #[test]

@@ -8,14 +8,15 @@
 use vf_core::types::VectorId;
 
 pub(crate) struct HnswNode {
-    pub(crate) vector: Vec<f32>,
+    /// Slot index into the `VectorArena` that owns this node's vector data.
+    pub(crate) vector_slot: usize,
     pub(crate) neighbors: Vec<Vec<VectorId>>,
 }
 
 impl HnswNode {
-    pub(crate) fn new(vector: Vec<f32>, level: usize) -> Self {
+    pub(crate) fn new(vector_slot: usize, level: usize) -> Self {
         let neighbors = (0..=level).map(|_| Vec::new()).collect();
-        Self { vector, neighbors }
+        Self { vector_slot, neighbors }
     }
 
     pub(crate) fn max_level(&self) -> usize {

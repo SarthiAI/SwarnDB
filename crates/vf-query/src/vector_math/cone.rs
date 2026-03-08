@@ -79,10 +79,10 @@ mod tests {
     fn test_cone_search_basic() {
         let direction = [1.0, 0.0];
         let vectors: Vec<(VectorId, Vec<f32>)> = vec![
-            (1, vec![1.0, 0.0]),   // 0 degrees
-            (2, vec![1.0, 1.0]),   // 45 degrees
-            (3, vec![0.0, 1.0]),   // 90 degrees
-            (4, vec![-1.0, 0.0]),  // 180 degrees
+            (1, vec![1.0, 0.0]),  // 0 degrees
+            (2, vec![1.0, 1.0]),  // 45 degrees
+            (3, vec![0.0, 1.0]),  // 90 degrees
+            (4, vec![-1.0, 0.0]), // 180 degrees
         ];
         let refs: Vec<(VectorId, &[f32])> =
             vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();

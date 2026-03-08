@@ -1,4 +1,4 @@
-use vf_core::distance::{get_distance_fn, DistanceFunction};
+use vf_core::distance::DistanceMetric;
 use vf_core::types::DistanceMetricType;
 
 pub struct DriftReport {
@@ -9,13 +9,13 @@ pub struct DriftReport {
 }
 
 pub struct DriftDetector {
-    distance_fn: Box<dyn DistanceFunction>,
+    distance_fn: DistanceMetric,
 }
 
 impl DriftDetector {
     pub fn new(metric: DistanceMetricType) -> Self {
         Self {
-            distance_fn: get_distance_fn(metric),
+            distance_fn: DistanceMetric::from_metric_type(metric),
         }
     }
 
@@ -71,7 +71,10 @@ impl DriftDetector {
 }
 
 fn compute_centroid(vectors: &[&[f32]]) -> Vec<f32> {
-    debug_assert!(!vectors.is_empty(), "compute_centroid called with empty input");
+    debug_assert!(
+        !vectors.is_empty(),
+        "compute_centroid called with empty input"
+    );
     let dim = vectors[0].len();
     let n = vectors.len() as f32;
     let mut centroid = vec![0.0f32; dim];

@@ -8,7 +8,6 @@ use std::time::Instant;
 
 use tonic::{Request, Response, Status};
 
-use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{Metadata, MetadataValue, VectorId};
 use vf_graph::RelationshipQueryEngine;
 use vf_query::{BatchExecutor, FilterExpression, FilterStrategy, QueryExecutor};
@@ -57,7 +56,7 @@ impl SearchService for SearchServiceImpl {
 
         let strategy = parse_strategy(&req.strategy);
 
-        let metadata_store = build_metadata_store(&collection.store);
+        let metadata_store = collection.metadata_cache.get_or_rebuild(&collection.store);
 
         let results = QueryExecutor::search(
             &collection.index as &dyn vf_index::traits::VectorIndex,
@@ -73,6 +72,14 @@ impl SearchService for SearchServiceImpl {
         let max_edges = if req.max_graph_edges == 0 { 10u32 } else { req.max_graph_edges };
         let graph_threshold = if req.graph_threshold == 0.0 { None } else { Some(req.graph_threshold) };
 
+        // Batch lookup all graph edges at once instead of per-result
+        let graph_edges_map = if req.include_graph {
+            let ids: Vec<VectorId> = results.iter().map(|r| r.id).collect();
+            RelationshipQueryEngine::get_related_batch(&collection.graph, &ids, graph_threshold, max_edges)
+        } else {
+            HashMap::new()
+        };
+
         let scored_results: Vec<proto::ScoredResult> = results
             .into_iter()
             .map(|r| {
@@ -81,11 +88,15 @@ impl SearchService for SearchServiceImpl {
                 } else {
                     None
                 };
-                let graph_edges = if req.include_graph {
-                    enrich_graph_edges(&collection.graph, r.id, graph_threshold, max_edges)
-                } else {
-                    vec![]
-                };
+                let graph_edges = graph_edges_map
+                    .get(&r.id)
+                    .map(|edges| {
+                        edges.iter().map(|&(target_id, similarity)| proto::RelatedEdge {
+                            target_id,
+                            similarity,
+                        }).collect()
+                    })
+                    .unwrap_or_default();
                 proto::ScoredResult {
                     id: r.id,
                     score: r.score,
@@ -161,7 +172,7 @@ impl SearchServiceImpl {
             q.k == first_k && q.strategy == queries[0].strategy && q.filter == queries[0].filter
         });
 
-        let metadata_store = build_metadata_store(&collection.store);
+        let metadata_store = collection.metadata_cache.get_or_rebuild(&collection.store);
 
         if all_uniform {
             let query_vectors: Vec<Vec<f32>> = queries
@@ -193,19 +204,20 @@ impl SearchServiceImpl {
             );
 
             let include_graph = queries[0].include_graph;
-            let graph_param = if include_graph {
-                let max_e = if queries[0].max_graph_edges == 0 { 10u32 } else { queries[0].max_graph_edges };
-                let g_thresh = if queries[0].graph_threshold == 0.0 { None } else { Some(queries[0].graph_threshold) };
-                Some((&collection.graph, g_thresh, max_e))
-            } else {
-                None
-            };
+            let max_e = if queries[0].max_graph_edges == 0 { 10u32 } else { queries[0].max_graph_edges };
+            let g_thresh = if queries[0].graph_threshold == 0.0 { None } else { Some(queries[0].graph_threshold) };
 
             batch_results
                 .into_iter()
                 .map(|r| {
                     let results = r.map_err(|e| Status::internal(format!("search error: {}", e)))?;
-                    Ok(to_search_response(results, &metadata_store, include_metadata, graph_param))
+                    let graph_edges_map = if include_graph {
+                        let ids: Vec<VectorId> = results.iter().map(|r| r.id).collect();
+                        RelationshipQueryEngine::get_related_batch(&collection.graph, &ids, g_thresh, max_e)
+                    } else {
+                        HashMap::new()
+                    };
+                    Ok(to_search_response(results, &metadata_store, include_metadata, &graph_edges_map))
                 })
                 .collect()
         } else {
@@ -231,14 +243,15 @@ impl SearchServiceImpl {
                 )
                 .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
-                let graph_param = if q.include_graph {
+                let graph_edges_map = if q.include_graph {
                     let max_e = if q.max_graph_edges == 0 { 10u32 } else { q.max_graph_edges };
                     let g_thresh = if q.graph_threshold == 0.0 { None } else { Some(q.graph_threshold) };
-                    Some((&collection.graph, g_thresh, max_e))
+                    let ids: Vec<VectorId> = results.iter().map(|r| r.id).collect();
+                    RelationshipQueryEngine::get_related_batch(&collection.graph, &ids, g_thresh, max_e)
                 } else {
-                    None
+                    HashMap::new()
                 };
-                responses.push(to_search_response(results, &metadata_store, q.include_metadata, graph_param));
+                responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map));
             }
             Ok(responses)
         }
@@ -263,7 +276,7 @@ impl SearchServiceImpl {
                 .ok_or_else(|| Status::invalid_argument("query vector is required"))?;
             let filter = q.filter.as_ref().map(convert_filter).transpose()?;
             let strategy = parse_strategy(&q.strategy);
-            let metadata_store = build_metadata_store(&collection.store);
+            let metadata_store = collection.metadata_cache.get_or_rebuild(&collection.store);
 
             let results = QueryExecutor::search(
                 &collection.index as &dyn vf_index::traits::VectorIndex,
@@ -276,14 +289,15 @@ impl SearchServiceImpl {
             )
             .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
-            let graph_param = if q.include_graph {
+            let graph_edges_map = if q.include_graph {
                 let max_e = if q.max_graph_edges == 0 { 10u32 } else { q.max_graph_edges };
                 let g_thresh = if q.graph_threshold == 0.0 { None } else { Some(q.graph_threshold) };
-                Some((&collection.graph, g_thresh, max_e))
+                let ids: Vec<VectorId> = results.iter().map(|r| r.id).collect();
+                RelationshipQueryEngine::get_related_batch(&collection.graph, &ids, g_thresh, max_e)
             } else {
-                None
+                HashMap::new()
             };
-            responses.push(to_search_response(results, &metadata_store, q.include_metadata, graph_param));
+            responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map));
         }
 
         Ok(responses)
@@ -300,19 +314,11 @@ fn parse_strategy(s: &str) -> FilterStrategy {
     }
 }
 
-fn build_metadata_store(store: &InMemoryVectorStore) -> HashMap<VectorId, Metadata> {
-    store
-        .iter_cloned()
-        .into_iter()
-        .filter_map(|(id, record)| record.metadata.map(|m| (id, m)))
-        .collect()
-}
-
 fn to_search_response(
     results: Vec<vf_core::types::ScoredResult>,
     metadata_store: &HashMap<VectorId, Metadata>,
     include_metadata: bool,
-    graph: Option<(&vf_graph::VirtualGraph, Option<f32>, u32)>,
+    graph_edges_map: &HashMap<VectorId, Vec<(VectorId, f32)>>,
 ) -> SearchResponse {
     let scored_results = results
         .into_iter()
@@ -322,11 +328,15 @@ fn to_search_response(
             } else {
                 None
             };
-            let graph_edges = if let Some((g, threshold, max_edges)) = graph {
-                enrich_graph_edges(g, r.id, threshold, max_edges)
-            } else {
-                vec![]
-            };
+            let graph_edges = graph_edges_map
+                .get(&r.id)
+                .map(|edges| {
+                    edges.iter().map(|&(target_id, similarity)| proto::RelatedEdge {
+                        target_id,
+                        similarity,
+                    }).collect()
+                })
+                .unwrap_or_default();
             proto::ScoredResult {
                 id: r.id,
                 score: r.score,
@@ -339,27 +349,6 @@ fn to_search_response(
     SearchResponse {
         results: scored_results,
         search_time_us: 0, // individual timing not tracked in batch
-    }
-}
-
-fn enrich_graph_edges(
-    graph: &vf_graph::VirtualGraph,
-    id: VectorId,
-    threshold: Option<f32>,
-    max_edges: u32,
-) -> Vec<proto::RelatedEdge> {
-    match RelationshipQueryEngine::get_related(graph, id, threshold) {
-        Ok(mut edges) => {
-            edges.truncate(max_edges as usize);
-            edges
-                .into_iter()
-                .map(|(target_id, similarity)| proto::RelatedEdge {
-                    target_id,
-                    similarity,
-                })
-                .collect()
-        }
-        Err(_) => vec![],
     }
 }
 

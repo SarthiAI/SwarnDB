@@ -9,7 +9,7 @@ use roaring::RoaringBitmap;
 use vf_core::types::{Metadata, ScoredResult, VectorId};
 use vf_index::traits::VectorIndex;
 
-use crate::eval::FilterEvaluator;
+use crate::eval::CompiledFilter;
 use crate::filter::{FilterExpression, QueryError};
 use crate::index_manager::IndexManager;
 
@@ -48,7 +48,17 @@ impl QueryExecutor {
                 Self::execute_pre_filter(index, query, k, filter, index_manager, metadata_store)
             }
             FilterStrategy::PostFilter { oversample_factor } => {
-                Self::execute_post_filter(index, query, k, filter, *oversample_factor, metadata_store)
+                // Use adaptive oversampling: if an IndexManager is available,
+                // estimate selectivity and override the fixed factor.
+                let adaptive_factor = if let Some(im) = index_manager {
+                    let selectivity = im.estimate_selectivity(filter);
+                    let estimated = compute_oversample(selectivity);
+                    // Use the larger of user-specified and estimated factors
+                    estimated.max(*oversample_factor)
+                } else {
+                    *oversample_factor
+                };
+                Self::execute_post_filter(index, query, k, filter, adaptive_factor, metadata_store)
             }
             FilterStrategy::Auto => {
                 Self::execute_auto(index, query, k, filter, index_manager, metadata_store)
@@ -64,7 +74,15 @@ impl QueryExecutor {
         index_manager: Option<&IndexManager>,
         metadata_store: &HashMap<VectorId, Metadata>,
     ) -> Result<Vec<ScoredResult>, QueryError> {
-        Self::search(index, query, k, filter, &FilterStrategy::Auto, index_manager, metadata_store)
+        Self::search(
+            index,
+            query,
+            k,
+            filter,
+            &FilterStrategy::Auto,
+            index_manager,
+            metadata_store,
+        )
     }
 
     fn execute_pre_filter(
@@ -90,12 +108,15 @@ impl QueryExecutor {
         let expanded_k = k * oversample_factor;
         let results = index.search(query, expanded_k)?;
 
+        // Compile filter once, evaluate many times without AST traversal
+        let compiled = CompiledFilter::compile(filter);
+
         let filtered: Vec<ScoredResult> = results
             .into_iter()
             .filter(|r| {
                 metadata_store
                     .get(&r.id)
-                    .map_or(false, |meta| FilterEvaluator::evaluate(filter, meta))
+                    .map_or(false, |meta| compiled.evaluate(meta))
             })
             .take(k)
             .collect();
@@ -117,6 +138,7 @@ impl QueryExecutor {
         }
 
         if let Some(im) = index_manager {
+            // Try exact bitmap evaluation first
             if let Some(bitmap) = im.evaluate_filter(filter) {
                 let selectivity = bitmap.len() as f64 / index_len as f64;
 
@@ -126,12 +148,25 @@ impl QueryExecutor {
                 } else {
                     let oversample = compute_oversample(selectivity);
                     return Self::execute_post_filter(
-                        index, query, k, filter, oversample, metadata_store,
+                        index,
+                        query,
+                        k,
+                        filter,
+                        oversample,
+                        metadata_store,
                     );
                 }
             }
+
+            // Bitmap evaluation not possible (e.g., Exists, Not, or missing
+            // index) -- fall back to estimated selectivity for adaptive
+            // oversampling instead of a fixed factor.
+            let estimated_selectivity = im.estimate_selectivity(filter);
+            let oversample = compute_oversample(estimated_selectivity);
+            return Self::execute_post_filter(index, query, k, filter, oversample, metadata_store);
         }
 
+        // No IndexManager available at all -- use a conservative default
         Self::execute_post_filter(index, query, k, filter, 3, metadata_store)
     }
 
@@ -145,7 +180,7 @@ impl QueryExecutor {
                 return bitmap_to_candidates(&bitmap);
             }
         }
-        FilterEvaluator::evaluate_batch(filter, metadata_store)
+        CompiledFilter::compile(filter).evaluate_batch(metadata_store)
     }
 }
 

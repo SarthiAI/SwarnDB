@@ -1,5 +1,5 @@
 use rand::Rng;
-use vf_core::distance::{get_distance_fn, DistanceFunction};
+use vf_core::distance::DistanceMetric;
 use vf_core::types::{DistanceMetricType, VectorId};
 
 pub struct KMeansConfig {
@@ -35,13 +35,16 @@ pub struct KMeansResult {
 
 pub struct KMeans {
     config: KMeansConfig,
-    distance_fn: Box<dyn DistanceFunction>,
+    distance_fn: DistanceMetric,
 }
 
 impl KMeans {
     pub fn new(config: KMeansConfig) -> Self {
-        let distance_fn = get_distance_fn(config.metric);
-        Self { config, distance_fn }
+        let distance_fn = DistanceMetric::from_metric_type(config.metric);
+        Self {
+            config,
+            distance_fn,
+        }
     }
 
     /// Run k-means clustering.
@@ -206,7 +209,8 @@ mod tests {
             (3, vec![10.0, 10.0]),
             (4, vec![10.1, 10.1]),
         ];
-        let refs: Vec<(VectorId, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let refs: Vec<(VectorId, &[f32])> =
+            vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
         let km = KMeans::new(KMeansConfig {
             k: 2,
             ..Default::default()
@@ -222,11 +226,9 @@ mod tests {
 
     #[test]
     fn test_kmeans_single_cluster() {
-        let vectors: Vec<(VectorId, Vec<f32>)> = vec![
-            (1, vec![1.0, 1.0]),
-            (2, vec![2.0, 2.0]),
-        ];
-        let refs: Vec<(VectorId, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let vectors: Vec<(VectorId, Vec<f32>)> = vec![(1, vec![1.0, 1.0]), (2, vec![2.0, 2.0])];
+        let refs: Vec<(VectorId, &[f32])> =
+            vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
         let km = KMeans::new(KMeansConfig {
             k: 1,
             ..Default::default()
@@ -248,7 +250,8 @@ mod tests {
     #[test]
     fn test_kmeans_k_exceeds_n() {
         let vectors: Vec<(VectorId, Vec<f32>)> = vec![(1, vec![1.0])];
-        let refs: Vec<(VectorId, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let refs: Vec<(VectorId, &[f32])> =
+            vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
         let km = KMeans::new(KMeansConfig {
             k: 10,
             ..Default::default()

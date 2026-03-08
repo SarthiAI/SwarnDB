@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use roaring::RoaringBitmap;
-use vf_core::types::{MetadataValue, Metadata, VectorId};
+use vf_core::types::{Metadata, MetadataValue, VectorId};
 
 use crate::filter::FilterExpression;
 use crate::index_bitmap::BitmapIndex;
@@ -305,6 +305,101 @@ impl IndexManager {
         if let Some(stats) = self.field_stats.get_mut(field) {
             stats.unique_values = unique;
             stats.total_values = total;
+        }
+    }
+
+    /// Returns the total number of indexed records.
+    pub fn total_records(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Estimates filter selectivity (fraction of records that pass) using index
+    /// cardinalities, without fully evaluating bitmaps.  Returns a value in
+    /// (0.0, 1.0].  Falls back to 1.0 (no filtering) when estimation is not
+    /// possible.
+    pub fn estimate_selectivity(&self, filter: &FilterExpression) -> f64 {
+        let total = self.records.len();
+        if total == 0 {
+            return 1.0;
+        }
+        self.estimate_selectivity_inner(filter, total as f64)
+    }
+
+    fn estimate_selectivity_inner(&self, filter: &FilterExpression, total: f64) -> f64 {
+        match filter {
+            FilterExpression::Eq(field, _) => {
+                // Assuming uniform distribution: 1 / unique_values
+                if let Some(stats) = self.field_stats.get(field) {
+                    if stats.unique_values > 0 {
+                        return (1.0 / stats.unique_values as f64).clamp(0.001, 1.0);
+                    }
+                }
+                1.0
+            }
+            FilterExpression::Ne(field, _) => {
+                // 1 - (1 / unique_values)
+                if let Some(stats) = self.field_stats.get(field) {
+                    if stats.unique_values > 0 {
+                        return (1.0 - 1.0 / stats.unique_values as f64).clamp(0.001, 1.0);
+                    }
+                }
+                1.0
+            }
+            FilterExpression::In(field, values) => {
+                // |values| / unique_values
+                if let Some(stats) = self.field_stats.get(field) {
+                    if stats.unique_values > 0 {
+                        return (values.len() as f64 / stats.unique_values as f64)
+                            .clamp(0.001, 1.0);
+                    }
+                }
+                1.0
+            }
+            FilterExpression::Gt(_, _)
+            | FilterExpression::Gte(_, _)
+            | FilterExpression::Lt(_, _)
+            | FilterExpression::Lte(_, _) => {
+                // Assume range predicates keep ~33% of data (heuristic)
+                0.33
+            }
+            FilterExpression::Between(_, _, _) => {
+                // Assume between keeps ~10% of data (heuristic)
+                0.10
+            }
+            FilterExpression::Exists(field) => {
+                // fraction of records that have this field
+                if let Some(stats) = self.field_stats.get(field) {
+                    return (stats.total_values as f64 / total).clamp(0.001, 1.0);
+                }
+                1.0
+            }
+            FilterExpression::Contains(_, _) => {
+                // Substring match: conservative estimate
+                0.10
+            }
+            FilterExpression::And(children) => {
+                // Assume independence: multiply selectivities
+                children
+                    .iter()
+                    .map(|c| self.estimate_selectivity_inner(c, total))
+                    .fold(1.0, |acc, s| acc * s)
+                    .clamp(0.001, 1.0)
+            }
+            FilterExpression::Or(children) => {
+                // P(A|B) = P(A) + P(B) - P(A)*P(B) for independent events
+                if children.is_empty() {
+                    return 0.001;
+                }
+                let result = children
+                    .iter()
+                    .map(|c| self.estimate_selectivity_inner(c, total))
+                    .fold(0.0, |acc, s| acc + s - acc * s);
+                result.clamp(0.001, 1.0)
+            }
+            FilterExpression::Not(child) => {
+                let inner = self.estimate_selectivity_inner(child, total);
+                (1.0 - inner).clamp(0.001, 1.0)
+            }
         }
     }
 

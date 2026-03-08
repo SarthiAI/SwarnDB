@@ -23,7 +23,7 @@ use vf_query::vector_math::*;
 use vf_query::{FilterExpression, FilterStrategy, IndexManager, QueryExecutor};
 
 use crate::convert::{distance_metric_to_string, parse_distance_metric};
-use crate::state::{AppState, CollectionState};
+use crate::state::{AppState, CollectionState, MetadataCache};
 use crate::validation::{validate_collection_name, ValidationConfig};
 
 // ── Error handling ──────────────────────────────────────────────────────
@@ -372,7 +372,7 @@ async fn create_collection(
         }
     }
 
-    let collection_state = CollectionState { config, store, index, index_manager, graph };
+    let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new() };
 
     let mut collections = state.collections.write();
     collections.insert(req.name.clone(), collection_state);
@@ -752,7 +752,7 @@ async fn search(
         return Err(err(StatusCode::BAD_REQUEST, format!("query dimension mismatch: expected {}, got {}", coll.config.dimension, req.query.len())));
     }
 
-    let metadata_store = build_metadata_store(&coll.store);
+    let metadata_store = coll.metadata_cache.get_or_rebuild(&coll.store);
 
     let results = QueryExecutor::search(
         &coll.index as &dyn VectorIndex,
@@ -767,17 +767,26 @@ async fn search(
     let max_edges = if req.max_graph_edges == 0 { 10u32 } else { req.max_graph_edges };
     let graph_threshold = if req.graph_threshold == 0.0 { None } else { Some(req.graph_threshold) };
 
+    // Batch lookup all graph edges at once instead of per-result
+    let graph_edges_map = if req.include_graph {
+        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        RelationshipQueryEngine::get_related_batch(&coll.graph, &ids, graph_threshold, max_edges)
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let scored = results.into_iter().map(|r| {
         let metadata = if req.include_metadata {
             metadata_store.get(&r.id).map(metadata_to_json)
         } else {
             None
         };
-        let graph_edges = if req.include_graph {
-            enrich_graph_edges_rest(&coll.graph, r.id, graph_threshold, max_edges)
-        } else {
-            vec![]
-        };
+        let graph_edges = graph_edges_map
+            .get(&r.id)
+            .map(|edges| {
+                edges.iter().map(|&(target_id, similarity)| GraphEdge { target_id, similarity }).collect()
+            })
+            .unwrap_or_default();
         ScoredResult { id: r.id, score: r.score, metadata, graph_edges }
     }).collect();
 
@@ -816,7 +825,7 @@ async fn batch_search(
             .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
         let strategy = parse_strategy(&q.strategy);
-        let metadata_store = build_metadata_store(&coll.store);
+        let metadata_store = coll.metadata_cache.get_or_rebuild(&coll.store);
 
         let results = QueryExecutor::search(
             &coll.index as &dyn VectorIndex,
@@ -831,17 +840,26 @@ async fn batch_search(
         let max_edges = if q.max_graph_edges == 0 { 10u32 } else { q.max_graph_edges };
         let graph_threshold = if q.graph_threshold == 0.0 { None } else { Some(q.graph_threshold) };
 
+        // Batch lookup all graph edges at once instead of per-result
+        let graph_edges_map = if q.include_graph {
+            let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+            RelationshipQueryEngine::get_related_batch(&coll.graph, &ids, graph_threshold, max_edges)
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let scored = results.into_iter().map(|r| {
             let metadata = if q.include_metadata {
                 metadata_store.get(&r.id).map(metadata_to_json)
             } else {
                 None
             };
-            let graph_edges = if q.include_graph {
-                enrich_graph_edges_rest(&coll.graph, r.id, graph_threshold, max_edges)
-            } else {
-                vec![]
-            };
+            let graph_edges = graph_edges_map
+                .get(&r.id)
+                .map(|edges| {
+                    edges.iter().map(|&(target_id, similarity)| GraphEdge { target_id, similarity }).collect()
+                })
+                .unwrap_or_default();
             ScoredResult { id: r.id, score: r.score, metadata, graph_edges }
         }).collect();
 
@@ -1102,38 +1120,11 @@ fn parse_strategy(s: &str) -> FilterStrategy {
     }
 }
 
-fn build_metadata_store(store: &InMemoryVectorStore) -> HashMap<VectorId, Metadata> {
-    store.iter_cloned()
-        .into_iter()
-        .filter_map(|(id, record)| record.metadata.map(|m| (id, m)))
-        .collect()
-}
-
-fn enrich_graph_edges_rest(
-    graph: &vf_graph::VirtualGraph,
-    id: VectorId,
-    threshold: Option<f32>,
-    max_edges: u32,
-) -> Vec<GraphEdge> {
-    match RelationshipQueryEngine::get_related(graph, id, threshold) {
-        Ok(mut edges) => {
-            edges.truncate(max_edges as usize);
-            edges
-                .into_iter()
-                .map(|(target_id, similarity)| GraphEdge { target_id, similarity })
-                .collect()
-        }
-        Err(_) => vec![],
-    }
-}
-
 // ── Vector Math helpers ─────────────────────────────────────────────────
 
 fn get_vectors_from_collection(store: &InMemoryVectorStore, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
     if ids.is_empty() {
-        store.iter_cloned().into_iter().map(|(id, record)| {
-            (id, record.data.to_f32_vec())
-        }).collect()
+        store.iter_vector_data()
     } else {
         ids.iter().filter_map(|&id| {
             store.get(id).ok().map(|record| (id, record.data.to_f32_vec()))

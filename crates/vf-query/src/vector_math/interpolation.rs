@@ -6,7 +6,12 @@ impl Interpolator {
         if a.len() != b.len() || !(0.0..=1.0).contains(&t) {
             return None;
         }
-        Some(a.iter().zip(b.iter()).map(|(&ai, &bi)| (1.0 - t) * ai + t * bi).collect())
+        Some(
+            a.iter()
+                .zip(b.iter())
+                .map(|(&ai, &bi)| (1.0 - t) * ai + t * bi)
+                .collect(),
+        )
     }
 
     /// Spherical linear interpolation (vectors should be normalized).
@@ -41,7 +46,11 @@ impl Interpolator {
             return None;
         }
         if n < 2 {
-            return if n == 1 { Some(vec![a.to_vec()]) } else { Some(vec![]) };
+            return if n == 1 {
+                Some(vec![a.to_vec()])
+            } else {
+                Some(vec![])
+            };
         }
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
@@ -57,7 +66,11 @@ impl Interpolator {
             return None;
         }
         if n < 2 {
-            return if n == 1 { Some(vec![a.to_vec()]) } else { Some(vec![]) };
+            return if n == 1 {
+                Some(vec![a.to_vec()])
+            } else {
+                Some(vec![])
+            };
         }
         let mut result = Vec::with_capacity(n);
         for i in 0..n {

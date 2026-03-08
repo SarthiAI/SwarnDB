@@ -47,7 +47,12 @@ impl Pca {
         // Center data
         let centered: Vec<Vec<f32>> = vectors
             .iter()
-            .map(|v| v.iter().zip(mean.iter()).map(|(&vi, &mi)| vi - mi).collect())
+            .map(|v| {
+                v.iter()
+                    .zip(mean.iter())
+                    .map(|(&vi, &mi)| vi - mi)
+                    .collect()
+            })
             .collect();
 
         // Compute covariance matrix
@@ -136,12 +141,7 @@ fn compute_covariance(centered: &[Vec<f32>], dim: usize) -> Vec<f32> {
     cov
 }
 
-fn power_iteration(
-    matrix: &[f32],
-    dim: usize,
-    max_iter: usize,
-    tolerance: f32,
-) -> (Vec<f32>, f32) {
+fn power_iteration(matrix: &[f32], dim: usize, max_iter: usize, tolerance: f32) -> (Vec<f32>, f32) {
     // Deterministic init: use (1, 1, 1, ...) normalized
     let mut v: Vec<f32> = vec![1.0 / (dim as f32).sqrt(); dim];
     let mut eigenvalue = 0.0f32;
@@ -235,12 +235,7 @@ mod tests {
 
     #[test]
     fn test_transform_new_data() {
-        let vectors: Vec<&[f32]> = vec![
-            &[1.0, 0.0],
-            &[0.0, 1.0],
-            &[1.0, 1.0],
-            &[0.0, 0.0],
-        ];
+        let vectors: Vec<&[f32]> = vec![&[1.0, 0.0], &[0.0, 1.0], &[1.0, 1.0], &[0.0, 0.0]];
         let pca = Pca::new(PcaConfig {
             n_components: 2,
             ..Default::default()

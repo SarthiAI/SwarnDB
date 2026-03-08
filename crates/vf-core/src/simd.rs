@@ -40,6 +40,19 @@ fn scalar_manhattan(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Fused cosine: compute dot(a,b), ||a||^2, ||b||^2 in a single pass.
+fn scalar_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    (dot, norm_a, norm_b)
+}
+
 // ---------------------------------------------------------------------------
 // x86_64 AVX2 kernels
 // ---------------------------------------------------------------------------
@@ -170,6 +183,61 @@ unsafe fn avx2_manhattan(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 8;
+    let remainder = n % 8;
+
+    let mut sum_dot = _mm256_setzero_ps();
+    let mut sum_na = _mm256_setzero_ps();
+    let mut sum_nb = _mm256_setzero_ps();
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    for i in 0..chunks {
+        let offset = i * 8;
+        let va = _mm256_loadu_ps(a_ptr.add(offset));
+        let vb = _mm256_loadu_ps(b_ptr.add(offset));
+        sum_dot = _mm256_add_ps(sum_dot, _mm256_mul_ps(va, vb));
+        sum_na = _mm256_add_ps(sum_na, _mm256_mul_ps(va, va));
+        sum_nb = _mm256_add_ps(sum_nb, _mm256_mul_ps(vb, vb));
+    }
+
+    // Horizontal sum helper
+    #[inline(always)]
+    unsafe fn hsum256(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        _mm_cvtss_f32(result)
+    }
+
+    let mut dot = hsum256(sum_dot);
+    let mut norm_a = hsum256(sum_na);
+    let mut norm_b = hsum256(sum_nb);
+
+    // Scalar tail
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        let ai = a[tail_start + i];
+        let bi = b[tail_start + i];
+        dot += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
+    }
+
+    (dot, norm_a, norm_b)
+}
+
 // ---------------------------------------------------------------------------
 // x86_64 SSE4.1 kernels
 // ---------------------------------------------------------------------------
@@ -290,6 +358,58 @@ unsafe fn sse41_manhattan(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn sse41_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let chunks = n / 4;
+    let remainder = n % 4;
+
+    let mut sum_dot = _mm_setzero_ps();
+    let mut sum_na = _mm_setzero_ps();
+    let mut sum_nb = _mm_setzero_ps();
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    for i in 0..chunks {
+        let offset = i * 4;
+        let va = _mm_loadu_ps(a_ptr.add(offset));
+        let vb = _mm_loadu_ps(b_ptr.add(offset));
+        sum_dot = _mm_add_ps(sum_dot, _mm_mul_ps(va, vb));
+        sum_na = _mm_add_ps(sum_na, _mm_mul_ps(va, va));
+        sum_nb = _mm_add_ps(sum_nb, _mm_mul_ps(vb, vb));
+    }
+
+    // Horizontal sum helper
+    #[inline(always)]
+    unsafe fn hsum128(v: __m128) -> f32 {
+        let shuf = _mm_movehdup_ps(v);
+        let sums = _mm_add_ps(v, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        _mm_cvtss_f32(result)
+    }
+
+    let mut dot = hsum128(sum_dot);
+    let mut norm_a = hsum128(sum_na);
+    let mut norm_b = hsum128(sum_nb);
+
+    // Scalar tail
+    let tail_start = chunks * 4;
+    for i in 0..remainder {
+        let ai = a[tail_start + i];
+        let bi = b[tail_start + i];
+        dot += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
+    }
+
+    (dot, norm_a, norm_b)
+}
+
 // ---------------------------------------------------------------------------
 // aarch64 NEON kernels
 // ---------------------------------------------------------------------------
@@ -401,12 +521,59 @@ unsafe fn neon_manhattan(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn neon_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let chunks = n / 4;
+    let remainder = n % 4;
+
+    let mut sum_dot = vdupq_n_f32(0.0);
+    let mut sum_na = vdupq_n_f32(0.0);
+    let mut sum_nb = vdupq_n_f32(0.0);
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    for i in 0..chunks {
+        let offset = i * 4;
+        unsafe {
+            let va = vld1q_f32(a_ptr.add(offset));
+            let vb = vld1q_f32(b_ptr.add(offset));
+            sum_dot = vfmaq_f32(sum_dot, va, vb);
+            sum_na = vfmaq_f32(sum_na, va, va);
+            sum_nb = vfmaq_f32(sum_nb, vb, vb);
+        }
+    }
+
+    let mut dot = vaddvq_f32(sum_dot);
+    let mut norm_a = vaddvq_f32(sum_na);
+    let mut norm_b = vaddvq_f32(sum_nb);
+
+    // Scalar tail
+    let tail_start = chunks * 4;
+    for i in 0..remainder {
+        let ai = a[tail_start + i];
+        let bi = b[tail_start + i];
+        dot += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
+    }
+
+    (dot, norm_a, norm_b)
+}
+
 // ---------------------------------------------------------------------------
 // SimdDispatcher: runtime feature detection + function pointer dispatch
 // ---------------------------------------------------------------------------
 
 /// Function pointer type for SIMD-dispatched distance kernels.
 type SimdKernelFn = fn(&[f32], &[f32]) -> f32;
+
+/// Function pointer type for fused cosine kernel (returns dot, norm_a_sq, norm_b_sq).
+type FusedCosineKernelFn = fn(&[f32], &[f32]) -> (f32, f32, f32);
 
 /// Runtime SIMD dispatcher that detects CPU features once and stores
 /// function pointers to the best available implementation.
@@ -416,6 +583,7 @@ pub struct SimdDispatcher {
     dot_product_fn: SimdKernelFn,
     squared_l2_fn: SimdKernelFn,
     manhattan_fn: SimdKernelFn,
+    fused_cosine_fn: FusedCosineKernelFn,
 }
 
 // Function pointers are Send + Sync
@@ -425,16 +593,17 @@ unsafe impl Sync for SimdDispatcher {}
 impl SimdDispatcher {
     /// Create a new dispatcher by detecting CPU features at runtime.
     fn detect() -> Self {
-        let (dot_fn, sql2_fn, man_fn) = Self::select_kernels();
+        let (dot_fn, sql2_fn, man_fn, fused_cos_fn) = Self::select_kernels();
         SimdDispatcher {
             dot_product_fn: dot_fn,
             squared_l2_fn: sql2_fn,
             manhattan_fn: man_fn,
+            fused_cosine_fn: fused_cos_fn,
         }
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn select_kernels() -> (SimdKernelFn, SimdKernelFn, SimdKernelFn) {
+    fn select_kernels() -> (SimdKernelFn, SimdKernelFn, SimdKernelFn, FusedCosineKernelFn) {
         if is_x86_feature_detected!("avx2") {
             // Wrap the unsafe target_feature functions in safe function pointers.
             // The runtime detection guarantees AVX2 is available.
@@ -442,24 +611,27 @@ impl SimdDispatcher {
                 |a, b| unsafe { avx2_dot_product(a, b) },
                 |a, b| unsafe { avx2_squared_l2(a, b) },
                 |a, b| unsafe { avx2_manhattan(a, b) },
+                |a, b| unsafe { avx2_fused_cosine(a, b) },
             )
         } else if is_x86_feature_detected!("sse4.1") {
             (
                 |a, b| unsafe { sse41_dot_product(a, b) },
                 |a, b| unsafe { sse41_squared_l2(a, b) },
                 |a, b| unsafe { sse41_manhattan(a, b) },
+                |a, b| unsafe { sse41_fused_cosine(a, b) },
             )
         } else {
             (
                 scalar_dot_product as SimdKernelFn,
                 scalar_squared_l2 as SimdKernelFn,
                 scalar_manhattan as SimdKernelFn,
+                scalar_fused_cosine as FusedCosineKernelFn,
             )
         }
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn select_kernels() -> (SimdKernelFn, SimdKernelFn, SimdKernelFn) {
+    fn select_kernels() -> (SimdKernelFn, SimdKernelFn, SimdKernelFn, FusedCosineKernelFn) {
         // NEON is mandatory on aarch64, but we still use runtime detection
         // for consistency and future-proofing.
         if std::arch::is_aarch64_feature_detected!("neon") {
@@ -467,22 +639,25 @@ impl SimdDispatcher {
                 |a, b| unsafe { neon_dot_product(a, b) },
                 |a, b| unsafe { neon_squared_l2(a, b) },
                 |a, b| unsafe { neon_manhattan(a, b) },
+                |a, b| unsafe { neon_fused_cosine(a, b) },
             )
         } else {
             (
                 scalar_dot_product as SimdKernelFn,
                 scalar_squared_l2 as SimdKernelFn,
                 scalar_manhattan as SimdKernelFn,
+                scalar_fused_cosine as FusedCosineKernelFn,
             )
         }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn select_kernels() -> (SimdKernelFn, SimdKernelFn, SimdKernelFn) {
+    fn select_kernels() -> (SimdKernelFn, SimdKernelFn, SimdKernelFn, FusedCosineKernelFn) {
         (
             scalar_dot_product as SimdKernelFn,
             scalar_squared_l2 as SimdKernelFn,
             scalar_manhattan as SimdKernelFn,
+            scalar_fused_cosine as FusedCosineKernelFn,
         )
     }
 
@@ -503,6 +678,12 @@ impl SimdDispatcher {
     pub fn manhattan(&self, a: &[f32], b: &[f32]) -> f32 {
         (self.manhattan_fn)(a, b)
     }
+
+    /// Compute fused cosine: returns (dot_ab, norm_a_sq, norm_b_sq) in single pass.
+    #[inline]
+    pub fn fused_cosine(&self, a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+        (self.fused_cosine_fn)(a, b)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +696,66 @@ static DISPATCHER: OnceLock<SimdDispatcher> = OnceLock::new();
 /// The dispatcher is initialized on first call with runtime CPU feature detection.
 pub fn get_dispatcher() -> &'static SimdDispatcher {
     DISPATCHER.get_or_init(SimdDispatcher::detect)
+}
+
+// ---------------------------------------------------------------------------
+// Batch computation methods on SimdDispatcher
+// ---------------------------------------------------------------------------
+
+impl SimdDispatcher {
+    /// Compute dot product from one query to multiple targets.
+    /// Keeps the query vector hot in L1 cache while iterating targets.
+    #[inline]
+    pub fn batch_dot_product(&self, query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+        debug_assert_eq!(targets.len(), results.len());
+        for (i, target) in targets.iter().enumerate() {
+            debug_assert_eq!(query.len(), target.len());
+            results[i] = (self.dot_product_fn)(query, target);
+        }
+    }
+
+    /// Compute squared L2 distance from one query to multiple targets.
+    #[inline]
+    pub fn batch_squared_l2(&self, query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+        debug_assert_eq!(targets.len(), results.len());
+        for (i, target) in targets.iter().enumerate() {
+            debug_assert_eq!(query.len(), target.len());
+            results[i] = (self.squared_l2_fn)(query, target);
+        }
+    }
+
+    /// Compute Manhattan distance from one query to multiple targets.
+    #[inline]
+    pub fn batch_manhattan(&self, query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+        debug_assert_eq!(targets.len(), results.len());
+        for (i, target) in targets.iter().enumerate() {
+            debug_assert_eq!(query.len(), target.len());
+            results[i] = (self.manhattan_fn)(query, target);
+        }
+    }
+
+    /// Compute fused cosine from one query to multiple targets.
+    /// Returns (dot, norm_a_sq, norm_b_sq) triples via output slices.
+    #[inline]
+    pub fn batch_fused_cosine(
+        &self,
+        query: &[f32],
+        targets: &[&[f32]],
+        dots: &mut [f32],
+        norms_a: &mut [f32],
+        norms_b: &mut [f32],
+    ) {
+        debug_assert_eq!(targets.len(), dots.len());
+        debug_assert_eq!(targets.len(), norms_a.len());
+        debug_assert_eq!(targets.len(), norms_b.len());
+        for (i, target) in targets.iter().enumerate() {
+            debug_assert_eq!(query.len(), target.len());
+            let (d, na, nb) = (self.fused_cosine_fn)(query, target);
+            dots[i] = d;
+            norms_a[i] = na;
+            norms_b[i] = nb;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +781,44 @@ pub fn squared_l2_f32(a: &[f32], b: &[f32]) -> f32 {
 pub fn manhattan_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     get_dispatcher().manhattan(a, b)
+}
+
+/// SIMD-accelerated fused cosine computation returning (dot, norm_a_sq, norm_b_sq).
+/// Computes all three values in a single pass over the data for better cache utilization.
+#[inline]
+pub fn fused_cosine_f32(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    debug_assert_eq!(a.len(), b.len());
+    get_dispatcher().fused_cosine(a, b)
+}
+
+/// Batch SIMD-accelerated dot product: one query vs multiple targets.
+#[inline]
+pub fn batch_dot_product_f32(query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+    get_dispatcher().batch_dot_product(query, targets, results);
+}
+
+/// Batch SIMD-accelerated squared L2: one query vs multiple targets.
+#[inline]
+pub fn batch_squared_l2_f32(query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+    get_dispatcher().batch_squared_l2(query, targets, results);
+}
+
+/// Batch SIMD-accelerated Manhattan: one query vs multiple targets.
+#[inline]
+pub fn batch_manhattan_f32(query: &[f32], targets: &[&[f32]], results: &mut [f32]) {
+    get_dispatcher().batch_manhattan(query, targets, results);
+}
+
+/// Batch SIMD-accelerated fused cosine: one query vs multiple targets.
+#[inline]
+pub fn batch_fused_cosine_f32(
+    query: &[f32],
+    targets: &[&[f32]],
+    dots: &mut [f32],
+    norms_a: &mut [f32],
+    norms_b: &mut [f32],
+) {
+    get_dispatcher().batch_fused_cosine(query, targets, dots, norms_a, norms_b);
 }
 
 #[cfg(test)]
