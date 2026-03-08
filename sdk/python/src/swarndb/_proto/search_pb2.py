@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from . import common_pb2 as swarndb_dot_v1_dot_common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17swarndb/v1/search.proto\x12\nswarndb.v1\x1a\x17swarndb/v1/common.proto\"\xb6\x01\n\x10\x46ilterExpression\x12$\n\x03\x61nd\x18\x01 \x01(\x0b\x32\x15.swarndb.v1.AndFilterH\x00\x12\"\n\x02or\x18\x02 \x01(\x0b\x32\x14.swarndb.v1.OrFilterH\x00\x12$\n\x03not\x18\x03 \x01(\x0b\x32\x15.swarndb.v1.NotFilterH\x00\x12(\n\x05\x66ield\x18\x04 \x01(\x0b\x32\x17.swarndb.v1.FieldFilterH\x00\x42\x08\n\x06\x66ilter\":\n\tAndFilter\x12-\n\x07\x66ilters\x18\x01 \x03(\x0b\x32\x1c.swarndb.v1.FilterExpression\"9\n\x08OrFilter\x12-\n\x07\x66ilters\x18\x01 \x03(\x0b\x32\x1c.swarndb.v1.FilterExpression\"9\n\tNotFilter\x12,\n\x06\x66ilter\x18\x01 \x01(\x0b\x32\x1c.swarndb.v1.FilterExpression\"}\n\x0b\x46ieldFilter\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\n\n\x02op\x18\x02 \x01(\t\x12(\n\x05value\x18\x03 \x01(\x0b\x32\x19.swarndb.v1.MetadataValue\x12)\n\x06values\x18\x04 \x03(\x0b\x32\x19.swarndb.v1.MetadataValue\"\xf4\x01\n\rSearchRequest\x12\x12\n\ncollection\x18\x01 \x01(\t\x12!\n\x05query\x18\x02 \x01(\x0b\x32\x12.swarndb.v1.Vector\x12\t\n\x01k\x18\x03 \x01(\r\x12,\n\x06\x66ilter\x18\x04 \x01(\x0b\x32\x1c.swarndb.v1.FilterExpression\x12\x10\n\x08strategy\x18\x05 \x01(\t\x12\x18\n\x10include_metadata\x18\x06 \x01(\x08\x12\x15\n\rinclude_graph\x18\x07 \x01(\x08\x12\x17\n\x0fgraph_threshold\x18\x08 \x01(\x02\x12\x17\n\x0fmax_graph_edges\x18\t \x01(\r\"S\n\x0eSearchResponse\x12)\n\x07results\x18\x01 \x03(\x0b\x32\x18.swarndb.v1.ScoredResult\x12\x16\n\x0esearch_time_us\x18\x02 \x01(\x04\"@\n\x12\x42\x61tchSearchRequest\x12*\n\x07queries\x18\x01 \x03(\x0b\x32\x19.swarndb.v1.SearchRequest\"Y\n\x13\x42\x61tchSearchResponse\x12+\n\x07results\x18\x01 \x03(\x0b\x32\x1a.swarndb.v1.SearchResponse\x12\x15\n\rtotal_time_us\x18\x02 \x01(\x04\x32\xa0\x01\n\rSearchService\x12?\n\x06Search\x12\x19.swarndb.v1.SearchRequest\x1a\x1a.swarndb.v1.SearchResponse\x12N\n\x0b\x42\x61tchSearch\x12\x1e.swarndb.v1.BatchSearchRequest\x1a\x1f.swarndb.v1.BatchSearchResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17swarndb/v1/search.proto\x12\nswarndb.v1\x1a\x17swarndb/v1/common.proto\"\xb6\x01\n\x10\x46ilterExpression\x12$\n\x03\x61nd\x18\x01 \x01(\x0b\x32\x15.swarndb.v1.AndFilterH\x00\x12\"\n\x02or\x18\x02 \x01(\x0b\x32\x14.swarndb.v1.OrFilterH\x00\x12$\n\x03not\x18\x03 \x01(\x0b\x32\x15.swarndb.v1.NotFilterH\x00\x12(\n\x05\x66ield\x18\x04 \x01(\x0b\x32\x17.swarndb.v1.FieldFilterH\x00\x42\x08\n\x06\x66ilter\":\n\tAndFilter\x12-\n\x07\x66ilters\x18\x01 \x03(\x0b\x32\x1c.swarndb.v1.FilterExpression\"9\n\x08OrFilter\x12-\n\x07\x66ilters\x18\x01 \x03(\x0b\x32\x1c.swarndb.v1.FilterExpression\"9\n\tNotFilter\x12,\n\x06\x66ilter\x18\x01 \x01(\x0b\x32\x1c.swarndb.v1.FilterExpression\"}\n\x0b\x46ieldFilter\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\n\n\x02op\x18\x02 \x01(\t\x12(\n\x05value\x18\x03 \x01(\x0b\x32\x19.swarndb.v1.MetadataValue\x12)\n\x06values\x18\x04 \x03(\x0b\x32\x19.swarndb.v1.MetadataValue\"\x9a\x02\n\rSearchRequest\x12\x12\n\ncollection\x18\x01 \x01(\t\x12!\n\x05query\x18\x02 \x01(\x0b\x32\x12.swarndb.v1.Vector\x12\t\n\x01k\x18\x03 \x01(\r\x12,\n\x06\x66ilter\x18\x04 \x01(\x0b\x32\x1c.swarndb.v1.FilterExpression\x12\x10\n\x08strategy\x18\x05 \x01(\t\x12\x18\n\x10include_metadata\x18\x06 \x01(\x08\x12\x15\n\rinclude_graph\x18\x07 \x01(\x08\x12\x17\n\x0fgraph_threshold\x18\x08 \x01(\x02\x12\x17\n\x0fmax_graph_edges\x18\t \x01(\r\x12\x16\n\tef_search\x18\n \x01(\rH\x00\x88\x01\x01\x42\x0c\n\n_ef_search\"d\n\x0eSearchResponse\x12)\n\x07results\x18\x01 \x03(\x0b\x32\x18.swarndb.v1.ScoredResult\x12\x16\n\x0esearch_time_us\x18\x02 \x01(\x04\x12\x0f\n\x07warning\x18\x03 \x01(\t\"@\n\x12\x42\x61tchSearchRequest\x12*\n\x07queries\x18\x01 \x03(\x0b\x32\x19.swarndb.v1.SearchRequest\"Y\n\x13\x42\x61tchSearchResponse\x12+\n\x07results\x18\x01 \x03(\x0b\x32\x1a.swarndb.v1.SearchResponse\x12\x15\n\rtotal_time_us\x18\x02 \x01(\x04\x32\xa0\x01\n\rSearchService\x12?\n\x06Search\x12\x19.swarndb.v1.SearchRequest\x1a\x1a.swarndb.v1.SearchResponse\x12N\n\x0b\x42\x61tchSearch\x12\x1e.swarndb.v1.BatchSearchRequest\x1a\x1f.swarndb.v1.BatchSearchResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -43,13 +43,13 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_FIELDFILTER']._serialized_start=427
   _globals['_FIELDFILTER']._serialized_end=552
   _globals['_SEARCHREQUEST']._serialized_start=555
-  _globals['_SEARCHREQUEST']._serialized_end=799
-  _globals['_SEARCHRESPONSE']._serialized_start=801
-  _globals['_SEARCHRESPONSE']._serialized_end=884
-  _globals['_BATCHSEARCHREQUEST']._serialized_start=886
-  _globals['_BATCHSEARCHREQUEST']._serialized_end=950
-  _globals['_BATCHSEARCHRESPONSE']._serialized_start=952
-  _globals['_BATCHSEARCHRESPONSE']._serialized_end=1041
-  _globals['_SEARCHSERVICE']._serialized_start=1044
-  _globals['_SEARCHSERVICE']._serialized_end=1204
+  _globals['_SEARCHREQUEST']._serialized_end=837
+  _globals['_SEARCHRESPONSE']._serialized_start=839
+  _globals['_SEARCHRESPONSE']._serialized_end=939
+  _globals['_BATCHSEARCHREQUEST']._serialized_start=941
+  _globals['_BATCHSEARCHREQUEST']._serialized_end=1005
+  _globals['_BATCHSEARCHRESPONSE']._serialized_start=1007
+  _globals['_BATCHSEARCHRESPONSE']._serialized_end=1096
+  _globals['_SEARCHSERVICE']._serialized_start=1099
+  _globals['_SEARCHSERVICE']._serialized_end=1259
 # @@protoc_insertion_point(module_scope)

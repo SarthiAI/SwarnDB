@@ -95,7 +95,7 @@ impl VectorIndex for BruteForceIndex {
             .ok_or(IndexError::NotFound(id))
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredResult>, IndexError> {
+    fn search(&self, query: &[f32], k: usize, _ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError> {
         if query.len() != self.dimension {
             return Err(IndexError::DimensionMismatch {
                 expected: self.dimension,
@@ -116,6 +116,7 @@ impl VectorIndex for BruteForceIndex {
         query: &[f32],
         k: usize,
         candidates: &[VectorId],
+        _ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, IndexError> {
         if query.len() != self.dimension {
             return Err(IndexError::DimensionMismatch {
@@ -201,7 +202,7 @@ mod tests {
     fn test_search_euclidean() {
         let index = make_index();
         // Query [1, 0, 0] — should find itself (id=0) as nearest
-        let results = index.search(&[1.0, 0.0, 0.0], 3).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 3, None).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, 0); // exact match
         assert!((results[0].score - 0.0).abs() < 1e-6);
@@ -214,7 +215,7 @@ mod tests {
         index.add(1, &[0.9, 0.1, 0.0]).unwrap();
         index.add(2, &[0.0, 1.0, 0.0]).unwrap();
 
-        let results = index.search(&[1.0, 0.0, 0.0], 2).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 2, None).unwrap();
         assert_eq!(results[0].id, 0); // exact match
         assert_eq!(results[1].id, 1); // close in direction
     }
@@ -222,14 +223,14 @@ mod tests {
     #[test]
     fn test_search_k_larger_than_index() {
         let index = make_index();
-        let results = index.search(&[1.0, 0.0, 0.0], 100).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 100, None).unwrap();
         assert_eq!(results.len(), 5); // only 5 vectors in index
     }
 
     #[test]
     fn test_search_empty_index() {
         let index = BruteForceIndex::new(3, DistanceMetricType::Euclidean);
-        let results = index.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 5, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -239,7 +240,7 @@ mod tests {
         // Only search among vectors 0 and 2
         let candidates = vec![0, 2];
         let results = index
-            .search_with_candidates(&[1.0, 0.0, 0.0], 5, &candidates)
+            .search_with_candidates(&[1.0, 0.0, 0.0], 5, &candidates, None)
             .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 0); // closer
@@ -248,7 +249,7 @@ mod tests {
     #[test]
     fn test_search_dimension_mismatch() {
         let index = make_index();
-        let result = index.search(&[1.0, 0.0], 5);
+        let result = index.search(&[1.0, 0.0], 5, None);
         assert!(matches!(
             result,
             Err(IndexError::DimensionMismatch {
@@ -261,7 +262,7 @@ mod tests {
     #[test]
     fn test_results_sorted_by_distance() {
         let index = make_index();
-        let results = index.search(&[0.5, 0.5, 0.5], 5).unwrap();
+        let results = index.search(&[0.5, 0.5, 0.5], 5, None).unwrap();
         for i in 1..results.len() {
             assert!(
                 results[i].score >= results[i - 1].score,
@@ -285,7 +286,7 @@ mod tests {
     fn test_search_after_remove() {
         let index = make_index();
         index.remove(0).unwrap();
-        let results = index.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 5, None).unwrap();
         // Vector 0 should not appear in results
         for r in &results {
             assert_ne!(r.id, 0);
@@ -301,7 +302,7 @@ mod tests {
 
         // Query [1, 0, 0]: dot products are 1, 0, 2. Negated: -1, 0, -2.
         // Sorted ascending: -2 (id=2), -1 (id=0), 0 (id=1)
-        let results = index.search(&[1.0, 0.0, 0.0], 3).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 3, None).unwrap();
         assert_eq!(results[0].id, 2); // highest dot product
         assert_eq!(results[1].id, 0);
         assert_eq!(results[2].id, 1);
@@ -318,7 +319,7 @@ mod tests {
         assert_eq!(index.len(), 10_000);
 
         let query: Vec<f32> = (0..128).map(|d| 50.0 * 0.01 + d as f32 * 0.001).collect();
-        let results = index.search(&query, 10).unwrap();
+        let results = index.search(&query, 10, None).unwrap();
         assert_eq!(results.len(), 10);
         // The closest should be vector 50 (exact match of the query pattern)
         assert_eq!(results[0].id, 50);

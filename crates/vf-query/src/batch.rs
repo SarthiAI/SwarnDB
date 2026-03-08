@@ -18,6 +18,7 @@ pub struct BatchQuery {
     pub k: usize,
     pub filter: Option<FilterExpression>,
     pub strategy: FilterStrategy,
+    pub ef_search: Option<usize>,
 }
 
 pub struct BatchResult {
@@ -45,6 +46,7 @@ impl BatchExecutor {
                     &q.strategy,
                     index_manager,
                     metadata_store,
+                    q.ef_search,
                 )
             })
             .collect()
@@ -58,6 +60,7 @@ impl BatchExecutor {
         strategy: &FilterStrategy,
         index_manager: Option<&IndexManager>,
         metadata_store: &HashMap<VectorId, Metadata>,
+        ef_search: Option<usize>,
     ) -> Vec<Result<Vec<ScoredResult>, QueryError>> {
         query_vectors
             .par_iter()
@@ -70,6 +73,7 @@ impl BatchExecutor {
                     strategy,
                     index_manager,
                     metadata_store,
+                    ef_search,
                 )
             })
             .collect()

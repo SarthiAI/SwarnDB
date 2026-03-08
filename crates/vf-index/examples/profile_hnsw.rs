@@ -58,7 +58,7 @@ fn main() {
     let search_start = Instant::now();
     let mut total_results = 0usize;
     for query in &queries {
-        let results = index.search(query, K).expect("search failed");
+        let results = index.search(query, K, None).expect("search failed");
         total_results += results.len();
     }
     let search_elapsed = search_start.elapsed();

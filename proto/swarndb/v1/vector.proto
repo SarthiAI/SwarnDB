@@ -9,6 +9,8 @@ service VectorService {
   rpc Update(UpdateRequest) returns (UpdateResponse);
   rpc Delete(DeleteVectorRequest) returns (DeleteVectorResponse);
   rpc BulkInsert(stream InsertRequest) returns (BulkInsertResponse);
+  rpc BulkInsertWithOptions(stream BulkInsertStreamMessage) returns (BulkInsertResponse);
+  rpc Optimize(OptimizeRequest) returns (OptimizeResponse);
 }
 
 message InsertRequest {
@@ -57,4 +59,32 @@ message DeleteVectorResponse {
 message BulkInsertResponse {
   uint64 inserted_count = 1;
   repeated string errors = 2;
+}
+
+message BulkInsertOptions {
+  uint32 batch_lock_size = 1;        // Number of vectors to lock-and-insert at once (default: 1, max: 10000)
+  bool defer_graph = 2;              // Skip graph computation during insert, rebuild via optimize()
+  uint32 wal_flush_every = 3;        // Flush WAL every N vectors (default: 1, 0 = disable WAL)
+  uint32 ef_construction = 4;        // Override HNSW ef_construction for this bulk insert (0 = use collection default)
+  string index_mode = 5;             // "immediate" (default) or "deferred"
+  bool skip_metadata_index = 6;      // Skip per-vector metadata indexing, rebuild via optimize()
+  bool parallel_build = 7;           // Use parallel HNSW construction (only with index_mode=deferred)
+}
+
+message BulkInsertStreamMessage {
+  oneof payload {
+    BulkInsertOptions options = 1;    // First message: options
+    InsertRequest vector = 2;         // Subsequent messages: vectors
+  }
+}
+
+message OptimizeRequest {
+  string collection = 1;
+}
+
+message OptimizeResponse {
+  string status = 1;                 // "completed", "already_optimized", "error"
+  string message = 2;
+  uint64 duration_ms = 3;
+  uint64 vectors_processed = 4;
 }

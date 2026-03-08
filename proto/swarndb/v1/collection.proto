@@ -41,6 +41,7 @@ message GetCollectionResponse {
   string distance_metric = 3;
   uint64 vector_count = 4;
   float default_threshold = 5;
+  string status = 6;  // "ready", "pending_optimization", "optimizing"
 }
 
 message ListCollectionsRequest {}

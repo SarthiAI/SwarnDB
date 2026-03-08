@@ -53,6 +53,7 @@ from swarndb.exceptions import (
 from swarndb.search import Filter, _to_proto_value, _scored_result_from_proto
 from swarndb.types import (
     BatchSearchResult,
+    BulkInsertOptions,
     BulkInsertResult,
     ClusterAssignment,
     ClusterResult,
@@ -62,6 +63,7 @@ from swarndb.types import (
     DriftReport,
     GhostVector,
     GraphEdge,
+    OptimizeResult,
     PCAResult,
     ScoredResult,
     SearchResult,
@@ -460,6 +462,52 @@ class AsyncCollectionAPI:
         except CollectionNotFoundError:
             return False
 
+    async def optimize(self, collection: str) -> OptimizeResult:
+        """Rebuild deferred indexes, graph, and metadata indexes.
+
+        Call this after bulk inserting with ``defer_graph=True`` or
+        ``index_mode="deferred"`` to finalize the collection's indexes.
+
+        Args:
+            collection: Collection name to optimize.
+
+        Returns:
+            An OptimizeResult with status, message, duration, and
+            number of vectors processed.
+
+        Raises:
+            CollectionNotFoundError: If the collection does not exist.
+        """
+        request = vector_pb2.OptimizeRequest(collection=collection)
+        response = await self._client._call(
+            self._client._vector_stub.Optimize, request
+        )
+        return OptimizeResult(
+            status=response.status,
+            message=response.message,
+            duration_ms=response.duration_ms,
+            vectors_processed=response.vectors_processed,
+        )
+
+    async def get_status(self, collection: str) -> str:
+        """Get collection optimization status.
+
+        Args:
+            collection: Collection name.
+
+        Returns:
+            One of: ``"ready"``, ``"pending_optimization"``, or
+            ``"optimizing"``.
+
+        Raises:
+            CollectionNotFoundError: If the collection does not exist.
+        """
+        request = collection_pb2.GetCollectionRequest(name=collection)
+        response = await self._client._call(
+            self._client._collection_stub.GetCollection, request
+        )
+        return response.status or "ready"
+
 
 # ---------------------------------------------------------------------------
 # AsyncVectorAPI
@@ -590,6 +638,13 @@ class AsyncVectorAPI:
         metadata_list: Optional[List[Dict[str, Any]]] = None,
         ids: Optional[List[int]] = None,
         batch_size: int = 1000,
+        batch_lock_size: Optional[int] = None,
+        defer_graph: bool = False,
+        wal_flush_every: Optional[int] = None,
+        ef_construction: Optional[int] = None,
+        index_mode: Optional[str] = None,
+        skip_metadata_index: bool = False,
+        parallel_build: bool = False,
     ) -> BulkInsertResult:
         """Bulk insert vectors using async streaming RPC.
 
@@ -603,12 +658,26 @@ class AsyncVectorAPI:
             ids: Optional per-vector IDs (must match length of ``vectors``
                 if provided). Use 0 for auto-assignment.
             batch_size: Number of vectors per streaming batch.
+            batch_lock_size: Vectors per lock acquisition (server default=1,
+                max=10000). Higher values reduce lock overhead.
+            defer_graph: If True, skip graph computation during insert.
+                Use ``client.collections.optimize()`` afterward.
+            wal_flush_every: WAL flush interval in operations (default=1,
+                0=disable WAL flushing for max throughput).
+            ef_construction: Override HNSW ef_construction for this batch.
+            index_mode: Index build mode: ``"immediate"`` (default) or
+                ``"deferred"`` (build index after all inserts).
+            skip_metadata_index: If True, skip metadata indexing during
+                insert for faster ingestion.
+            parallel_build: If True, use parallel HNSW construction
+                (only effective with ``index_mode="deferred"``).
 
         Returns:
             A BulkInsertResult with inserted_count and any errors.
 
         Raises:
-            ValueError: If metadata_list or ids length doesn't match vectors.
+            ValueError: If metadata_list or ids length doesn't match vectors,
+                or if index_mode is not a valid value.
         """
         total = len(vectors)
 
@@ -621,6 +690,32 @@ class AsyncVectorAPI:
             raise ValueError(
                 f"ids length ({len(ids)}) must match vectors length ({total})"
             )
+        if index_mode is not None and index_mode not in ("immediate", "deferred"):
+            raise ValueError(
+                f"index_mode must be 'immediate' or 'deferred', "
+                f"got {index_mode!r}"
+            )
+        if batch_lock_size is not None and (batch_lock_size < 1 or batch_lock_size > 10000):
+            raise ValueError(
+                f"batch_lock_size must be between 1 and 10000, "
+                f"got {batch_lock_size}"
+            )
+        if parallel_build and index_mode not in (None, "deferred"):
+            raise ValueError(
+                "parallel_build=True requires index_mode='deferred'"
+            )
+
+        # Build options to determine which RPC to use
+        options = BulkInsertOptions(
+            batch_lock_size=batch_lock_size,
+            defer_graph=defer_graph,
+            wal_flush_every=wal_flush_every,
+            ef_construction=ef_construction,
+            index_mode=index_mode,
+            skip_metadata_index=skip_metadata_index,
+            parallel_build=parallel_build,
+        )
+        use_optimized_rpc = options.has_non_defaults()
 
         async def _request_iterator() -> AsyncIterator[vector_pb2.InsertRequest]:
             """Yield InsertRequest messages asynchronously."""
@@ -636,6 +731,29 @@ class AsyncVectorAPI:
                     )
                 yield req
 
+        async def _options_request_iterator() -> AsyncIterator:
+            """Yield options message first, then vector InsertRequests.
+
+            Uses the BulkInsertWithOptions streaming RPC where the first
+            message contains BulkInsertOptions and subsequent messages
+            contain the vectors.
+            """
+            options_msg = vector_pb2.BulkInsertStreamMessage(
+                options=vector_pb2.BulkInsertOptions(
+                    batch_lock_size=options.batch_lock_size or 0,
+                    defer_graph=options.defer_graph,
+                    wal_flush_every=options.wal_flush_every or 0,
+                    ef_construction=options.ef_construction or 0,
+                    index_mode=options.index_mode or "",
+                    skip_metadata_index=options.skip_metadata_index,
+                    parallel_build=options.parallel_build,
+                )
+            )
+            yield options_msg
+
+            async for req in _request_iterator():
+                yield vector_pb2.BulkInsertStreamMessage(vector=req)
+
         # BulkInsert is stream_unary: stream requests, get one response.
         # Cannot use _call (unary-unary), so call stub directly with retry.
         metadata = self._client._metadata()
@@ -644,11 +762,31 @@ class AsyncVectorAPI:
 
         for attempt in range(self._client._max_retries + 1):
             try:
-                response = await self._client._vector_stub.BulkInsert(
-                    _request_iterator(),
-                    timeout=call_timeout,
-                    metadata=metadata,
-                )
+                if use_optimized_rpc:
+                    logger.info(
+                        "Async BulkInsert with options: batch_lock_size=%s, "
+                        "defer_graph=%s, wal_flush_every=%s, "
+                        "ef_construction=%s, index_mode=%s, "
+                        "skip_metadata_index=%s, parallel_build=%s",
+                        options.batch_lock_size,
+                        options.defer_graph,
+                        options.wal_flush_every,
+                        options.ef_construction,
+                        options.index_mode,
+                        options.skip_metadata_index,
+                        options.parallel_build,
+                    )
+                    response = await self._client._vector_stub.BulkInsertWithOptions(
+                        _options_request_iterator(),
+                        timeout=call_timeout,
+                        metadata=metadata,
+                    )
+                else:
+                    response = await self._client._vector_stub.BulkInsert(
+                        _request_iterator(),
+                        timeout=call_timeout,
+                        metadata=metadata,
+                    )
                 return BulkInsertResult(
                     inserted_count=response.inserted_count,
                     errors=list(response.errors),
@@ -699,6 +837,7 @@ class AsyncSearchAPI:
         include_graph: bool = False,
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
+        ef_search: Optional[int] = None,
     ) -> SearchResult:
         """Search for nearest neighbors.
 
@@ -712,6 +851,7 @@ class AsyncSearchAPI:
             include_graph: Whether to include graph edges in results.
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
+            ef_search: Optional HNSW ef_search override for this query.
 
         Returns:
             SearchResult with ``.results`` list and ``.search_time_us``.
@@ -736,6 +876,8 @@ class AsyncSearchAPI:
             graph_threshold=graph_threshold,
             max_graph_edges=max_graph_edges,
         )
+        if ef_search is not None:
+            request.ef_search = ef_search
         if filter is not None:
             request.filter.CopyFrom(filter._to_proto())
 
@@ -748,6 +890,7 @@ class AsyncSearchAPI:
         return SearchResult(
             results=results,
             search_time_us=response.search_time_us,
+            warning=getattr(response, 'warning', '') or '',
         )
 
     async def batch(
@@ -762,6 +905,7 @@ class AsyncSearchAPI:
         include_graph: bool = False,
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
+        ef_search: Optional[int] = None,
     ) -> BatchSearchResult:
         """Batch search multiple queries against a collection.
 
@@ -775,6 +919,7 @@ class AsyncSearchAPI:
             include_graph: Whether to include graph edges in results.
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
+            ef_search: Optional HNSW ef_search override applied to all queries.
 
         Returns:
             BatchSearchResult with ``.results`` (list of SearchResult)
@@ -804,6 +949,8 @@ class AsyncSearchAPI:
                 graph_threshold=graph_threshold,
                 max_graph_edges=max_graph_edges,
             )
+            if ef_search is not None:
+                req.ef_search = ef_search
             if proto_filter is not None:
                 req.filter.CopyFrom(proto_filter)
             search_requests.append(req)
@@ -819,7 +966,11 @@ class AsyncSearchAPI:
         for sr in response.results:
             results = [_scored_result_from_proto(r) for r in sr.results]
             search_results.append(
-                SearchResult(results=results, search_time_us=sr.search_time_us)
+                SearchResult(
+                    results=results,
+                    search_time_us=sr.search_time_us,
+                    warning=getattr(sr, 'warning', '') or '',
+                )
             )
 
         return BatchSearchResult(

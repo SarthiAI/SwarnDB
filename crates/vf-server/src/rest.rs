@@ -4,6 +4,7 @@
 // Change License: MIT
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use axum::extract::{Path, Query, State, FromRequest};
@@ -23,8 +24,13 @@ use vf_query::vector_math::*;
 use vf_query::{FilterExpression, FilterStrategy, IndexManager, QueryExecutor};
 
 use crate::convert::{distance_metric_to_string, parse_distance_metric};
-use crate::state::{AppState, CollectionState, MetadataCache};
-use crate::validation::{validate_collection_name, ValidationConfig};
+use crate::metrics;
+use crate::state::{AppState, CollectionState, CollectionStatus, MetadataCache};
+use crate::validation::{
+    validate_batch_lock_size, validate_bulk_insert_options, validate_collection_name,
+    validate_ef_construction, validate_ef_search, validate_index_mode, validate_wal_flush_every,
+    ValidationConfig,
+};
 
 // ── Error handling ──────────────────────────────────────────────────────
 
@@ -89,6 +95,7 @@ pub struct CollectionInfo {
     pub distance_metric: String,
     pub vector_count: u64,
     pub default_threshold: f32,
+    pub status: String,
 }
 
 #[derive(Serialize)]
@@ -147,6 +154,20 @@ pub struct DeleteVectorRes {
 #[derive(Deserialize)]
 pub struct BulkInsertReq {
     pub vectors: Vec<InsertVectorReq>,
+    #[serde(default)]
+    pub batch_lock_size: Option<u32>,
+    #[serde(default)]
+    pub defer_graph: Option<bool>,
+    #[serde(default)]
+    pub wal_flush_every: Option<u32>,
+    #[serde(default)]
+    pub ef_construction: Option<u32>,
+    #[serde(default)]
+    pub index_mode: Option<String>,
+    #[serde(default)]
+    pub skip_metadata_index: Option<bool>,
+    #[serde(default)]
+    pub parallel_build: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -177,6 +198,8 @@ pub struct SearchReq {
     pub graph_threshold: f32,
     #[serde(default = "default_max_graph_edges")]
     pub max_graph_edges: u32,
+    #[serde(default)]
+    pub ef_search: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -193,6 +216,8 @@ pub struct ScoredResult {
 pub struct SearchRes {
     pub results: Vec<ScoredResult>,
     pub search_time_us: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub warning: String,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +242,8 @@ pub struct BatchSearchQuery {
     pub graph_threshold: f32,
     #[serde(default = "default_max_graph_edges")]
     pub max_graph_edges: u32,
+    #[serde(default)]
+    pub ef_search: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -299,6 +326,7 @@ pub fn rest_router(state: AppState) -> Router {
         .route("/api/v1/collections/{collection}/vectors/{id}", put(update_vector))
         .route("/api/v1/collections/{collection}/vectors/{id}", delete(delete_vector))
         .route("/api/v1/collections/{collection}/vectors/bulk", post(bulk_insert))
+        .route("/api/v1/collections/{collection}/optimize", post(optimize_collection))
         // Search
         .route("/api/v1/collections/{collection}/search", post(search))
         .route("/api/v1/search/batch", post(batch_search))
@@ -372,7 +400,7 @@ async fn create_collection(
         }
     }
 
-    let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new() };
+    let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new(), status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)), deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) };
 
     let mut collections = state.collections.write();
     collections.insert(req.name.clone(), collection_state);
@@ -384,12 +412,16 @@ async fn list_collections(
     State(state): State<AppState>,
 ) -> Json<ListCollectionsRes> {
     let collections = state.collections.read();
-    let list = collections.values().map(|c| CollectionInfo {
-        name: c.config.name.clone(),
-        dimension: c.config.dimension as u32,
-        distance_metric: distance_metric_to_string(c.config.distance_metric),
-        vector_count: c.store.len() as u64,
-        default_threshold: c.config.default_similarity_threshold.unwrap_or(0.0),
+    let list = collections.values().map(|c| {
+        let status_str = c.status.read().unwrap().as_str().to_string();
+        CollectionInfo {
+            name: c.config.name.clone(),
+            dimension: c.config.dimension as u32,
+            distance_metric: distance_metric_to_string(c.config.distance_metric),
+            vector_count: c.store.len() as u64,
+            default_threshold: c.config.default_similarity_threshold.unwrap_or(0.0),
+            status: status_str,
+        }
     }).collect();
     Json(ListCollectionsRes { collections: list })
 }
@@ -401,12 +433,14 @@ async fn get_collection(
     let collections = state.collections.read();
     let c = collections.get(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", name)))?;
+    let status_str = c.status.read().unwrap().as_str().to_string();
     Ok(Json(CollectionInfo {
         name: c.config.name.clone(),
         dimension: c.config.dimension as u32,
         distance_metric: distance_metric_to_string(c.config.distance_metric),
         vector_count: c.store.len() as u64,
         default_threshold: c.config.default_similarity_threshold.unwrap_or(0.0),
+        status: status_str,
     }))
 }
 
@@ -610,7 +644,49 @@ async fn bulk_insert(
     let mut inserted_count: u64 = 0;
     let mut errors: Vec<String> = Vec::new();
     let mut inserted_ids: Vec<u64> = Vec::new();
-    let mut inserted_vectors: std::collections::HashMap<u64, Vec<f32>> = std::collections::HashMap::new();
+    let mut inserted_vectors: HashMap<u64, Vec<f32>> = HashMap::new();
+
+    // Validate and extract optimization parameters
+    let index_mode = req.index_mode.as_deref().unwrap_or("immediate");
+    validate_index_mode(index_mode)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let raw_batch_lock_size = req.batch_lock_size.unwrap_or(1);
+    validate_batch_lock_size(raw_batch_lock_size, state.max_batch_lock_size)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let raw_wal_flush_every = req.wal_flush_every.unwrap_or(1);
+    validate_wal_flush_every(raw_wal_flush_every, state.max_wal_flush_interval)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if let Some(ef) = req.ef_construction {
+        if ef > 0 {
+            validate_ef_construction(ef, state.max_ef_construction)
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            tracing::info!(ef_construction = ef, "ef_construction override for bulk insert");
+        }
+    }
+
+    let parallel_build = req.parallel_build.unwrap_or(false);
+    validate_bulk_insert_options(parallel_build, index_mode)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let defer_graph = req.defer_graph.unwrap_or(false);
+    if defer_graph {
+        tracing::warn!("defer_graph enabled: search may return stale results until optimize() is called");
+    }
+
+    // Reject empty vector list early
+    if req.vectors.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "vectors list is empty".to_string()));
+    }
+
+    let batch_lock_size = raw_batch_lock_size.max(1) as usize;
+    let wal_flush_every = raw_wal_flush_every as usize;
+    let _ef_construction = req.ef_construction; // TODO: HNSW parameter override
+    let deferred_index_mode = index_mode == "deferred";
+    let skip_metadata_index = req.skip_metadata_index.unwrap_or(false);
+    let _parallel_build = parallel_build; // stored for optimize()
 
     // Verify collection exists before iterating
     {
@@ -620,6 +696,15 @@ async fn bulk_insert(
         }
     }
 
+    // Pre-validate and parse all vectors before acquiring locks
+    struct PreparedVector {
+        index: usize,
+        id: u64,
+        values: Vec<f32>,
+        metadata: Option<Metadata>,
+    }
+
+    let mut prepared: Vec<PreparedVector> = Vec::with_capacity(req.vectors.len());
     for (i, v) in req.vectors.into_iter().enumerate() {
         if v.values.is_empty() {
             errors.push(format!("item {}: missing or empty vector", i));
@@ -634,84 +719,130 @@ async fn bulk_insert(
             }
         };
 
-        let vector_data = VectorData::F32(v.values.clone());
+        prepared.push(PreparedVector {
+            index: i,
+            id: v.id,
+            values: v.values,
+            metadata: core_metadata,
+        });
+    }
 
-        // Acquire collections write lock for in-memory insert, then release it
-        let assigned_id = {
+    // Process vectors in batches (batch_lock_size controls how many vectors
+    // are inserted per lock acquisition to reduce lock contention)
+    let mut wal_counter: usize = 0;
+    let mut pending_wal: Vec<(u64, Vec<f32>, Option<Metadata>)> = Vec::new();
+
+    for chunk in prepared.chunks(batch_lock_size.max(1)) {
+        // Acquire write lock once per batch
+        let mut batch_assigned: Vec<(u64, Vec<f32>, Option<Metadata>)> = Vec::new();
+
+        {
             let mut collections = state.collections.write();
             let coll = match collections.get_mut(&collection) {
                 Some(c) => c,
                 None => {
-                    errors.push(format!("collection '{}' not found", collection));
+                    for pv in chunk {
+                        errors.push(format!("item {}: collection '{}' not found", pv.index, collection));
+                    }
                     continue;
                 }
             };
 
-            if v.values.len() != coll.config.dimension {
-                errors.push(format!("item {}: vector dimension mismatch: expected {}, got {}", i, coll.config.dimension, v.values.len()));
-                continue;
-            }
+            for pv in chunk {
+                if pv.values.len() != coll.config.dimension {
+                    errors.push(format!(
+                        "item {}: vector dimension mismatch: expected {}, got {}",
+                        pv.index, coll.config.dimension, pv.values.len()
+                    ));
+                    continue;
+                }
 
-            let assigned_id = if v.id == 0 {
-                match coll.store.insert_auto_id(vector_data, core_metadata.clone()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        errors.push(format!("item {}: store insert failed: {}", i, e));
+                let vector_data = VectorData::F32(pv.values.clone());
+
+                let assigned_id = if pv.id == 0 {
+                    match coll.store.insert_auto_id(vector_data, pv.metadata.clone()) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            errors.push(format!("item {}: store insert failed: {}", pv.index, e));
+                            continue;
+                        }
+                    }
+                } else {
+                    let record = VectorRecord::new(pv.id, vector_data, pv.metadata.clone());
+                    match coll.store.insert(record) {
+                        Ok(()) => pv.id,
+                        Err(e) => {
+                            errors.push(format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e));
+                            continue;
+                        }
+                    }
+                };
+
+                // Index: skip if deferred mode
+                if !deferred_index_mode {
+                    if let Err(e) = coll.index.add(assigned_id, &pv.values) {
+                        let _ = coll.store.delete(assigned_id);
+                        errors.push(format!("item {}: index insert failed: {}", pv.index, e));
                         continue;
                     }
                 }
-            } else {
-                let record = VectorRecord::new(v.id, vector_data, core_metadata.clone());
-                match coll.store.insert(record) {
-                    Ok(()) => v.id,
-                    Err(e) => {
-                        errors.push(format!("item {}: store insert failed for id {}: {}", i, v.id, e));
-                        continue;
+
+                // Metadata index: skip if flag set
+                if !skip_metadata_index {
+                    if let Some(ref meta) = pv.metadata {
+                        coll.index_manager.index_record(assigned_id, meta);
                     }
                 }
-            };
 
-            if let Err(e) = coll.index.add(assigned_id, &v.values) {
-                // Rollback: remove from store since index add failed
-                let _ = coll.store.delete(assigned_id);
-                errors.push(format!("item {}: index insert failed: {}", i, e));
-                continue;
+                // Graph: compute per-vector only if not deferred
+                if !defer_graph {
+                    if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
+                        &mut coll.graph, &coll.index, assigned_id, &pv.values, 10,
+                    ) {
+                        tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
+                    }
+                }
+
+                batch_assigned.push((assigned_id, pv.values.clone(), pv.metadata.clone()));
+                inserted_ids.push(assigned_id);
+                inserted_vectors.insert(assigned_id, pv.values.clone());
+                inserted_count += 1;
             }
+        } // write lock released
 
-            if let Some(ref meta) = core_metadata {
-                coll.index_manager.index_record(assigned_id, meta);
+        // WAL persistence with batched flushing
+        for (assigned_id, values, core_metadata) in batch_assigned {
+            pending_wal.push((assigned_id, values, core_metadata));
+            wal_counter += 1;
+
+            if wal_flush_every <= 1 || wal_counter >= wal_flush_every {
+                let mut cm = state.collection_manager.write();
+                if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
+                    for (id, vals, meta) in pending_wal.drain(..) {
+                        if let Err(e) = storage_coll.insert(id, VectorData::F32(vals), meta) {
+                            tracing::warn!(collection = %collection, id = id, "storage bulk insert failed: {}", e);
+                        }
+                    }
+                }
+                wal_counter = 0;
             }
+        }
+    }
 
-            // Compute virtual graph edges for the newly inserted vector
-            if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-                &mut coll.graph, &coll.index, assigned_id, &v.values, 10,
-            ) {
-                tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
-            }
-
-            assigned_id
-        }; // collections write lock released here
-
-        // Save values for batch graph recomputation before they're moved
-        let values_for_graph = v.values.clone();
-
-        // Persist to storage layer (best-effort) - separate lock acquisition
-        {
-            let mut cm = state.collection_manager.write();
-            if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
-                if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(v.values), core_metadata) {
-                    tracing::warn!(collection = %collection, id = assigned_id, "storage bulk insert failed: {}", e);
+    // Flush any remaining WAL entries
+    if !pending_wal.is_empty() {
+        let mut cm = state.collection_manager.write();
+        if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
+            for (id, vals, meta) in pending_wal.drain(..) {
+                if let Err(e) = storage_coll.insert(id, VectorData::F32(vals), meta) {
+                    tracing::warn!(collection = %collection, id = id, "storage bulk insert failed: {}", e);
                 }
             }
         }
-
-        inserted_ids.push(assigned_id);
-        inserted_vectors.insert(assigned_id, values_for_graph);
-        inserted_count += 1;
     }
 
-    // Recompute graph edges for all inserted vectors now that the full index is available
-    if !inserted_ids.is_empty() {
+    // Batch graph recomputation (only when graph is NOT deferred)
+    if !defer_graph && !inserted_ids.is_empty() {
         let mut collections = state.collections.write();
         if let Some(coll) = collections.get_mut(&collection) {
             if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
@@ -722,7 +853,56 @@ async fn bulk_insert(
         }
     }
 
+    // Set deferred flags and update collection status if any optimization was deferred
+    if inserted_count > 0 && (deferred_index_mode || defer_graph || skip_metadata_index) {
+        let collections = state.collections.read();
+        if let Some(coll) = collections.get(&collection) {
+            if deferred_index_mode {
+                coll.deferred_index.store(true, Ordering::Release);
+            }
+            if defer_graph {
+                coll.deferred_graph.store(true, Ordering::Release);
+            }
+            if skip_metadata_index {
+                coll.deferred_metadata.store(true, Ordering::Release);
+            }
+            // Mark collection as pending optimization
+            if let Ok(mut status) = coll.status.write() {
+                *status = CollectionStatus::PendingOptimization;
+            }
+        }
+    }
+
     Ok(Json(BulkInsertRes { inserted_count, errors }))
+}
+
+// ── Optimize handler ────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct OptimizeRes {
+    status: String,
+    message: String,
+    duration_ms: u64,
+    vectors_processed: u64,
+}
+
+async fn optimize_collection(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<OptimizeRes>, (StatusCode, Json<ErrorResponse>)> {
+    match state.optimize_collection(&collection) {
+        Ok(result) => Ok(Json(OptimizeRes {
+            status: result.status,
+            message: result.message,
+            duration_ms: result.duration_ms,
+            vectors_processed: result.vectors_processed,
+        })),
+        Err(e) if e.contains("not found") => Err(err(StatusCode::NOT_FOUND, e)),
+        Err(e) if e.contains("already being optimized") => {
+            Err(err(StatusCode::CONFLICT, e))
+        }
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
 }
 
 // ── Search handlers ─────────────────────────────────────────────────────
@@ -744,6 +924,14 @@ async fn search(
 
     let strategy = parse_strategy(&req.strategy);
 
+    let ef_search = validate_ef_search(req.ef_search, state.max_ef_search)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if let Some(ef) = ef_search {
+        tracing::debug!(ef_search = ?ef, collection = %collection, "per-query ef_search override");
+        metrics::record_ef_search(ef, &collection);
+    }
+
     let collections = state.collections.read();
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
@@ -754,6 +942,18 @@ async fn search(
 
     let metadata_store = coll.metadata_cache.get_or_rebuild(&coll.store);
 
+    // Check collection status for stale results warning
+    let warning = if let Ok(status) = coll.status.read() {
+        match *status {
+            CollectionStatus::PendingOptimization => {
+                "collection has pending optimizations; results may be stale or incomplete. Call optimize() to rebuild indexes.".to_string()
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
     let results = QueryExecutor::search(
         &coll.index as &dyn VectorIndex,
         &req.query,
@@ -762,6 +962,7 @@ async fn search(
         &strategy,
         Some(&coll.index_manager),
         &metadata_store,
+        ef_search,
     ).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {}", e)))?;
 
     let max_edges = if req.max_graph_edges == 0 { 10u32 } else { req.max_graph_edges };
@@ -790,7 +991,7 @@ async fn search(
         ScoredResult { id: r.id, score: r.score, metadata, graph_edges }
     }).collect();
 
-    Ok(Json(SearchRes { results: scored, search_time_us: timer.elapsed().as_micros() as u64 }))
+    Ok(Json(SearchRes { results: scored, search_time_us: timer.elapsed().as_micros() as u64, warning }))
 }
 
 async fn batch_search(
@@ -825,7 +1026,28 @@ async fn batch_search(
             .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
         let strategy = parse_strategy(&q.strategy);
+
+        let ef_search = validate_ef_search(q.ef_search, state.max_ef_search)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+        if let Some(ef) = ef_search {
+            tracing::debug!(ef_search = ?ef, collection = %q.collection, "per-query ef_search override");
+            metrics::record_ef_search(ef, &q.collection);
+        }
+
         let metadata_store = coll.metadata_cache.get_or_rebuild(&coll.store);
+
+        // Check collection status for stale results warning
+        let warning = if let Ok(status) = coll.status.read() {
+            match *status {
+                CollectionStatus::PendingOptimization => {
+                    "collection has pending optimizations; results may be stale or incomplete. Call optimize() to rebuild indexes.".to_string()
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
 
         let results = QueryExecutor::search(
             &coll.index as &dyn VectorIndex,
@@ -835,6 +1057,7 @@ async fn batch_search(
             &strategy,
             Some(&coll.index_manager),
             &metadata_store,
+            ef_search,
         ).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {}", e)))?;
 
         let max_edges = if q.max_graph_edges == 0 { 10u32 } else { q.max_graph_edges };
@@ -863,7 +1086,7 @@ async fn batch_search(
             ScoredResult { id: r.id, score: r.score, metadata, graph_edges }
         }).collect();
 
-        responses.push(SearchRes { results: scored, search_time_us: query_timer.elapsed().as_micros() as u64 });
+        responses.push(SearchRes { results: scored, search_time_us: query_timer.elapsed().as_micros() as u64, warning });
     }
 
     Ok(Json(BatchSearchRes { results: responses, total_time_us: timer.elapsed().as_micros() as u64 }))

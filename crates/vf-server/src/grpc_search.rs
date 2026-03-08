@@ -16,15 +16,18 @@ use crate::proto::swarndb::v1::search_service_server::SearchService;
 use crate::proto::swarndb::v1::{
     self as proto, BatchSearchRequest, BatchSearchResponse, SearchRequest, SearchResponse,
 };
-use crate::state::AppState;
+use crate::metrics;
+use crate::state::{AppState, CollectionStatus};
+use crate::validation::validate_ef_search;
 
 pub struct SearchServiceImpl {
     state: AppState,
+    max_ef_search: usize,
 }
 
 impl SearchServiceImpl {
-    pub fn new(state: AppState) -> Self {
-        Self { state }
+    pub fn new(state: AppState, max_ef_search: usize) -> Self {
+        Self { state, max_ef_search }
     }
 }
 
@@ -56,6 +59,14 @@ impl SearchService for SearchServiceImpl {
 
         let strategy = parse_strategy(&req.strategy);
 
+        let ef_search = validate_ef_search(req.ef_search, self.max_ef_search)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        if let Some(ef) = ef_search {
+            tracing::debug!(ef_search = ?ef, collection = %req.collection, "per-query ef_search override");
+            metrics::record_ef_search(ef, &req.collection);
+        }
+
         let metadata_store = collection.metadata_cache.get_or_rebuild(&collection.store);
 
         let results = QueryExecutor::search(
@@ -66,6 +77,7 @@ impl SearchService for SearchServiceImpl {
             &strategy,
             Some(&collection.index_manager),
             &metadata_store,
+            ef_search,
         )
         .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
@@ -108,9 +120,22 @@ impl SearchService for SearchServiceImpl {
 
         let search_time_us = timer.elapsed().as_micros() as u64;
 
+        // Check if collection is pending optimization and add warning
+        let warning = if let Ok(status) = collection.status.read() {
+            match *status {
+                CollectionStatus::PendingOptimization => {
+                    "collection has pending optimizations; results may be stale or incomplete. Call optimize() to rebuild indexes.".to_string()
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
         Ok(Response::new(SearchResponse {
             results: scored_results,
             search_time_us,
+            warning,
         }))
     }
 
@@ -169,10 +194,22 @@ impl SearchServiceImpl {
         let include_metadata = queries[0].include_metadata;
 
         let all_uniform = queries.iter().skip(1).all(|q| {
-            q.k == first_k && q.strategy == queries[0].strategy && q.filter == queries[0].filter
+            q.k == first_k && q.strategy == queries[0].strategy && q.filter == queries[0].filter && q.ef_search == queries[0].ef_search
         });
 
         let metadata_store = collection.metadata_cache.get_or_rebuild(&collection.store);
+
+        // Check collection status for stale results warning
+        let warning = if let Ok(status) = collection.status.read() {
+            match *status {
+                CollectionStatus::PendingOptimization => {
+                    "collection has pending optimizations; results may be stale or incomplete. Call optimize() to rebuild indexes.".to_string()
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
 
         if all_uniform {
             let query_vectors: Vec<Vec<f32>> = queries
@@ -193,6 +230,14 @@ impl SearchServiceImpl {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let first_ef_search = validate_ef_search(queries[0].ef_search, self.max_ef_search)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+            if let Some(ef) = first_ef_search {
+                tracing::debug!(ef_search = ?ef, collection = %collection_name, "per-query ef_search override");
+                metrics::record_ef_search(ef, collection_name);
+            }
+
             let batch_results = BatchExecutor::search_batch_uniform(
                 &collection.index as &dyn vf_index::traits::VectorIndex,
                 &query_vectors,
@@ -201,6 +246,7 @@ impl SearchServiceImpl {
                 &first_strategy,
                 Some(&collection.index_manager),
                 &metadata_store,
+                first_ef_search,
             );
 
             let include_graph = queries[0].include_graph;
@@ -217,7 +263,7 @@ impl SearchServiceImpl {
                     } else {
                         HashMap::new()
                     };
-                    Ok(to_search_response(results, &metadata_store, include_metadata, &graph_edges_map))
+                    Ok(to_search_response(results, &metadata_store, include_metadata, &graph_edges_map, warning.clone()))
                 })
                 .collect()
         } else {
@@ -232,6 +278,14 @@ impl SearchServiceImpl {
                 let filter = q.filter.as_ref().map(convert_filter).transpose()?;
                 let strategy = parse_strategy(&q.strategy);
 
+                let ef_search = validate_ef_search(q.ef_search, self.max_ef_search)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+                if let Some(ef) = ef_search {
+                    tracing::debug!(ef_search = ?ef, collection = %q.collection, "per-query ef_search override");
+                    metrics::record_ef_search(ef, &q.collection);
+                }
+
                 let results = QueryExecutor::search(
                     &collection.index as &dyn vf_index::traits::VectorIndex,
                     &query_vector,
@@ -240,6 +294,7 @@ impl SearchServiceImpl {
                     &strategy,
                     Some(&collection.index_manager),
                     &metadata_store,
+                    ef_search,
                 )
                 .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
@@ -251,7 +306,7 @@ impl SearchServiceImpl {
                 } else {
                     HashMap::new()
                 };
-                responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map));
+                responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map, warning.clone()));
             }
             Ok(responses)
         }
@@ -278,6 +333,26 @@ impl SearchServiceImpl {
             let strategy = parse_strategy(&q.strategy);
             let metadata_store = collection.metadata_cache.get_or_rebuild(&collection.store);
 
+            // Check collection status for stale results warning
+            let warning = if let Ok(status) = collection.status.read() {
+                match *status {
+                    CollectionStatus::PendingOptimization => {
+                        "collection has pending optimizations; results may be stale or incomplete. Call optimize() to rebuild indexes.".to_string()
+                    }
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+
+            let ef_search = validate_ef_search(q.ef_search, self.max_ef_search)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+            if let Some(ef) = ef_search {
+                tracing::debug!(ef_search = ?ef, collection = %q.collection, "per-query ef_search override");
+                metrics::record_ef_search(ef, &q.collection);
+            }
+
             let results = QueryExecutor::search(
                 &collection.index as &dyn vf_index::traits::VectorIndex,
                 &query_vector,
@@ -286,6 +361,7 @@ impl SearchServiceImpl {
                 &strategy,
                 Some(&collection.index_manager),
                 &metadata_store,
+                ef_search,
             )
             .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
@@ -297,7 +373,7 @@ impl SearchServiceImpl {
             } else {
                 HashMap::new()
             };
-            responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map));
+            responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map, warning));
         }
 
         Ok(responses)
@@ -319,6 +395,7 @@ fn to_search_response(
     metadata_store: &HashMap<VectorId, Metadata>,
     include_metadata: bool,
     graph_edges_map: &HashMap<VectorId, Vec<(VectorId, f32)>>,
+    warning: String,
 ) -> SearchResponse {
     let scored_results = results
         .into_iter()
@@ -349,6 +426,7 @@ fn to_search_response(
     SearchResponse {
         results: scored_results,
         search_time_us: 0, // individual timing not tracked in batch
+        warning,
     }
 }
 

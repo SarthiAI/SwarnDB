@@ -113,6 +113,30 @@ pub enum ValidationError {
 
     #[error("request body size {size} bytes exceeds maximum {max} bytes")]
     RequestBodyTooLarge { size: usize, max: usize },
+
+    #[error("ef_search value {value} exceeds maximum {max}")]
+    EfSearchTooLarge { value: usize, max: usize },
+
+    #[error("batch_lock_size {value} exceeds maximum {max}")]
+    BatchLockSizeTooLarge { value: u32, max: u32 },
+
+    #[error("batch_lock_size must be at least 1")]
+    BatchLockSizeZero,
+
+    #[error("wal_flush_every {value} exceeds maximum {max}")]
+    WalFlushEveryTooLarge { value: u32, max: u32 },
+
+    #[error("ef_construction {value} is below minimum {min}")]
+    EfConstructionTooSmall { value: u32, min: u32 },
+
+    #[error("ef_construction {value} exceeds maximum {max}")]
+    EfConstructionTooLarge { value: u32, max: u32 },
+
+    #[error("invalid index_mode '{mode}': must be 'immediate' or 'deferred'")]
+    InvalidIndexMode { mode: String },
+
+    #[error("parallel_build requires index_mode='deferred'")]
+    ParallelBuildRequiresDeferred,
 }
 
 impl ValidationError {
@@ -228,6 +252,131 @@ pub fn validate_batch_size(
         });
     }
 
+    Ok(())
+}
+
+/// Validates the ef_search parameter for HNSW queries.
+///
+/// Returns `Ok(None)` if ef_search is `None` or `Some(0)` (use default).
+/// Returns an error if the value exceeds `max_ef_search`.
+/// Otherwise returns `Ok(Some(value as usize))`.
+pub fn validate_ef_search(
+    ef_search: Option<u32>,
+    max_ef_search: usize,
+) -> Result<Option<usize>, ValidationError> {
+    match ef_search {
+        None => Ok(None),
+        Some(0) => Ok(None),
+        Some(val) => {
+            let val_usize = val as usize;
+            if val_usize > max_ef_search {
+                return Err(ValidationError::EfSearchTooLarge {
+                    value: val_usize,
+                    max: max_ef_search,
+                });
+            }
+            Ok(Some(val_usize))
+        }
+    }
+}
+
+/// Validates the batch_lock_size parameter for bulk insert operations.
+///
+/// Returns an error if the value is zero or exceeds the configured maximum.
+/// Logs a warning when the value exceeds 5000 (high lock contention risk).
+pub fn validate_batch_lock_size(
+    size: u32,
+    max_batch_lock_size: u32,
+) -> Result<(), ValidationError> {
+    if size == 0 {
+        return Err(ValidationError::BatchLockSizeZero);
+    }
+    if size > max_batch_lock_size {
+        return Err(ValidationError::BatchLockSizeTooLarge {
+            value: size,
+            max: max_batch_lock_size,
+        });
+    }
+    if size > 5000 {
+        tracing::warn!(
+            batch_lock_size = size,
+            "large batch_lock_size may hold write lock too long, blocking readers"
+        );
+    }
+    Ok(())
+}
+
+/// Validates the wal_flush_every parameter for bulk insert operations.
+///
+/// Logs a WARN when value is 0 (WAL disabled) and an INFO when value > 1 (batched).
+pub fn validate_wal_flush_every(
+    n: u32,
+    max_wal_flush_interval: u32,
+) -> Result<(), ValidationError> {
+    if n > max_wal_flush_interval {
+        return Err(ValidationError::WalFlushEveryTooLarge {
+            value: n,
+            max: max_wal_flush_interval,
+        });
+    }
+    if n == 0 {
+        tracing::warn!("WAL disabled (wal_flush_every=0), data loss possible on crash");
+    } else if n > 1 {
+        tracing::info!(wal_flush_every = n, "WAL batched every {} vectors", n);
+    }
+    Ok(())
+}
+
+/// Validates the ef_construction override for bulk insert HNSW parameter.
+///
+/// Returns an error if the value is below 8 or exceeds the configured maximum.
+pub fn validate_ef_construction(
+    ef: u32,
+    max_ef_construction: u32,
+) -> Result<(), ValidationError> {
+    if ef < 8 {
+        return Err(ValidationError::EfConstructionTooSmall {
+            value: ef,
+            min: 8,
+        });
+    }
+    if ef > max_ef_construction {
+        return Err(ValidationError::EfConstructionTooLarge {
+            value: ef,
+            max: max_ef_construction,
+        });
+    }
+    if ef > 500 {
+        tracing::warn!(
+            ef_construction = ef,
+            "high ef_construction override may significantly slow insert"
+        );
+    }
+    Ok(())
+}
+
+/// Validates the index_mode parameter for bulk insert operations.
+///
+/// Valid values: "immediate", "deferred".
+pub fn validate_index_mode(mode: &str) -> Result<(), ValidationError> {
+    match mode {
+        "immediate" | "deferred" => Ok(()),
+        _ => Err(ValidationError::InvalidIndexMode {
+            mode: mode.to_string(),
+        }),
+    }
+}
+
+/// Validates bulk insert option combinations.
+///
+/// Returns an error if parallel_build is true but index_mode is not "deferred".
+pub fn validate_bulk_insert_options(
+    parallel_build: bool,
+    index_mode: &str,
+) -> Result<(), ValidationError> {
+    if parallel_build && index_mode != "deferred" {
+        return Err(ValidationError::ParallelBuildRequiresDeferred);
+    }
     Ok(())
 }
 
@@ -375,6 +524,29 @@ mod tests {
     fn valid_batch_size() {
         let cfg = test_config();
         assert!(validate_batch_size(50, &cfg).is_ok());
+    }
+
+    #[test]
+    fn ef_search_none_returns_ok_none() {
+        assert_eq!(validate_ef_search(None, 10000).unwrap(), None);
+    }
+
+    #[test]
+    fn ef_search_zero_returns_ok_none() {
+        assert_eq!(validate_ef_search(Some(0), 10000).unwrap(), None);
+    }
+
+    #[test]
+    fn ef_search_valid_value() {
+        assert_eq!(validate_ef_search(Some(500), 10000).unwrap(), Some(500));
+    }
+
+    #[test]
+    fn ef_search_over_limit() {
+        assert!(matches!(
+            validate_ef_search(Some(20000), 10000),
+            Err(ValidationError::EfSearchTooLarge { value: 20000, max: 10000 })
+        ));
     }
 
     #[test]

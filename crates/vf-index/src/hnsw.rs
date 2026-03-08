@@ -665,7 +665,7 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn search_knn(&self, inner: &HnswInner, query: &[f32], k: usize) -> Result<Vec<ScoredResult>, IndexError> {
+    fn search_knn(&self, inner: &HnswInner, query: &[f32], k: usize, ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError> {
         if query.len() != self.dimension {
             return Err(IndexError::DimensionMismatch {
                 expected: self.dimension,
@@ -689,7 +689,7 @@ impl HnswIndex {
         }
 
         // Phase 2: search at layer 0 with ef_search
-        let ef = self.params.ef_search.max(k);
+        let ef = ef_search.unwrap_or(self.params.ef_search).max(k);
         let results = self.search_layer(inner, query, &[current_ep], ef, 0);
 
         let mut scored: Vec<ScoredResult> = results
@@ -1280,9 +1280,9 @@ impl VectorIndex for HnswIndex {
         self.delete_node(&mut inner, id)
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredResult>, IndexError> {
+    fn search(&self, query: &[f32], k: usize, ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError> {
         let inner = self.inner.read();
-        self.search_knn(&inner, query, k)
+        self.search_knn(&inner, query, k, ef_search)
     }
 
     fn search_with_candidates(
@@ -1290,6 +1290,7 @@ impl VectorIndex for HnswIndex {
         query: &[f32],
         k: usize,
         candidates: &[VectorId],
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, IndexError> {
         if query.len() != self.dimension {
             return Err(IndexError::DimensionMismatch {
@@ -1308,7 +1309,7 @@ impl VectorIndex for HnswIndex {
         let candidate_set: HashSet<VectorId> = candidates.iter().copied().collect();
 
         // Use a larger ef to get more candidates for post-filtering
-        let ef = self.params.ef_search.max(k * 10);
+        let ef = ef_search.unwrap_or(self.params.ef_search).max(k * 10);
 
         let mut current_ep = entry_point;
 

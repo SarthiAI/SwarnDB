@@ -155,7 +155,7 @@ impl QuantizedHnswIndex {
     /// re-computing exact distances, we confirm the graph's approximate
     /// ordering and recover neighbors that the greedy search ranked slightly
     /// too low.
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredResult>, IndexError> {
+    pub fn search(&self, query: &[f32], k: usize, ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError> {
         if query.len() != self.dimension {
             return Err(IndexError::DimensionMismatch {
                 expected: self.dimension,
@@ -165,7 +165,7 @@ impl QuantizedHnswIndex {
 
         // Over-retrieve candidates from HNSW graph.
         let expanded_k = k.saturating_mul(self.rerank_factor).max(k);
-        let candidates = self.hnsw.search(query, expanded_k)?;
+        let candidates = self.hnsw.search(query, expanded_k, ef_search)?;
 
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -208,6 +208,7 @@ impl QuantizedHnswIndex {
         &self,
         query: &[f32],
         k: usize,
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, IndexError> {
         if query.len() != self.dimension {
             return Err(IndexError::DimensionMismatch {
@@ -217,7 +218,7 @@ impl QuantizedHnswIndex {
         }
 
         // Retrieve candidates from HNSW graph.
-        let candidates = self.hnsw.search(query, k)?;
+        let candidates = self.hnsw.search(query, k, ef_search)?;
 
         if candidates.is_empty() {
             return Ok(Vec::new());

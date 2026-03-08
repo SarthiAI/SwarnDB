@@ -82,7 +82,7 @@ impl GraphRefiner {
                 None => continue,
             };
 
-            let results = index.search(vector_data, search_k)?;
+            let results = index.search(vector_data, search_k, None)?;
             let threshold = graph.resolve_threshold(node_id, None);
 
             for result in results {

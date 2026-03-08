@@ -48,18 +48,20 @@ class GetCollectionRequest(_message.Message):
     def __init__(self, name: _Optional[str] = ...) -> None: ...
 
 class GetCollectionResponse(_message.Message):
-    __slots__ = ("name", "dimension", "distance_metric", "vector_count", "default_threshold")
+    __slots__ = ("name", "dimension", "distance_metric", "vector_count", "default_threshold", "status")
     NAME_FIELD_NUMBER: _ClassVar[int]
     DIMENSION_FIELD_NUMBER: _ClassVar[int]
     DISTANCE_METRIC_FIELD_NUMBER: _ClassVar[int]
     VECTOR_COUNT_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_THRESHOLD_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
     name: str
     dimension: int
     distance_metric: str
     vector_count: int
     default_threshold: float
-    def __init__(self, name: _Optional[str] = ..., dimension: _Optional[int] = ..., distance_metric: _Optional[str] = ..., vector_count: _Optional[int] = ..., default_threshold: _Optional[float] = ...) -> None: ...
+    status: str
+    def __init__(self, name: _Optional[str] = ..., dimension: _Optional[int] = ..., distance_metric: _Optional[str] = ..., vector_count: _Optional[int] = ..., default_threshold: _Optional[float] = ..., status: _Optional[str] = ...) -> None: ...
 
 class ListCollectionsRequest(_message.Message):
     __slots__ = ()

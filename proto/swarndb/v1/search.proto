@@ -46,11 +46,14 @@ message SearchRequest {
   bool include_graph = 7;
   float graph_threshold = 8;
   uint32 max_graph_edges = 9;
+  optional uint32 ef_search = 10;
 }
 
 message SearchResponse {
   repeated ScoredResult results = 1;
   uint64 search_time_us = 2;
+  // Warning message when collection is in PendingOptimization state (stale results possible)
+  string warning = 3;
 }
 
 message BatchSearchRequest {

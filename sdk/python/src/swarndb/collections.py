@@ -6,11 +6,14 @@ get info, and check existence of collections.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List
 
-from ._proto import collection_pb2
+from ._proto import collection_pb2, vector_pb2
 from .exceptions import CollectionNotFoundError
-from .types import CollectionInfo
+from .types import CollectionInfo, OptimizeResult
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .client import SwarnDBClient
@@ -141,3 +144,53 @@ class CollectionAPI:
             return True
         except CollectionNotFoundError:
             return False
+
+    def optimize(self, collection: str) -> OptimizeResult:
+        """Rebuild deferred indexes, graph, and metadata indexes.
+
+        Call this after bulk inserting with ``defer_graph=True`` or
+        ``index_mode="deferred"`` to finalize the collection's indexes
+        and make all vectors searchable at full quality.
+
+        Args:
+            collection: Collection name to optimize.
+
+        Returns:
+            An OptimizeResult with status, message, duration, and
+            number of vectors processed.
+
+        Raises:
+            CollectionNotFoundError: If the collection does not exist.
+        """
+        request = vector_pb2.OptimizeRequest(collection=collection)
+        response = self._client._call(
+            self._client._vector_stub.Optimize, request
+        )
+        return OptimizeResult(
+            status=response.status,
+            message=response.message,
+            duration_ms=response.duration_ms,
+            vectors_processed=response.vectors_processed,
+        )
+
+    def get_status(self, collection: str) -> str:
+        """Get collection optimization status.
+
+        Returns the current optimization state of a collection, which
+        indicates whether deferred indexes need to be rebuilt.
+
+        Args:
+            collection: Collection name.
+
+        Returns:
+            One of: ``"ready"``, ``"pending_optimization"``, or
+            ``"optimizing"``.
+
+        Raises:
+            CollectionNotFoundError: If the collection does not exist.
+        """
+        request = collection_pb2.GetCollectionRequest(name=collection)
+        response = self._client._call(
+            self._client._collection_stub.GetCollection, request
+        )
+        return response.status or "ready"

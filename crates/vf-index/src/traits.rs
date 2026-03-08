@@ -34,15 +34,18 @@ pub trait VectorIndex: Send + Sync {
 
     /// Search for the k nearest neighbors of the query vector.
     /// Returns results sorted by distance (ascending — closest first).
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredResult>, IndexError>;
+    /// `ef_search` optionally overrides the index's default ef_search parameter.
+    fn search(&self, query: &[f32], k: usize, ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError>;
 
     /// Search with a candidate filter (for pre-filtering).
     /// Only considers vectors whose IDs are in the candidates set.
+    /// `ef_search` optionally overrides the index's default ef_search parameter.
     fn search_with_candidates(
         &self,
         query: &[f32],
         k: usize,
         candidates: &[VectorId],
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, IndexError>;
 
     /// Returns the number of vectors in the index

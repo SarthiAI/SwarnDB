@@ -64,6 +64,22 @@ pub struct ServerConfig {
     /// Bulk operation timeout in milliseconds.
     #[serde(default = "default_bulk_timeout_ms")]
     pub bulk_timeout_ms: u64,
+
+    /// Maximum allowed ef_search parameter for HNSW queries.
+    #[serde(default = "default_max_ef_search")]
+    pub max_ef_search: usize,
+
+    /// Maximum allowed batch_lock_size for bulk insert operations.
+    #[serde(default = "default_max_batch_lock_size")]
+    pub max_batch_lock_size: u32,
+
+    /// Maximum allowed wal_flush_every interval for bulk insert operations.
+    #[serde(default = "default_max_wal_flush_interval")]
+    pub max_wal_flush_interval: u32,
+
+    /// Maximum allowed ef_construction override for bulk insert operations.
+    #[serde(default = "default_max_ef_construction")]
+    pub max_ef_construction: u32,
 }
 
 fn default_host() -> String {
@@ -114,6 +130,22 @@ fn default_bulk_timeout_ms() -> u64 {
     30000
 }
 
+fn default_max_ef_search() -> usize {
+    10_000
+}
+
+fn default_max_batch_lock_size() -> u32 {
+    10_000
+}
+
+fn default_max_wal_flush_interval() -> u32 {
+    100_000
+}
+
+fn default_max_ef_construction() -> u32 {
+    2000
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -130,6 +162,10 @@ impl Default for ServerConfig {
             target_p99_latency_ms: default_target_p99_latency_ms(),
             search_timeout_ms: default_search_timeout_ms(),
             bulk_timeout_ms: default_bulk_timeout_ms(),
+            max_ef_search: default_max_ef_search(),
+            max_batch_lock_size: default_max_batch_lock_size(),
+            max_wal_flush_interval: default_max_wal_flush_interval(),
+            max_ef_construction: default_max_ef_construction(),
         }
     }
 }
@@ -186,6 +222,10 @@ impl ServerConfig {
     /// - `SWARNDB_TARGET_P99_LATENCY_MS` -> target_p99_latency_ms
     /// - `SWARNDB_SEARCH_TIMEOUT_MS` -> search_timeout_ms
     /// - `SWARNDB_BULK_TIMEOUT_MS` -> bulk_timeout_ms
+    /// - `SWARNDB_MAX_EF_SEARCH` -> max_ef_search
+    /// - `SWARNDB_MAX_BATCH_LOCK_SIZE` -> max_batch_lock_size
+    /// - `SWARNDB_MAX_WAL_FLUSH_INTERVAL` -> max_wal_flush_interval
+    /// - `SWARNDB_MAX_EF_CONSTRUCTION` -> max_ef_construction
     pub fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("SWARNDB_HOST") {
             self.host = val;
@@ -274,6 +314,38 @@ impl ServerConfig {
                 tracing::warn!("Invalid SWARNDB_BULK_TIMEOUT_MS value: {}", val);
             }
         }
+
+        if let Ok(val) = env::var("SWARNDB_MAX_EF_SEARCH") {
+            if let Ok(n) = val.parse::<usize>() {
+                self.max_ef_search = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_MAX_EF_SEARCH value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_MAX_BATCH_LOCK_SIZE") {
+            if let Ok(n) = val.parse::<u32>() {
+                self.max_batch_lock_size = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_MAX_BATCH_LOCK_SIZE value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_MAX_WAL_FLUSH_INTERVAL") {
+            if let Ok(n) = val.parse::<u32>() {
+                self.max_wal_flush_interval = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_MAX_WAL_FLUSH_INTERVAL value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_MAX_EF_CONSTRUCTION") {
+            if let Ok(n) = val.parse::<u32>() {
+                self.max_ef_construction = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_MAX_EF_CONSTRUCTION value: {}", val);
+            }
+        }
     }
 
     /// Returns the gRPC socket address string (e.g., "0.0.0.0:50051").
@@ -319,6 +391,10 @@ mod tests {
         assert_eq!(config.target_p99_latency_ms, 500);
         assert_eq!(config.search_timeout_ms, 5000);
         assert_eq!(config.bulk_timeout_ms, 30000);
+        assert_eq!(config.max_ef_search, 10_000);
+        assert_eq!(config.max_batch_lock_size, 10_000);
+        assert_eq!(config.max_wal_flush_interval, 100_000);
+        assert_eq!(config.max_ef_construction, 2000);
     }
 
     #[test]

@@ -37,15 +37,16 @@ impl QueryExecutor {
         strategy: &FilterStrategy,
         index_manager: Option<&IndexManager>,
         metadata_store: &HashMap<VectorId, Metadata>,
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, QueryError> {
         let filter = match filter {
             Some(f) => f,
-            None => return Ok(index.search(query, k)?),
+            None => return Ok(index.search(query, k, ef_search)?),
         };
 
         match strategy {
             FilterStrategy::PreFilter => {
-                Self::execute_pre_filter(index, query, k, filter, index_manager, metadata_store)
+                Self::execute_pre_filter(index, query, k, filter, index_manager, metadata_store, ef_search)
             }
             FilterStrategy::PostFilter { oversample_factor } => {
                 // Use adaptive oversampling: if an IndexManager is available,
@@ -58,10 +59,10 @@ impl QueryExecutor {
                 } else {
                     *oversample_factor
                 };
-                Self::execute_post_filter(index, query, k, filter, adaptive_factor, metadata_store)
+                Self::execute_post_filter(index, query, k, filter, adaptive_factor, metadata_store, ef_search)
             }
             FilterStrategy::Auto => {
-                Self::execute_auto(index, query, k, filter, index_manager, metadata_store)
+                Self::execute_auto(index, query, k, filter, index_manager, metadata_store, ef_search)
             }
         }
     }
@@ -73,6 +74,7 @@ impl QueryExecutor {
         filter: Option<&FilterExpression>,
         index_manager: Option<&IndexManager>,
         metadata_store: &HashMap<VectorId, Metadata>,
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, QueryError> {
         Self::search(
             index,
@@ -82,6 +84,7 @@ impl QueryExecutor {
             &FilterStrategy::Auto,
             index_manager,
             metadata_store,
+            ef_search,
         )
     }
 
@@ -92,9 +95,10 @@ impl QueryExecutor {
         filter: &FilterExpression,
         index_manager: Option<&IndexManager>,
         metadata_store: &HashMap<VectorId, Metadata>,
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, QueryError> {
         let candidates = Self::resolve_candidates(filter, index_manager, metadata_store);
-        Ok(index.search_with_candidates(query, k, &candidates)?)
+        Ok(index.search_with_candidates(query, k, &candidates, ef_search)?)
     }
 
     fn execute_post_filter(
@@ -104,9 +108,10 @@ impl QueryExecutor {
         filter: &FilterExpression,
         oversample_factor: usize,
         metadata_store: &HashMap<VectorId, Metadata>,
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, QueryError> {
         let expanded_k = k * oversample_factor;
-        let results = index.search(query, expanded_k)?;
+        let results = index.search(query, expanded_k, ef_search)?;
 
         // Compile filter once, evaluate many times without AST traversal
         let compiled = CompiledFilter::compile(filter);
@@ -131,6 +136,7 @@ impl QueryExecutor {
         filter: &FilterExpression,
         index_manager: Option<&IndexManager>,
         metadata_store: &HashMap<VectorId, Metadata>,
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, QueryError> {
         let index_len = index.len();
         if index_len == 0 {
@@ -144,7 +150,7 @@ impl QueryExecutor {
 
                 if selectivity > 0.01 {
                     let candidates = bitmap_to_candidates(&bitmap);
-                    return Ok(index.search_with_candidates(query, k, &candidates)?);
+                    return Ok(index.search_with_candidates(query, k, &candidates, ef_search)?);
                 } else {
                     let oversample = compute_oversample(selectivity);
                     return Self::execute_post_filter(
@@ -154,6 +160,7 @@ impl QueryExecutor {
                         filter,
                         oversample,
                         metadata_store,
+                        ef_search,
                     );
                 }
             }
@@ -163,11 +170,11 @@ impl QueryExecutor {
             // oversampling instead of a fixed factor.
             let estimated_selectivity = im.estimate_selectivity(filter);
             let oversample = compute_oversample(estimated_selectivity);
-            return Self::execute_post_filter(index, query, k, filter, oversample, metadata_store);
+            return Self::execute_post_filter(index, query, k, filter, oversample, metadata_store, ef_search);
         }
 
         // No IndexManager available at all -- use a conservative default
-        Self::execute_post_filter(index, query, k, filter, 3, metadata_store)
+        Self::execute_post_filter(index, query, k, filter, 3, metadata_store, ef_search)
     }
 
     fn resolve_candidates(

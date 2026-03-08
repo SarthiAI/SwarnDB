@@ -343,6 +343,7 @@ impl IvfHnswPqIndex {
     /// * `query` - Query vector of length `dimension`.
     /// * `k` - Number of nearest neighbors to return.
     /// * `nprobe` - Number of partitions to probe (higher = better recall, slower).
+    /// * `ef_search` - Optional override for the HNSW coarse quantizer's ef_search parameter.
     ///
     /// # Errors
     /// Returns an error if the index is not trained or dimensions mismatch.
@@ -351,6 +352,7 @@ impl IvfHnswPqIndex {
         query: &[f32],
         k: usize,
         nprobe: usize,
+        ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, IndexError> {
         self.check_trained()?;
         if query.len() != self.dimension {
@@ -363,7 +365,7 @@ impl IvfHnswPqIndex {
         let nprobe = nprobe.min(self.num_partitions).max(1);
 
         // Step 1: Find nprobe nearest centroids via HNSW coarse search.
-        let centroid_results = self.coarse_quantizer.search(query, nprobe)?;
+        let centroid_results = VectorIndex::search(&self.coarse_quantizer, query, nprobe, ef_search)?;
 
         // Step 2+3: For each probed partition, scan PQ codes with distance table.
         let pq = self.pq.read();
@@ -501,7 +503,7 @@ impl IvfHnswPqIndex {
     /// Find the nearest partition for a vector using HNSW coarse search.
     fn assign_partition(&self, vector: &[f32]) -> usize {
         // Try HNSW search first (fast).
-        if let Ok(results) = VectorIndex::search(&self.coarse_quantizer, vector, 1) {
+        if let Ok(results) = VectorIndex::search(&self.coarse_quantizer, vector, 1, None) {
             if let Some(result) = results.first() {
                 return result.id as usize;
             }
@@ -528,6 +530,69 @@ impl IvfHnswPqIndex {
         } else {
             Ok(())
         }
+    }
+}
+
+impl VectorIndex for IvfHnswPqIndex {
+    fn add(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
+        self.add(id, vector)
+    }
+
+    fn remove(&self, _id: VectorId) -> Result<(), IndexError> {
+        Err(IndexError::Internal(
+            "IvfHnswPqIndex is append-only and does not support removal".into(),
+        ))
+    }
+
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<ScoredResult>, IndexError> {
+        // Default nprobe: sqrt(num_partitions), clamped to [1, num_partitions].
+        let nprobe = ((self.num_partitions as f64).sqrt().ceil() as usize)
+            .max(1)
+            .min(self.num_partitions);
+        self.search(query, k, nprobe, ef_search)
+    }
+
+    fn search_with_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidates: &[VectorId],
+        ef_search: Option<usize>,
+    ) -> Result<Vec<ScoredResult>, IndexError> {
+        // Search all partitions, then filter by candidate set.
+        let results = VectorIndex::search(self, query, k.max(candidates.len()), ef_search)?;
+        let candidate_set: std::collections::HashSet<VectorId> =
+            candidates.iter().copied().collect();
+        let filtered: Vec<ScoredResult> = results
+            .into_iter()
+            .filter(|r| candidate_set.contains(&r.id))
+            .take(k)
+            .collect();
+        Ok(filtered)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension()
+    }
+
+    fn contains(&self, id: VectorId) -> bool {
+        // Scan all inverted lists for the ID.
+        self.inverted_lists
+            .iter()
+            .any(|list| list.read().iter().any(|entry| entry.id == id))
     }
 }
 
@@ -568,7 +633,7 @@ mod tests {
         let index = IvfHnswPqIndex::new(8, 2, 2).unwrap();
         let v = vec![1.0; 8];
         assert!(index.add(0, &v).is_err());
-        assert!(index.search(&v, 1, 1).is_err());
+        assert!(index.search(&v, 1, 1, None).is_err());
     }
 
     #[test]
@@ -582,6 +647,6 @@ mod tests {
 
         let bad = vec![1.0; 4]; // wrong dimension
         assert!(index.add(0, &bad).is_err());
-        assert!(index.search(&bad, 1, 1).is_err());
+        assert!(index.search(&bad, 1, 1, None).is_err());
     }
 }

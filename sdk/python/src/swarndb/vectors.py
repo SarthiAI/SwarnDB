@@ -15,7 +15,7 @@ import grpc
 from swarndb._helpers import _to_proto_vector
 from swarndb._proto import common_pb2, vector_pb2
 from swarndb.exceptions import SwarnDBError, VectorNotFoundError
-from swarndb.types import BulkInsertResult, VectorRecord
+from swarndb.types import BulkInsertOptions, BulkInsertResult, VectorRecord
 
 if TYPE_CHECKING:
     from swarndb.client import SwarnDBClient
@@ -239,6 +239,13 @@ class VectorAPI:
         ids: Optional[List[int]] = None,
         batch_size: int = 1000,
         show_progress: bool = False,
+        batch_lock_size: Optional[int] = None,
+        defer_graph: bool = False,
+        wal_flush_every: Optional[int] = None,
+        ef_construction: Optional[int] = None,
+        index_mode: Optional[str] = None,
+        skip_metadata_index: bool = False,
+        parallel_build: bool = False,
     ) -> BulkInsertResult:
         """Bulk insert vectors using streaming RPC.
 
@@ -256,12 +263,26 @@ class VectorAPI:
                 progress bar granularity).
             show_progress: If True, display a tqdm progress bar. Requires
                 tqdm to be installed.
+            batch_lock_size: Vectors per lock acquisition (server default=1,
+                max=10000). Higher values reduce lock overhead.
+            defer_graph: If True, skip graph computation during insert.
+                Use ``client.collections.optimize()`` afterward.
+            wal_flush_every: WAL flush interval in operations (default=1,
+                0=disable WAL flushing for max throughput).
+            ef_construction: Override HNSW ef_construction for this batch.
+            index_mode: Index build mode: ``"immediate"`` (default) or
+                ``"deferred"`` (build index after all inserts).
+            skip_metadata_index: If True, skip metadata indexing during
+                insert for faster ingestion.
+            parallel_build: If True, use parallel HNSW construction
+                (only effective with ``index_mode="deferred"``).
 
         Returns:
             A BulkInsertResult with inserted_count and any errors.
 
         Raises:
-            ValueError: If metadata_list or ids length doesn't match vectors.
+            ValueError: If metadata_list or ids length doesn't match vectors,
+                or if index_mode is not a valid value.
             ImportError: If show_progress is True but tqdm is not installed.
         """
         total = len(vectors)
@@ -275,12 +296,38 @@ class VectorAPI:
             raise ValueError(
                 f"ids length ({len(ids)}) must match vectors length ({total})"
             )
+        if index_mode is not None and index_mode not in ("immediate", "deferred"):
+            raise ValueError(
+                f"index_mode must be 'immediate' or 'deferred', "
+                f"got {index_mode!r}"
+            )
+        if batch_lock_size is not None and (batch_lock_size < 1 or batch_lock_size > 10000):
+            raise ValueError(
+                f"batch_lock_size must be between 1 and 10000, "
+                f"got {batch_lock_size}"
+            )
+        if parallel_build and index_mode not in (None, "deferred"):
+            raise ValueError(
+                "parallel_build=True requires index_mode='deferred'"
+            )
 
         if show_progress and tqdm is None:
             raise ImportError(
                 "tqdm is required for progress bars. "
                 "Install it with: pip install tqdm"
             )
+
+        # Build options to determine which RPC to use
+        options = BulkInsertOptions(
+            batch_lock_size=batch_lock_size,
+            defer_graph=defer_graph,
+            wal_flush_every=wal_flush_every,
+            ef_construction=ef_construction,
+            index_mode=index_mode,
+            skip_metadata_index=skip_metadata_index,
+            parallel_build=parallel_build,
+        )
+        use_optimized_rpc = options.has_non_defaults()
 
         def _request_iterator() -> Iterator[vector_pb2.InsertRequest]:
             """Yield InsertRequest messages, optionally with progress."""
@@ -306,6 +353,29 @@ class VectorAPI:
                     )
                 yield req
 
+        def _options_request_iterator() -> Iterator:
+            """Yield options message first, then vector InsertRequests.
+
+            Uses the BulkInsertWithOptions streaming RPC where the first
+            message contains BulkInsertOptions and subsequent messages
+            contain the vectors.
+            """
+            options_msg = vector_pb2.BulkInsertStreamMessage(
+                options=vector_pb2.BulkInsertOptions(
+                    batch_lock_size=options.batch_lock_size or 0,
+                    defer_graph=options.defer_graph,
+                    wal_flush_every=options.wal_flush_every or 0,
+                    ef_construction=options.ef_construction or 0,
+                    index_mode=options.index_mode or "",
+                    skip_metadata_index=options.skip_metadata_index,
+                    parallel_build=options.parallel_build,
+                )
+            )
+            yield options_msg
+
+            for req in _request_iterator():
+                yield vector_pb2.BulkInsertStreamMessage(vector=req)
+
         # BulkInsert is stream_unary: we stream requests, get one response.
         # Cannot use _call (which is for unary-unary), so call stub directly
         # with retry logic.
@@ -315,11 +385,31 @@ class VectorAPI:
 
         for attempt in range(self._client._max_retries + 1):
             try:
-                response = self._client._vector_stub.BulkInsert(
-                    _request_iterator(),
-                    timeout=call_timeout,
-                    metadata=metadata,
-                )
+                if use_optimized_rpc:
+                    logger.info(
+                        "BulkInsert with options: batch_lock_size=%s, "
+                        "defer_graph=%s, wal_flush_every=%s, "
+                        "ef_construction=%s, index_mode=%s, "
+                        "skip_metadata_index=%s, parallel_build=%s",
+                        options.batch_lock_size,
+                        options.defer_graph,
+                        options.wal_flush_every,
+                        options.ef_construction,
+                        options.index_mode,
+                        options.skip_metadata_index,
+                        options.parallel_build,
+                    )
+                    response = self._client._vector_stub.BulkInsertWithOptions(
+                        _options_request_iterator(),
+                        timeout=call_timeout,
+                        metadata=metadata,
+                    )
+                else:
+                    response = self._client._vector_stub.BulkInsert(
+                        _request_iterator(),
+                        timeout=call_timeout,
+                        metadata=metadata,
+                    )
                 return BulkInsertResult(
                     inserted_count=response.inserted_count,
                     errors=list(response.errors),

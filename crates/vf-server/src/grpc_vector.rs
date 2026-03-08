@@ -9,22 +9,43 @@ use tonic::{Request, Response, Status};
 
 use crate::convert::{core_to_proto_metadata, proto_to_core_metadata};
 use crate::proto::swarndb::v1::vector_service_server::VectorService;
+use std::sync::atomic::Ordering;
+
 use crate::proto::swarndb::v1::{
-    BulkInsertResponse, DeleteVectorRequest, DeleteVectorResponse, GetVectorRequest,
-    GetVectorResponse, InsertRequest, InsertResponse, UpdateRequest, UpdateResponse, Vector,
+    BulkInsertResponse, BulkInsertStreamMessage, DeleteVectorRequest, DeleteVectorResponse,
+    GetVectorRequest, GetVectorResponse, InsertRequest, InsertResponse, OptimizeRequest,
+    OptimizeResponse, UpdateRequest, UpdateResponse, Vector,
+    bulk_insert_stream_message::Payload,
 };
-use crate::state::AppState;
+use crate::state::{AppState, CollectionStatus};
+use crate::validation::{
+    validate_batch_lock_size, validate_bulk_insert_options, validate_ef_construction,
+    validate_index_mode, validate_wal_flush_every,
+};
 use vf_core::store::VectorRecord;
 use vf_core::vector::VectorData;
 use vf_index::traits::VectorIndex;
 
 pub struct VectorServiceImpl {
     state: AppState,
+    max_batch_lock_size: u32,
+    max_wal_flush_interval: u32,
+    max_ef_construction: u32,
 }
 
 impl VectorServiceImpl {
-    pub fn new(state: AppState) -> Self {
-        Self { state }
+    pub fn new(
+        state: AppState,
+        max_batch_lock_size: u32,
+        max_wal_flush_interval: u32,
+        max_ef_construction: u32,
+    ) -> Self {
+        Self {
+            state,
+            max_batch_lock_size,
+            max_wal_flush_interval,
+            max_ef_construction,
+        }
     }
 }
 
@@ -332,5 +353,415 @@ impl VectorService for VectorServiceImpl {
             inserted_count,
             errors,
         }))
+    }
+
+    async fn bulk_insert_with_options(
+        &self,
+        request: Request<tonic::Streaming<BulkInsertStreamMessage>>,
+    ) -> Result<Response<BulkInsertResponse>, Status> {
+        let mut stream = request.into_inner();
+
+        // First message must be BulkInsertOptions
+        let first_msg = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("stream is empty, expected options message first"))?;
+
+        let options = match first_msg.payload {
+            Some(Payload::Options(opts)) => opts,
+            Some(Payload::Vector(_)) => {
+                return Err(Status::invalid_argument(
+                    "first message must be BulkInsertOptions, got vector",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "first message must contain BulkInsertOptions payload",
+                ));
+            }
+        };
+
+        // Validate and parse options
+        let index_mode = if options.index_mode.is_empty() {
+            "immediate"
+        } else {
+            &options.index_mode
+        };
+        validate_index_mode(index_mode)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let raw_batch_lock_size = if options.batch_lock_size == 0 { 1 } else { options.batch_lock_size };
+        validate_batch_lock_size(raw_batch_lock_size, self.max_batch_lock_size)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        validate_wal_flush_every(options.wal_flush_every, self.max_wal_flush_interval)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        if options.ef_construction > 0 {
+            validate_ef_construction(options.ef_construction, self.max_ef_construction)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            tracing::info!(ef_construction = options.ef_construction, "ef_construction override for bulk insert");
+        }
+
+        validate_bulk_insert_options(options.parallel_build, index_mode)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        if options.defer_graph {
+            tracing::warn!("defer_graph enabled: search may return stale results until optimize() is called");
+        }
+
+        let batch_lock_size = raw_batch_lock_size as usize;
+        let defer_graph = options.defer_graph;
+        let wal_flush_every = options.wal_flush_every;
+        let _ef_construction = options.ef_construction; // TODO: thread to HNSW index
+        let index_mode_deferred = index_mode == "deferred";
+        let skip_metadata_index = options.skip_metadata_index;
+        let _parallel_build = options.parallel_build; // TODO: use in optimize() with index_mode=deferred
+
+        let mut inserted_count: u64 = 0;
+        let mut item_index: u64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+        let mut wal_counter: u32 = 0;
+        let mut pending_wal: Vec<(String, u64, Vec<f32>, Option<vf_core::types::Metadata>)> = Vec::new();
+
+        // Buffer for batched lock acquisition
+        struct BatchItem {
+            req: InsertRequest,
+            item_idx: u64,
+        }
+        let mut batch_buffer: Vec<BatchItem> = Vec::with_capacity(batch_lock_size);
+
+        // Track collection names and inserted vectors for deferred graph recomputation
+        let mut batch_vectors: std::collections::HashMap<
+            String,
+            (Vec<u64>, std::collections::HashMap<u64, Vec<f32>>),
+        > = std::collections::HashMap::new();
+
+        // Track which collections had any deferred flags set
+        let mut collections_with_deferrals: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // Helper closure to process a batch of items
+        let process_batch = |batch: &mut Vec<BatchItem>,
+                             state: &AppState,
+                             errors: &mut Vec<String>,
+                             inserted_count: &mut u64,
+                             wal_counter: &mut u32,
+                             wal_flush_every: u32,
+                             defer_graph: bool,
+                             index_mode_deferred: bool,
+                             skip_metadata_index: bool,
+                             batch_vectors: &mut std::collections::HashMap<
+            String,
+            (Vec<u64>, std::collections::HashMap<u64, Vec<f32>>),
+        >,
+                             pending_wal: &mut Vec<(String, u64, Vec<f32>, Option<vf_core::types::Metadata>)>,
+        | {
+            if batch.is_empty() {
+                return;
+            }
+
+            // Group by collection name to minimize lock re-acquisitions
+            let mut by_collection: std::collections::HashMap<String, Vec<&mut BatchItem>> =
+                std::collections::HashMap::new();
+            for item in batch.iter_mut() {
+                by_collection
+                    .entry(item.req.collection.clone())
+                    .or_default()
+                    .push(item);
+            }
+
+            // Process each collection group under a single write lock
+            for (coll_name, items) in &by_collection {
+                let mut collections = state.collections.write();
+                let coll = match collections.get_mut(coll_name) {
+                    Some(c) => c,
+                    None => {
+                        for item in items {
+                            errors.push(format!(
+                                "item {}: collection '{}' not found",
+                                item.item_idx, coll_name
+                            ));
+                        }
+                        continue;
+                    }
+                };
+
+                for item in items {
+                    let proto_vec = match item.req.vector.as_ref() {
+                        Some(v) if !v.values.is_empty() => v,
+                        _ => {
+                            errors.push(format!(
+                                "item {}: missing or empty vector",
+                                item.item_idx
+                            ));
+                            continue;
+                        }
+                    };
+
+                    let values = proto_vec.values.clone();
+                    let core_metadata = item.req.metadata.as_ref().map(proto_to_core_metadata);
+                    let vector_data = VectorData::F32(values.clone());
+
+                    // Insert into store
+                    let assigned_id = if item.req.id == 0 {
+                        match coll.store.insert_auto_id(vector_data, core_metadata.clone()) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                errors.push(format!(
+                                    "item {}: store insert failed: {}",
+                                    item.item_idx, e
+                                ));
+                                continue;
+                            }
+                        }
+                    } else {
+                        let record =
+                            VectorRecord::new(item.req.id, vector_data, core_metadata.clone());
+                        match coll.store.insert(record) {
+                            Ok(()) => item.req.id,
+                            Err(e) => {
+                                errors.push(format!(
+                                    "item {}: store insert failed for id {}: {}",
+                                    item.item_idx, item.req.id, e
+                                ));
+                                continue;
+                            }
+                        }
+                    };
+
+                    // HNSW index: skip if deferred
+                    if !index_mode_deferred {
+                        if let Err(e) = coll.index.add(assigned_id, &values) {
+                            let _ = coll.store.delete(assigned_id);
+                            errors.push(format!(
+                                "item {}: index insert failed for id {}: {}",
+                                item.item_idx, assigned_id, e
+                            ));
+                            continue;
+                        }
+                    }
+
+                    // Metadata index: skip if flagged
+                    if !skip_metadata_index {
+                        if let Some(ref meta) = core_metadata {
+                            coll.index_manager.index_record(assigned_id, meta);
+                        }
+                    }
+
+                    // Graph computation: skip if deferred
+                    if !defer_graph {
+                        if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
+                            &mut coll.graph,
+                            &coll.index,
+                            assigned_id,
+                            &values,
+                            10,
+                        ) {
+                            tracing::warn!(
+                                collection = %coll_name,
+                                id = assigned_id,
+                                "graph compute failed: {}",
+                                e
+                            );
+                        }
+                    }
+
+                    // Track for post-insert graph recomputation
+                    let entry = batch_vectors
+                        .entry(coll_name.clone())
+                        .or_insert_with(|| (Vec::new(), std::collections::HashMap::new()));
+                    entry.0.push(assigned_id);
+                    entry.1.insert(assigned_id, values.clone());
+
+                    *inserted_count += 1;
+
+                    // WAL persistence: accumulate into pending buffer, flush at threshold
+                    if wal_flush_every > 0 {
+                        pending_wal.push((coll_name.clone(), assigned_id, values, core_metadata));
+                        *wal_counter += 1;
+
+                        if wal_flush_every <= 1 || *wal_counter >= wal_flush_every {
+                            let mut cm = state.collection_manager.write();
+                            for (cn, id, vals, meta) in pending_wal.drain(..) {
+                                if let Ok(storage_coll) = cm.get_collection_mut(&cn) {
+                                    if let Err(e) = storage_coll.insert(
+                                        id,
+                                        VectorData::F32(vals),
+                                        meta,
+                                    ) {
+                                        tracing::warn!(
+                                            collection = %cn,
+                                            id = id,
+                                            "storage insert failed: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            *wal_counter = 0;
+                        }
+                    }
+                    // wal_flush_every == 0 means skip WAL entirely
+                }
+            }
+
+            batch.clear();
+        };
+
+        // Stream vectors and collect into batches
+        while let Some(result) = stream.message().await? {
+            match result.payload {
+                Some(Payload::Vector(req)) => {
+                    let current_item = item_index;
+                    item_index += 1;
+
+                    if !req.collection.is_empty() {
+                        collections_with_deferrals.insert(req.collection.clone());
+                    }
+
+                    batch_buffer.push(BatchItem {
+                        req,
+                        item_idx: current_item,
+                    });
+
+                    if batch_buffer.len() >= batch_lock_size {
+                        process_batch(
+                            &mut batch_buffer,
+                            &self.state,
+                            &mut errors,
+                            &mut inserted_count,
+                            &mut wal_counter,
+                            wal_flush_every,
+                            defer_graph,
+                            index_mode_deferred,
+                            skip_metadata_index,
+                            &mut batch_vectors,
+                            &mut pending_wal,
+                        );
+                    }
+                }
+                Some(Payload::Options(_)) => {
+                    errors.push(format!(
+                        "item {}: unexpected options message after first message",
+                        item_index
+                    ));
+                    item_index += 1;
+                }
+                None => {
+                    item_index += 1;
+                }
+            }
+        }
+
+        // Reject empty stream (options sent but no vectors followed)
+        if item_index == 0 {
+            return Err(Status::invalid_argument(
+                "stream contained no vectors after options message",
+            ));
+        }
+
+        // Process any remaining items in the buffer
+        process_batch(
+            &mut batch_buffer,
+            &self.state,
+            &mut errors,
+            &mut inserted_count,
+            &mut wal_counter,
+            wal_flush_every,
+            defer_graph,
+            index_mode_deferred,
+            skip_metadata_index,
+            &mut batch_vectors,
+            &mut pending_wal,
+        );
+
+        // Flush any remaining WAL entries
+        if !pending_wal.is_empty() {
+            let mut cm = self.state.collection_manager.write();
+            for (cn, id, vals, meta) in pending_wal.drain(..) {
+                if let Ok(storage_coll) = cm.get_collection_mut(&cn) {
+                    if let Err(e) = storage_coll.insert(id, VectorData::F32(vals), meta) {
+                        tracing::warn!(
+                            collection = %cn,
+                            id = id,
+                            "storage insert failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Recompute graph edges for all inserted vectors (only if graph not deferred)
+        if !defer_graph {
+            for (coll_name, (ids, vectors_map)) in &batch_vectors {
+                let mut collections = self.state.collections.write();
+                if let Some(coll) = collections.get_mut(coll_name) {
+                    if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
+                        &mut coll.graph, &coll.index, ids, vectors_map, 10,
+                    ) {
+                        tracing::warn!(
+                            collection = %coll_name,
+                            "graph compute_batch after bulk_insert_with_options failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Set deferred flags and collection status
+        let any_deferred = defer_graph || index_mode_deferred || skip_metadata_index;
+        if any_deferred {
+            let collections = self.state.collections.read();
+            for coll_name in &collections_with_deferrals {
+                if let Some(coll) = collections.get(coll_name) {
+                    if defer_graph {
+                        coll.deferred_graph.store(true, Ordering::Release);
+                    }
+                    if index_mode_deferred {
+                        coll.deferred_index.store(true, Ordering::Release);
+                    }
+                    if skip_metadata_index {
+                        coll.deferred_metadata.store(true, Ordering::Release);
+                    }
+                    // Set status to PendingOptimization
+                    if let Ok(mut status) = coll.status.write() {
+                        *status = CollectionStatus::PendingOptimization;
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(BulkInsertResponse {
+            inserted_count,
+            errors,
+        }))
+    }
+
+    async fn optimize(
+        &self,
+        request: Request<OptimizeRequest>,
+    ) -> Result<Response<OptimizeResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.collection.is_empty() {
+            return Err(Status::invalid_argument("collection name is required"));
+        }
+
+        match self.state.optimize_collection(&req.collection) {
+            Ok(result) => Ok(Response::new(OptimizeResponse {
+                status: result.status,
+                message: result.message,
+                duration_ms: result.duration_ms,
+                vectors_processed: result.vectors_processed,
+            })),
+            Err(e) if e.contains("not found") => Err(Status::not_found(e)),
+            Err(e) if e.contains("already being optimized") => {
+                Err(Status::failed_precondition(e))
+            }
+            Err(e) => Err(Status::internal(e)),
+        }
     }
 }

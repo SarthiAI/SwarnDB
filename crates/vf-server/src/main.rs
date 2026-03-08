@@ -50,7 +50,13 @@ async fn main() {
     let metrics_handle = setup_metrics();
 
     // 4. Create application state
-    let state = AppState::new(Path::new(&config.data_dir)).unwrap_or_else(|e| {
+    let state = AppState::new(
+        Path::new(&config.data_dir),
+        config.max_ef_search,
+        config.max_batch_lock_size,
+        config.max_wal_flush_interval,
+        config.max_ef_construction,
+    ).unwrap_or_else(|e| {
         tracing::error!("failed to initialize AppState: {}", e);
         std::process::exit(1);
     });
@@ -62,13 +68,22 @@ async fn main() {
         .expect("invalid gRPC bind address");
 
     let grpc_state = state.clone();
+    let max_ef_search = config.max_ef_search;
+    let max_batch_lock_size = config.max_batch_lock_size;
+    let max_wal_flush_interval = config.max_wal_flush_interval;
+    let max_ef_construction = config.max_ef_construction;
     let grpc_handle = tokio::spawn(async move {
         tracing::info!(%grpc_addr, "gRPC server listening");
 
         let collection_svc =
             CollectionServiceServer::new(CollectionServiceImpl::new(grpc_state.clone()));
-        let vector_svc = VectorServiceServer::new(VectorServiceImpl::new(grpc_state.clone()));
-        let search_svc = SearchServiceServer::new(SearchServiceImpl::new(grpc_state.clone()));
+        let vector_svc = VectorServiceServer::new(VectorServiceImpl::new(
+            grpc_state.clone(),
+            max_batch_lock_size,
+            max_wal_flush_interval,
+            max_ef_construction,
+        ));
+        let search_svc = SearchServiceServer::new(SearchServiceImpl::new(grpc_state.clone(), max_ef_search));
         let graph_svc = GraphServiceServer::new(GraphServiceImpl::new(grpc_state.clone()));
         let vector_math_svc =
             VectorMathServiceServer::new(VectorMathServiceImpl::new(grpc_state.clone()));

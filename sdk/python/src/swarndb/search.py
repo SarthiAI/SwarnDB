@@ -330,6 +330,7 @@ class SearchAPI:
         include_graph: bool = False,
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
+        ef_search: Optional[int] = None,
     ) -> SearchResult:
         """Search for nearest neighbors.
 
@@ -343,6 +344,7 @@ class SearchAPI:
             include_graph: Whether to include graph edges in results.
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
+            ef_search: Optional HNSW ef_search override for this query.
 
         Returns:
             SearchResult with ``.results`` list and ``.search_time_us``.
@@ -367,6 +369,8 @@ class SearchAPI:
             graph_threshold=graph_threshold,
             max_graph_edges=max_graph_edges,
         )
+        if ef_search is not None:
+            request.ef_search = ef_search
         if filter is not None:
             request.filter.CopyFrom(filter._to_proto())
 
@@ -379,6 +383,7 @@ class SearchAPI:
         return SearchResult(
             results=results,
             search_time_us=response.search_time_us,
+            warning=getattr(response, 'warning', '') or '',
         )
 
     def batch(
@@ -393,6 +398,7 @@ class SearchAPI:
         include_graph: bool = False,
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
+        ef_search: Optional[int] = None,
     ) -> BatchSearchResult:
         """Batch search multiple queries against a collection.
 
@@ -406,6 +412,7 @@ class SearchAPI:
             include_graph: Whether to include graph edges in results.
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
+            ef_search: Optional HNSW ef_search override applied to all queries.
 
         Returns:
             BatchSearchResult with ``.results`` (list of SearchResult)
@@ -435,6 +442,8 @@ class SearchAPI:
                 graph_threshold=graph_threshold,
                 max_graph_edges=max_graph_edges,
             )
+            if ef_search is not None:
+                req.ef_search = ef_search
             if proto_filter is not None:
                 req.filter.CopyFrom(proto_filter)
             search_requests.append(req)
@@ -450,7 +459,11 @@ class SearchAPI:
         for sr in response.results:
             results = [_scored_result_from_proto(r) for r in sr.results]
             search_results.append(
-                SearchResult(results=results, search_time_us=sr.search_time_us)
+                SearchResult(
+                    results=results,
+                    search_time_us=sr.search_time_us,
+                    warning=getattr(sr, 'warning', '') or '',
+                )
             )
 
         return BatchSearchResult(

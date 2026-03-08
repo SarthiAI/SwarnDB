@@ -125,6 +125,45 @@ class DiversityResult:
 
 
 @dataclass(frozen=True)
+class BulkInsertOptions:
+    """Configuration options for optimized bulk insert operations.
+
+    These parameters control server-side behavior during bulk ingestion,
+    allowing callers to trade consistency for throughput.
+    """
+
+    batch_lock_size: Optional[int] = None
+    defer_graph: bool = False
+    wal_flush_every: Optional[int] = None
+    ef_construction: Optional[int] = None
+    index_mode: Optional[str] = None
+    skip_metadata_index: bool = False
+    parallel_build: bool = False
+
+    def has_non_defaults(self) -> bool:
+        """Return True if any parameter differs from its default."""
+        return (
+            self.batch_lock_size is not None
+            or self.defer_graph
+            or self.wal_flush_every is not None
+            or self.ef_construction is not None
+            or self.index_mode is not None
+            or self.skip_metadata_index
+            or self.parallel_build
+        )
+
+
+@dataclass(frozen=True)
+class OptimizeResult:
+    """Result of a collection optimize operation."""
+
+    status: str
+    message: str
+    duration_ms: int
+    vectors_processed: int
+
+
+@dataclass(frozen=True)
 class BulkInsertResult:
     """Result of a bulk insert operation."""
 
@@ -138,6 +177,7 @@ class SearchResult:
 
     results: List[ScoredResult]
     search_time_us: int
+    warning: str = ""
 
 
 @dataclass(frozen=True)

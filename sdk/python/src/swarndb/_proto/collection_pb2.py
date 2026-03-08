@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from . import common_pb2 as swarndb_dot_v1_dot_common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1bswarndb/v1/collection.proto\x12\nswarndb.v1\x1a\x17swarndb/v1/common.proto\"\x83\x01\n\x17\x43reateCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x04 \x01(\x02\x12\x13\n\x0bmax_vectors\x18\x05 \x01(\x04\"9\n\x18\x43reateCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0f\n\x07success\x18\x02 \x01(\x08\"\'\n\x17\x44\x65leteCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"+\n\x18\x44\x65leteCollectionResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"$\n\x14GetCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"\x82\x01\n\x15GetCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x14\n\x0cvector_count\x18\x04 \x01(\x04\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x05 \x01(\x02\"\x18\n\x16ListCollectionsRequest\"Q\n\x17ListCollectionsResponse\x12\x36\n\x0b\x63ollections\x18\x01 \x03(\x0b\x32!.swarndb.v1.GetCollectionResponse2\x83\x03\n\x11\x43ollectionService\x12]\n\x10\x43reateCollection\x12#.swarndb.v1.CreateCollectionRequest\x1a$.swarndb.v1.CreateCollectionResponse\x12]\n\x10\x44\x65leteCollection\x12#.swarndb.v1.DeleteCollectionRequest\x1a$.swarndb.v1.DeleteCollectionResponse\x12T\n\rGetCollection\x12 .swarndb.v1.GetCollectionRequest\x1a!.swarndb.v1.GetCollectionResponse\x12Z\n\x0fListCollections\x12\".swarndb.v1.ListCollectionsRequest\x1a#.swarndb.v1.ListCollectionsResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1bswarndb/v1/collection.proto\x12\nswarndb.v1\x1a\x17swarndb/v1/common.proto\"\x83\x01\n\x17\x43reateCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x04 \x01(\x02\x12\x13\n\x0bmax_vectors\x18\x05 \x01(\x04\"9\n\x18\x43reateCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0f\n\x07success\x18\x02 \x01(\x08\"\'\n\x17\x44\x65leteCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"+\n\x18\x44\x65leteCollectionResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"$\n\x14GetCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"\x92\x01\n\x15GetCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x14\n\x0cvector_count\x18\x04 \x01(\x04\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x05 \x01(\x02\x12\x0e\n\x06status\x18\x06 \x01(\t\"\x18\n\x16ListCollectionsRequest\"Q\n\x17ListCollectionsResponse\x12\x36\n\x0b\x63ollections\x18\x01 \x03(\x0b\x32!.swarndb.v1.GetCollectionResponse2\x83\x03\n\x11\x43ollectionService\x12]\n\x10\x43reateCollection\x12#.swarndb.v1.CreateCollectionRequest\x1a$.swarndb.v1.CreateCollectionResponse\x12]\n\x10\x44\x65leteCollection\x12#.swarndb.v1.DeleteCollectionRequest\x1a$.swarndb.v1.DeleteCollectionResponse\x12T\n\rGetCollection\x12 .swarndb.v1.GetCollectionRequest\x1a!.swarndb.v1.GetCollectionResponse\x12Z\n\x0fListCollections\x12\".swarndb.v1.ListCollectionsRequest\x1a#.swarndb.v1.ListCollectionsResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -43,11 +43,11 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_GETCOLLECTIONREQUEST']._serialized_start=347
   _globals['_GETCOLLECTIONREQUEST']._serialized_end=383
   _globals['_GETCOLLECTIONRESPONSE']._serialized_start=386
-  _globals['_GETCOLLECTIONRESPONSE']._serialized_end=516
-  _globals['_LISTCOLLECTIONSREQUEST']._serialized_start=518
-  _globals['_LISTCOLLECTIONSREQUEST']._serialized_end=542
-  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_start=544
-  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_end=625
-  _globals['_COLLECTIONSERVICE']._serialized_start=628
-  _globals['_COLLECTIONSERVICE']._serialized_end=1015
+  _globals['_GETCOLLECTIONRESPONSE']._serialized_end=532
+  _globals['_LISTCOLLECTIONSREQUEST']._serialized_start=534
+  _globals['_LISTCOLLECTIONSREQUEST']._serialized_end=558
+  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_start=560
+  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_end=641
+  _globals['_COLLECTIONSERVICE']._serialized_start=644
+  _globals['_COLLECTIONSERVICE']._serialized_end=1031
 # @@protoc_insertion_point(module_scope)

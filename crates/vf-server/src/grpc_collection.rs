@@ -105,6 +105,12 @@ impl CollectionService for CollectionServiceImpl {
             index_manager,
             graph,
             metadata_cache: MetadataCache::new(),
+            status: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::state::CollectionStatus::Ready,
+            )),
+            deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let mut collections = self.state.collections.write();
@@ -152,12 +158,14 @@ impl CollectionService for CollectionServiceImpl {
             Status::not_found(format!("collection '{}' not found", req.name))
         })?;
 
+        let status_str = coll.status.read().unwrap().as_str().to_string();
         Ok(Response::new(GetCollectionResponse {
             name: coll.config.name.clone(),
             dimension: coll.config.dimension as u32,
             distance_metric: distance_metric_to_string(coll.config.distance_metric),
             vector_count: coll.store.len() as u64,
             default_threshold: coll.config.default_similarity_threshold.unwrap_or(0.0),
+            status: status_str,
         }))
     }
 
@@ -169,12 +177,16 @@ impl CollectionService for CollectionServiceImpl {
 
         let list: Vec<GetCollectionResponse> = collections
             .values()
-            .map(|coll| GetCollectionResponse {
-                name: coll.config.name.clone(),
-                dimension: coll.config.dimension as u32,
-                distance_metric: distance_metric_to_string(coll.config.distance_metric),
-                vector_count: coll.store.len() as u64,
-                default_threshold: coll.config.default_similarity_threshold.unwrap_or(0.0),
+            .map(|coll| {
+                let status_str = coll.status.read().unwrap().as_str().to_string();
+                GetCollectionResponse {
+                    name: coll.config.name.clone(),
+                    dimension: coll.config.dimension as u32,
+                    distance_metric: distance_metric_to_string(coll.config.distance_metric),
+                    vector_count: coll.store.len() as u64,
+                    default_threshold: coll.config.default_similarity_threshold.unwrap_or(0.0),
+                    status: status_str,
+                }
             })
             .collect();
 

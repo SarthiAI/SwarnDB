@@ -327,7 +327,7 @@ pub fn run_benchmark(
     let search_start = Instant::now();
     for query in &query_vectors {
         let results = index
-            .search(query, config.k)
+            .search(query, config.k, None)
             .map_err(|e| format!("Search failed: {e}"))?;
         let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
         all_results.push(ids);

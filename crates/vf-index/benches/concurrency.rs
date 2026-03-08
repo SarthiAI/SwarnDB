@@ -73,7 +73,7 @@ fn bench_hnsw_search_qps(c: &mut Criterion) {
                                     // Each thread does multiple searches
                                     for i in 0..8 {
                                         let q = &qs[(t * 8 + i) % qs.len()];
-                                        let _ = black_box(idx.search(q, k));
+                                        let _ = black_box(idx.search(q, k, None));
                                     }
                                 })
                             })

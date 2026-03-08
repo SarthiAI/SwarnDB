@@ -20,6 +20,7 @@ from swarndb.exceptions import (
 )
 from swarndb.types import (
     BatchSearchResult,
+    BulkInsertOptions,
     BulkInsertResult,
     ClusterAssignment,
     ClusterResult,
@@ -29,6 +30,7 @@ from swarndb.types import (
     DriftReport,
     GhostVector,
     GraphEdge,
+    OptimizeResult,
     PCAResult,
     ScoredResult,
     SearchResult,
@@ -97,7 +99,9 @@ __all__ = [
     "ClusterAssignment",
     "PCAResult",
     "DiversityResult",
+    "BulkInsertOptions",
     "BulkInsertResult",
+    "OptimizeResult",
     # Exceptions
     "SwarnDBError",
     "ConnectionError",

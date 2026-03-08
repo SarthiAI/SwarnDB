@@ -47,7 +47,7 @@ class FieldFilter(_message.Message):
     def __init__(self, field: _Optional[str] = ..., op: _Optional[str] = ..., value: _Optional[_Union[_common_pb2.MetadataValue, _Mapping]] = ..., values: _Optional[_Iterable[_Union[_common_pb2.MetadataValue, _Mapping]]] = ...) -> None: ...
 
 class SearchRequest(_message.Message):
-    __slots__ = ("collection", "query", "k", "filter", "strategy", "include_metadata", "include_graph", "graph_threshold", "max_graph_edges")
+    __slots__ = ("collection", "query", "k", "filter", "strategy", "include_metadata", "include_graph", "graph_threshold", "max_graph_edges", "ef_search")
     COLLECTION_FIELD_NUMBER: _ClassVar[int]
     QUERY_FIELD_NUMBER: _ClassVar[int]
     K_FIELD_NUMBER: _ClassVar[int]
@@ -57,6 +57,7 @@ class SearchRequest(_message.Message):
     INCLUDE_GRAPH_FIELD_NUMBER: _ClassVar[int]
     GRAPH_THRESHOLD_FIELD_NUMBER: _ClassVar[int]
     MAX_GRAPH_EDGES_FIELD_NUMBER: _ClassVar[int]
+    EF_SEARCH_FIELD_NUMBER: _ClassVar[int]
     collection: str
     query: _common_pb2.Vector
     k: int
@@ -66,15 +67,18 @@ class SearchRequest(_message.Message):
     include_graph: bool
     graph_threshold: float
     max_graph_edges: int
-    def __init__(self, collection: _Optional[str] = ..., query: _Optional[_Union[_common_pb2.Vector, _Mapping]] = ..., k: _Optional[int] = ..., filter: _Optional[_Union[FilterExpression, _Mapping]] = ..., strategy: _Optional[str] = ..., include_metadata: bool = ..., include_graph: bool = ..., graph_threshold: _Optional[float] = ..., max_graph_edges: _Optional[int] = ...) -> None: ...
+    ef_search: int
+    def __init__(self, collection: _Optional[str] = ..., query: _Optional[_Union[_common_pb2.Vector, _Mapping]] = ..., k: _Optional[int] = ..., filter: _Optional[_Union[FilterExpression, _Mapping]] = ..., strategy: _Optional[str] = ..., include_metadata: bool = ..., include_graph: bool = ..., graph_threshold: _Optional[float] = ..., max_graph_edges: _Optional[int] = ..., ef_search: _Optional[int] = ...) -> None: ...
 
 class SearchResponse(_message.Message):
-    __slots__ = ("results", "search_time_us")
+    __slots__ = ("results", "search_time_us", "warning")
     RESULTS_FIELD_NUMBER: _ClassVar[int]
     SEARCH_TIME_US_FIELD_NUMBER: _ClassVar[int]
+    WARNING_FIELD_NUMBER: _ClassVar[int]
     results: _containers.RepeatedCompositeFieldContainer[_common_pb2.ScoredResult]
     search_time_us: int
-    def __init__(self, results: _Optional[_Iterable[_Union[_common_pb2.ScoredResult, _Mapping]]] = ..., search_time_us: _Optional[int] = ...) -> None: ...
+    warning: str
+    def __init__(self, results: _Optional[_Iterable[_Union[_common_pb2.ScoredResult, _Mapping]]] = ..., search_time_us: _Optional[int] = ..., warning: _Optional[str] = ...) -> None: ...
 
 class BatchSearchRequest(_message.Message):
     __slots__ = ("queries",)

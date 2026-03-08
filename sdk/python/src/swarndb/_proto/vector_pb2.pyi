@@ -84,3 +84,47 @@ class BulkInsertResponse(_message.Message):
     inserted_count: int
     errors: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, inserted_count: _Optional[int] = ..., errors: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class BulkInsertOptions(_message.Message):
+    __slots__ = ("batch_lock_size", "defer_graph", "wal_flush_every", "ef_construction", "index_mode", "skip_metadata_index", "parallel_build")
+    BATCH_LOCK_SIZE_FIELD_NUMBER: _ClassVar[int]
+    DEFER_GRAPH_FIELD_NUMBER: _ClassVar[int]
+    WAL_FLUSH_EVERY_FIELD_NUMBER: _ClassVar[int]
+    EF_CONSTRUCTION_FIELD_NUMBER: _ClassVar[int]
+    INDEX_MODE_FIELD_NUMBER: _ClassVar[int]
+    SKIP_METADATA_INDEX_FIELD_NUMBER: _ClassVar[int]
+    PARALLEL_BUILD_FIELD_NUMBER: _ClassVar[int]
+    batch_lock_size: int
+    defer_graph: bool
+    wal_flush_every: int
+    ef_construction: int
+    index_mode: str
+    skip_metadata_index: bool
+    parallel_build: bool
+    def __init__(self, batch_lock_size: _Optional[int] = ..., defer_graph: bool = ..., wal_flush_every: _Optional[int] = ..., ef_construction: _Optional[int] = ..., index_mode: _Optional[str] = ..., skip_metadata_index: bool = ..., parallel_build: bool = ...) -> None: ...
+
+class BulkInsertStreamMessage(_message.Message):
+    __slots__ = ("options", "vector")
+    OPTIONS_FIELD_NUMBER: _ClassVar[int]
+    VECTOR_FIELD_NUMBER: _ClassVar[int]
+    options: BulkInsertOptions
+    vector: InsertRequest
+    def __init__(self, options: _Optional[_Union[BulkInsertOptions, _Mapping]] = ..., vector: _Optional[_Union[InsertRequest, _Mapping]] = ...) -> None: ...
+
+class OptimizeRequest(_message.Message):
+    __slots__ = ("collection",)
+    COLLECTION_FIELD_NUMBER: _ClassVar[int]
+    collection: str
+    def __init__(self, collection: _Optional[str] = ...) -> None: ...
+
+class OptimizeResponse(_message.Message):
+    __slots__ = ("status", "message", "duration_ms", "vectors_processed")
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    DURATION_MS_FIELD_NUMBER: _ClassVar[int]
+    VECTORS_PROCESSED_FIELD_NUMBER: _ClassVar[int]
+    status: str
+    message: str
+    duration_ms: int
+    vectors_processed: int
+    def __init__(self, status: _Optional[str] = ..., message: _Optional[str] = ..., duration_ms: _Optional[int] = ..., vectors_processed: _Optional[int] = ...) -> None: ...

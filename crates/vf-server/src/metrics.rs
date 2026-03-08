@@ -41,6 +41,9 @@ pub const WAL_SIZE_BYTES: &str = "swarndb_wal_size_bytes";
 /// Gauge: number of storage segments.
 pub const SEGMENT_COUNT: &str = "swarndb_segments_total";
 
+/// Histogram: per-query ef_search override values.
+pub const SEARCH_EF_USED: &str = "swarndb_search_ef_used";
+
 // ── Setup ───────────────────────────────────────────────────────────────
 
 /// Installs the Prometheus metrics recorder and returns a handle
@@ -111,4 +114,10 @@ pub fn set_wal_size_bytes(bytes: u64) {
 /// Updates the segment count gauge.
 pub fn set_segment_count(count: u64) {
     gauge!(SEGMENT_COUNT).set(count as f64);
+}
+
+/// Records a per-query ef_search override value.
+pub fn record_ef_search(ef_value: usize, collection: &str) {
+    histogram!(SEARCH_EF_USED, "collection" => collection.to_owned())
+        .record(ef_value as f64);
 }

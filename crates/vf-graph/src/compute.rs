@@ -35,7 +35,7 @@ impl RelationshipComputer {
         let threshold = graph.resolve_threshold(vector_id, None);
         let max_edges = graph.config().max_edges_per_node;
 
-        let results = index.search(vector_data, k)?;
+        let results = index.search(vector_data, k, None)?;
 
         let mut added = 0usize;
         for result in results {
