@@ -1177,6 +1177,7 @@ async fn set_threshold(
 
     if req.vector_id == 0 {
         coll.graph.config_mut().default_threshold = req.threshold;
+        coll.deferred_graph.store(true, Ordering::Release);
     } else {
         coll.graph.set_vector_threshold(req.vector_id, req.threshold);
     }

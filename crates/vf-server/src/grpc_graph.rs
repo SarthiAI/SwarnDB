@@ -3,6 +3,8 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
+use std::sync::atomic::Ordering;
+
 use tonic::{Request, Response, Status};
 
 use vf_graph::{GraphTraversal, RelationshipQueryEngine, TraversalOrder};
@@ -131,6 +133,7 @@ impl GraphService for GraphServiceImpl {
         if req.vector_id == 0 {
             // Update collection-level default threshold
             collection.graph.config_mut().default_threshold = req.threshold;
+            collection.deferred_graph.store(true, Ordering::Release);
         } else {
             // Set per-vector threshold override
             collection
