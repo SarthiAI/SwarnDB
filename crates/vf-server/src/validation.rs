@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Input validation and security middleware for request handling.
 //!
@@ -50,11 +49,11 @@ fn default_max_vectors_per_request() -> usize {
 }
 
 fn default_max_request_body_bytes() -> usize {
-    64 * 1024 * 1024 // 64 MB
+    256 * 1024 * 1024 // 256 MB
 }
 
 fn default_max_metadata_size_bytes() -> usize {
-    1024 * 1024 // 1 MB
+    4 * 1024 * 1024 // 4 MB
 }
 
 fn default_max_collection_name_length() -> usize {
@@ -65,14 +64,38 @@ fn default_allowed_collection_name_pattern() -> String {
     "^[a-zA-Z0-9_-]+$".to_string()
 }
 
+/// Reads an environment variable and parses it as `usize`, returning the
+/// struct default if the variable is unset or unparseable.
+fn env_override_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 impl Default for ValidationConfig {
     fn default() -> Self {
         Self {
-            max_vector_dimension: default_max_vector_dimension(),
-            max_vectors_per_request: default_max_vectors_per_request(),
-            max_request_body_bytes: default_max_request_body_bytes(),
-            max_metadata_size_bytes: default_max_metadata_size_bytes(),
-            max_collection_name_length: default_max_collection_name_length(),
+            max_vector_dimension: env_override_usize(
+                "SWARNDB_MAX_VECTOR_DIMENSION",
+                default_max_vector_dimension(),
+            ),
+            max_vectors_per_request: env_override_usize(
+                "SWARNDB_MAX_VECTORS_PER_REQUEST",
+                default_max_vectors_per_request(),
+            ),
+            max_request_body_bytes: env_override_usize(
+                "SWARNDB_MAX_REQUEST_BODY_BYTES",
+                default_max_request_body_bytes(),
+            ),
+            max_metadata_size_bytes: env_override_usize(
+                "SWARNDB_MAX_METADATA_SIZE_BYTES",
+                default_max_metadata_size_bytes(),
+            ),
+            max_collection_name_length: env_override_usize(
+                "SWARNDB_MAX_COLLECTION_NAME_LENGTH",
+                default_max_collection_name_length(),
+            ),
             allowed_collection_name_pattern: default_allowed_collection_name_pattern(),
         }
     }

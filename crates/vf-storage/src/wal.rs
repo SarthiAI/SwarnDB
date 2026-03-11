@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Write-Ahead Log (WAL) writer and reader for crash-safe durability.
 //!
@@ -21,8 +20,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
+
 use crate::error::{StorageError, StorageResult};
 use crate::format::{WalOp, WAL_MAGIC};
+use crate::FilePermissionConfig;
+
+/// Maximum WAL entry size (256 MB) to prevent unbounded heap allocation from
+/// corrupted or malicious on-disk data.
+const MAX_WAL_ENTRY_SIZE: usize = 256 * 1024 * 1024;
 
 // ── WalEntry ────────────────────────────────────────────────────────────────
 
@@ -43,14 +49,28 @@ pub struct WalWriter {
     bytes_written: u64,
     max_size: u64,
     entry_count: u64,
+    /// Exclusive lock file to prevent multi-process corruption.
+    _lock_file: File,
 }
 
 impl WalWriter {
     /// Create a **new** WAL file at `path`, writing the 4-byte magic header.
+    /// Uses default file permissions (0o600). Use `create_with_perms` for custom permissions.
     pub fn create(path: &Path, max_size: u64) -> StorageResult<Self> {
+        Self::create_with_perms(path, max_size, &FilePermissionConfig::default())
+    }
+
+    /// Create a **new** WAL file with configurable file permissions.
+    pub fn create_with_perms(path: &Path, max_size: u64, perm_config: &FilePermissionConfig) -> StorageResult<Self> {
         let file = File::create(path).map_err(|e| {
             StorageError::WalWriteFailed(format!("failed to create WAL file: {e}"))
         })?;
+
+        // Set file permissions using configurable mode.
+        perm_config.apply_file_permissions(path).map_err(|e| {
+            StorageError::WalWriteFailed(format!("failed to set WAL file permissions: {e}"))
+        })?;
+
         let mut writer = BufWriter::new(file);
 
         writer.write_all(&WAL_MAGIC).map_err(|e| {
@@ -58,12 +78,29 @@ impl WalWriter {
         })?;
         writer.flush().map_err(StorageError::Io)?;
 
+        // Acquire exclusive lock to prevent multi-process corruption.
+        let lock_path = path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| StorageError::FileLocked(format!("cannot open lock file: {e}")))?;
+        lock_file.try_lock_exclusive().map_err(|_| {
+            StorageError::FileLocked(format!(
+                "WAL file {:?} is locked by another process",
+                path
+            ))
+        })?;
+
         Ok(Self {
             file: writer,
             path: path.to_path_buf(),
             bytes_written: 4,
             max_size,
             entry_count: 0,
+            _lock_file: lock_file,
         })
     }
 
@@ -100,15 +137,62 @@ impl WalWriter {
             });
         }
 
+        // Count existing entries by scanning the file from after the magic header.
+        // This gives an accurate entry_count when reopening a WAL with data.
+        let mut entry_count: u64 = 0;
+        {
+            let mut reader = BufReader::new(&file);
+            // Already read the 4-byte magic above; position is past it.
+            // Seek reader to right after magic (offset 4).
+            reader.seek(SeekFrom::Start(4)).map_err(StorageError::Io)?;
+            loop {
+                // Try to read entry_len (4 bytes).
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(StorageError::Io(e)),
+                }
+                let entry_len = u32::from_le_bytes(len_buf) as usize;
+                if entry_len < 9 || entry_len > MAX_WAL_ENTRY_SIZE {
+                    break; // corrupted or truncated — stop counting
+                }
+                // Skip body (entry_len bytes) + CRC (4 bytes).
+                let skip = entry_len as i64 + 4;
+                match reader.seek(SeekFrom::Current(skip)) {
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                entry_count += 1;
+            }
+        }
+
         // Seek to end to determine total file size and prepare for appending.
         let size = file.seek(SeekFrom::End(0)).map_err(StorageError::Io)?;
+
+        // Acquire exclusive lock to prevent multi-process corruption.
+        let lock_path = path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| StorageError::FileLocked(format!("cannot open lock file: {e}")))?;
+        lock_file.try_lock_exclusive().map_err(|_| {
+            StorageError::FileLocked(format!(
+                "WAL file {:?} is locked by another process",
+                path
+            ))
+        })?;
 
         Ok(Self {
             file: BufWriter::new(file),
             path: path.to_path_buf(),
             bytes_written: size,
             max_size,
-            entry_count: 0,
+            entry_count,
+            _lock_file: lock_file,
         })
     }
 
@@ -124,7 +208,10 @@ impl WalWriter {
         collection_id: u64,
         payload: &[u8],
     ) -> StorageResult<()> {
-        let entry_len = 1u32 + 8u32 + payload.len() as u32;
+        let payload_len_u32 = u32::try_from(payload.len()).map_err(|_| {
+            StorageError::WalPayloadOverflow(payload.len())
+        })?;
+        let entry_len = 1u32 + 8u32 + payload_len_u32;
 
         // Build the body that is covered by the CRC.
         let mut body = Vec::with_capacity(entry_len as usize);
@@ -146,6 +233,7 @@ impl WalWriter {
             .map_err(|e| StorageError::WalWriteFailed(format!("write crc: {e}")))?;
 
         self.file.flush().map_err(StorageError::Io)?;
+        self.file.get_ref().sync_data().map_err(StorageError::Io)?;
 
         // Total bytes on disk for this entry: 4 (entry_len) + body + 4 (crc).
         let total = 4u64 + entry_len as u64 + 4u64;
@@ -182,33 +270,64 @@ impl WalWriter {
 
         let old_path = self.path.clone();
 
-        // Swap out the current file handle with a /dev/null placeholder so we
-        // can close the write handle before renaming. Using /dev/null avoids
-        // any risk of truncating or locking the original WAL file.
+        // Task 275: Atomic rename pattern for crash consistency.
+        // Write the new WAL to a temp file first, fsync it, then rename.
+        let tmp_new_wal = old_path.with_extension("log.tmp");
+        let fresh_tmp = Self::create(&tmp_new_wal, self.max_size)?;
+
+        // Fsync the fresh WAL temp file.
+        fresh_tmp.file.get_ref().sync_all().map_err(|e| {
+            StorageError::WalRotationFailed(format!("failed to fsync new WAL: {e}"))
+        })?;
+
+        // Task 283: Use a platform-appropriate empty file instead of /dev/null.
+        // Create a temporary empty file as placeholder to swap out the current handle.
+        let placeholder_path = old_path.with_extension("log.placeholder");
+        let placeholder = File::create(&placeholder_path).map_err(|e| {
+            StorageError::WalRotationFailed(format!(
+                "failed to create placeholder file: {e}"
+            ))
+        })?;
+
         let old_writer = std::mem::replace(
             &mut self.file,
-            BufWriter::new(
-                File::open("/dev/null").map_err(|e| {
-                    StorageError::WalRotationFailed(format!(
-                        "failed to open /dev/null placeholder: {e}"
-                    ))
-                })?,
-            ),
+            BufWriter::new(placeholder),
         );
 
         // Close the write handle so the file is no longer held open for writing.
         drop(old_writer);
 
-        // Rename the old WAL to the archive path.
-        fs::rename(&old_path, new_path).map_err(|e| {
+        // Crash-safe rotation order (Option A):
+        // 1. Hard-link old WAL to archive path (preserves original).
+        // 2. Atomically rename .tmp over the live path (replaces old WAL).
+        // If crash after step 1 but before step 2: old WAL still at live path — safe.
+        // If crash after step 2: archive exists, fresh WAL at live path — safe.
+        // Worst case: archive is missing (not linked yet) but live WAL is always valid.
+
+        // Step 1: Link old WAL to archive (non-destructive copy).
+        fs::hard_link(&old_path, new_path).or_else(|_| {
+            // Fallback to copy if hard_link fails (e.g. cross-device).
+            fs::copy(&old_path, new_path).map(|_| ())
+        }).map_err(|e| {
             StorageError::WalRotationFailed(format!(
-                "failed to rename WAL {:?} -> {:?}: {e}",
+                "failed to archive WAL {:?} -> {:?}: {e}",
                 old_path, new_path
             ))
         })?;
 
-        // Create a brand-new WAL at the original path.
-        let fresh = Self::create(&old_path, self.max_size)?;
+        // Step 2: Atomically rename fresh WAL to live path (replaces old WAL on POSIX).
+        fs::rename(&tmp_new_wal, &old_path).map_err(|e| {
+            StorageError::WalRotationFailed(format!(
+                "failed to rename temp WAL {:?} -> {:?}: {e}",
+                tmp_new_wal, old_path
+            ))
+        })?;
+
+        // Clean up the placeholder file.
+        let _ = fs::remove_file(&placeholder_path);
+
+        // Re-open the fresh WAL at the original path.
+        let fresh = Self::open(&old_path, self.max_size)?;
         self.file = fresh.file;
         self.bytes_written = fresh.bytes_written;
         self.entry_count = fresh.entry_count;
@@ -292,6 +411,14 @@ impl WalReader {
             return Err(StorageError::WalInvalidEntry(format!(
                 "entry_len too small: {entry_len}"
             )));
+        }
+
+        // Prevent unbounded allocation from corrupted entry_len values.
+        if entry_len > MAX_WAL_ENTRY_SIZE {
+            return Err(StorageError::WalEntryTooLarge {
+                size: entry_len,
+                max: MAX_WAL_ENTRY_SIZE,
+            });
         }
 
         // Read body (entry_len bytes).

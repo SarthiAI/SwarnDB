@@ -133,6 +133,9 @@ class GraphAPI:
             CollectionNotFoundError: If the collection does not exist.
             GraphError: If the operation fails.
         """
+        if threshold <= 0.0 or threshold > 1.0:
+            raise ValueError("threshold must be >0.0 and <=1.0")
+
         request = graph_pb2.SetThresholdRequest(
             collection=collection,
             vector_id=vector_id,

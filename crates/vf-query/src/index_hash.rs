@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 
@@ -34,8 +33,8 @@ impl HashKey {
 pub struct HashIndex {
     field_name: String,
     map: HashMap<HashKey, RoaringBitmap>,
-    // VectorId is u64 but RoaringBitmap uses u32. We truncate via `id as u32`,
-    // limiting this index to ~4 billion vectors (acceptable for v1).
+    // VectorId is u64 but RoaringBitmap uses u32. We use checked `try_into()`
+    // conversion, silently skipping IDs that exceed the u32 range.
     id_to_key: HashMap<u32, HashKey>,
 }
 
@@ -57,7 +56,10 @@ impl HashIndex {
         let Some(key) = HashKey::from_metadata(value) else {
             return;
         };
-        let id32 = id as u32;
+        let id32: u32 = match id.try_into() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
         // Remove old mapping if present
         if let Some(old_key) = self.id_to_key.remove(&id32) {
@@ -78,7 +80,10 @@ impl HashIndex {
 
     /// Remove a vector ID from the index.
     pub fn remove(&mut self, id: VectorId) {
-        let id32 = id as u32;
+        let id32: u32 = match id.try_into() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
         if let Some(key) = self.id_to_key.remove(&id32) {
             if let Some(bitmap) = self.map.get_mut(&key) {
                 bitmap.remove(id32);

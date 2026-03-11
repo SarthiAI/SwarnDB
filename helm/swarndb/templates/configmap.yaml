@@ -5,8 +5,58 @@ metadata:
   labels:
     {{- include "swarndb.labels" . | nindent 4 }}
 data:
-  log-level: {{ .Values.config.logLevel | quote }}
-  max-connections: {{ .Values.config.maxConnections | quote }}
-  request-timeout-ms: {{ .Values.config.requestTimeoutMs | quote }}
+  # ---- Network ----
   grpc-port: {{ .Values.service.grpcPort | quote }}
   rest-port: {{ .Values.service.restPort | quote }}
+  max-message-size: {{ .Values.config.maxMessageSize | quote }}
+  max-request-body-bytes: {{ .Values.config.maxRequestBodyBytes | quote }}
+  cors-origins: {{ .Values.config.corsOrigins | quote }}
+
+  # ---- Storage ----
+  wal-max-size: {{ .Values.config.walMaxSize | quote }}
+  tiered-hot-capacity: {{ .Values.config.tieredHotCapacity | quote }}
+  memtable-flush-threshold: {{ .Values.config.memtableFlushThreshold | quote }}
+
+  # ---- Logging ----
+  log-level: {{ .Values.config.logLevel | quote }}
+
+  # ---- Connection Limits ----
+  max-connections: {{ .Values.config.maxConnections | quote }}
+
+  # ---- Concurrency Control ----
+  max-concurrent-searches: {{ .Values.config.maxConcurrentSearches | quote }}
+  min-concurrency: {{ .Values.config.minConcurrency | quote }}
+  max-concurrency: {{ .Values.config.maxConcurrency | quote }}
+  target-p99-latency-ms: {{ .Values.config.targetP99LatencyMs | quote }}
+  concurrency-ema-alpha: {{ .Values.config.concurrencyEmaAlpha | quote }}
+  concurrency-high-threshold: {{ .Values.config.concurrencyHighThreshold | quote }}
+  concurrency-low-threshold: {{ .Values.config.concurrencyLowThreshold | quote }}
+  concurrency-decrease-rate: {{ .Values.config.concurrencyDecreaseRate | quote }}
+  concurrency-increase-rate: {{ .Values.config.concurrencyIncreaseRate | quote }}
+  search-queue-size: {{ .Values.config.searchQueueSize | quote }}
+
+  # ---- Timeouts ----
+  request-timeout-ms: {{ .Values.config.requestTimeoutMs | quote }}
+  search-timeout-ms: {{ .Values.config.searchTimeoutMs | quote }}
+  bulk-timeout-ms: {{ .Values.config.bulkTimeoutMs | quote }}
+  compute-timeout-secs: {{ .Values.config.computeTimeoutSecs | quote }}
+
+  # ---- Search Limits ----
+  max-k: {{ .Values.config.maxK | quote }}
+  max-ef-search: {{ .Values.config.maxEfSearch | quote }}
+
+  # ---- HNSW Index Tuning ----
+  max-ef: {{ .Values.config.maxEf | quote }}
+  max-ef-construction: {{ .Values.config.maxEfConstruction | quote }}
+
+  # ---- Bulk Insert Limits ----
+  max-batch-lock-size: {{ .Values.config.maxBatchLockSize | quote }}
+  max-wal-flush-interval: {{ .Values.config.maxWalFlushInterval | quote }}
+  max-bulk-insert-messages: {{ .Values.config.maxBulkInsertMessages | quote }}
+  max-bulk-insert-payload-bytes: {{ .Values.config.maxBulkInsertPayloadBytes | quote }}
+
+  # ---- Validation Limits ----
+  max-metadata-size-bytes: {{ .Values.config.maxMetadataSizeBytes | quote }}
+  max-vector-dimension: {{ .Values.config.maxVectorDimension | quote }}
+  max-vectors-per-request: {{ .Values.config.maxVectorsPerRequest | quote }}
+  max-collection-name-length: {{ .Values.config.maxCollectionNameLength | quote }}

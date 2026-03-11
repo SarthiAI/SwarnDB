@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -105,6 +104,13 @@ pub struct CollectionConfig {
     pub max_vectors: usize,
     /// Data type for vector storage
     pub data_type: DataTypeConfig,
+    /// Memtable flush threshold (number of vectors before flushing to segment)
+    #[serde(default = "default_memtable_flush_threshold")]
+    pub memtable_flush_threshold: usize,
+}
+
+fn default_memtable_flush_threshold() -> usize {
+    50_000
 }
 
 impl Default for CollectionConfig {
@@ -116,6 +122,7 @@ impl Default for CollectionConfig {
             default_similarity_threshold: None,
             max_vectors: 0,
             data_type: DataTypeConfig::F32,
+            memtable_flush_threshold: 50_000,
         }
     }
 }

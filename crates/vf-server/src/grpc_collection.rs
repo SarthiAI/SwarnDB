@@ -1,13 +1,13 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! gRPC CollectionService handler implementation.
 
 use tonic::{Request, Response, Status};
 
 use crate::convert::{distance_metric_to_string, parse_distance_metric};
+use crate::validation::{validate_collection_name, ValidationConfig};
 use crate::proto::swarndb::v1::collection_service_server::CollectionService;
 use crate::proto::swarndb::v1::{
     CreateCollectionRequest, CreateCollectionResponse, DeleteCollectionRequest,
@@ -18,8 +18,16 @@ use crate::state::{AppState, CollectionState, MetadataCache};
 use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{CollectionConfig, DataTypeConfig};
 use vf_graph::VirtualGraph;
-use vf_index::hnsw::HnswIndex;
+use vf_index::hnsw::{HnswIndex, HnswParams};
 use vf_query::IndexManager;
+
+/// Sanitize a string for safe inclusion in log messages by removing control chars.
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect()
+}
 
 pub struct CollectionServiceImpl {
     state: AppState,
@@ -39,8 +47,9 @@ impl CollectionService for CollectionServiceImpl {
     ) -> Result<Response<CreateCollectionResponse>, Status> {
         let req = request.into_inner();
 
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("collection name must not be empty"));
+        let validation_config = ValidationConfig::default();
+        if let Err(e) = validate_collection_name(&req.name, &validation_config) {
+            return Err(Status::invalid_argument(e.to_string()));
         }
         if req.dimension == 0 {
             return Err(Status::invalid_argument("dimension must be greater than 0"));
@@ -56,6 +65,11 @@ impl CollectionService for CollectionServiceImpl {
         })?;
 
         let dimension = req.dimension as usize;
+        if req.default_threshold < 0.0 || req.default_threshold > 1.0 {
+            return Err(Status::invalid_argument(
+                "default_threshold must be between 0.0 and 1.0",
+            ));
+        }
         let threshold = if req.default_threshold > 0.0 {
             Some(req.default_threshold)
         } else {
@@ -69,29 +83,30 @@ impl CollectionService for CollectionServiceImpl {
             default_similarity_threshold: threshold,
             max_vectors: req.max_vectors as usize,
             data_type: DataTypeConfig::F32,
+            ..CollectionConfig::default()
         };
 
-        // Check for duplicate in-memory BEFORE persisting to storage
-        {
-            let collections = self.state.collections.read();
-            if collections.contains_key(&req.name) {
-                return Err(Status::already_exists(format!(
-                    "collection '{}' already exists",
-                    req.name
-                )));
-            }
+        // Atomic check-and-create under a single write lock to prevent TOCTOU race
+        let mut collections = self.state.collections.write();
+        if collections.contains_key(&req.name) {
+            return Err(Status::already_exists(format!(
+                "collection '{}' already exists",
+                sanitize_for_log(&req.name)
+            )));
         }
 
         // Persist to storage layer
         {
             let mut cm = self.state.collection_manager.write();
-            if let Err(e) = cm.create_collection(config.clone()) {
-                return Err(Status::internal(format!("storage create failed: {}", e)));
+            if let Err(_e) = cm.create_collection(config.clone()) {
+                return Err(Status::internal("storage create failed"));
             }
         }
 
         let store = InMemoryVectorStore::new(dimension);
-        let index = HnswIndex::with_defaults(dimension, distance_metric);
+        let mut hnsw_params = HnswParams::default();
+        hnsw_params.max_ef = self.state.max_ef;
+        let index = HnswIndex::new(dimension, distance_metric, hnsw_params);
         let index_manager = IndexManager::with_defaults();
         let graph = match threshold {
             Some(t) => VirtualGraph::with_threshold(t, distance_metric),
@@ -113,7 +128,7 @@ impl CollectionService for CollectionServiceImpl {
             deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
-        let mut collections = self.state.collections.write();
+        tracing::info!(collection = %sanitize_for_log(&req.name), "collection created");
         collections.insert(req.name.clone(), collection_state);
 
         Ok(Response::new(CreateCollectionResponse {
@@ -140,10 +155,11 @@ impl CollectionService for CollectionServiceImpl {
         if collections.remove(&req.name).is_none() {
             return Err(Status::not_found(format!(
                 "collection '{}' not found",
-                req.name
+                sanitize_for_log(&req.name)
             )));
         }
 
+        tracing::warn!(collection = %sanitize_for_log(&req.name), "collection deleted");
         Ok(Response::new(DeleteCollectionResponse { success: true }))
     }
 
@@ -158,7 +174,9 @@ impl CollectionService for CollectionServiceImpl {
             Status::not_found(format!("collection '{}' not found", req.name))
         })?;
 
-        let status_str = coll.status.read().unwrap().as_str().to_string();
+        let status_str = coll.status.read()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
         Ok(Response::new(GetCollectionResponse {
             name: coll.config.name.clone(),
             dimension: coll.config.dimension as u32,
@@ -178,7 +196,9 @@ impl CollectionService for CollectionServiceImpl {
         let list: Vec<GetCollectionResponse> = collections
             .values()
             .map(|coll| {
-                let status_str = coll.status.read().unwrap().as_str().to_string();
+                let status_str = coll.status.read()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
                 GetCollectionResponse {
                     name: coll.config.name.clone(),
                     dimension: coll.config.dimension as u32,

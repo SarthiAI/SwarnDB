@@ -1,33 +1,50 @@
-version: "3.8"
+# SwarnDB - Lightweight Docker Compose for local development
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+#
+# For benchmark/production workloads, use docker-compose.benchmark.yml:
+#   docker compose -f docker-compose.benchmark.yml up -d
 
 services:
   swarndb:
     build: .
     container_name: swarndb
     ports:
-      - "50051:50051"
-      - "8080:8080"
+      - "127.0.0.1:${SWARNDB_REST_PORT:-8080}:8080"    # REST API (localhost only)
+      - "127.0.0.1:${SWARNDB_GRPC_PORT:-50051}:50051"  # gRPC API (localhost only)
     environment:
       SWARNDB_HOST: "0.0.0.0"
       SWARNDB_GRPC_PORT: "50051"
       SWARNDB_REST_PORT: "8080"
       SWARNDB_DATA_DIR: "/data"
-      SWARNDB_LOG_LEVEL: "info"
-      SWARNDB_API_KEYS: ""
+      SWARNDB_WAL_MAX_SIZE: "${SWARNDB_WAL_MAX_SIZE:-268435456}"
+      SWARNDB_LOG_LEVEL: "${SWARNDB_LOG_LEVEL:-info}"
+      SWARNDB_API_KEYS: "${SWARNDB_API_KEYS:-}"
+      SWARNDB_MAX_CONNECTIONS: "${SWARNDB_MAX_CONNECTIONS:-1000}"
+      SWARNDB_REQUEST_TIMEOUT_MS: "${SWARNDB_REQUEST_TIMEOUT_MS:-30000}"
+      SWARNDB_SEARCH_TIMEOUT_MS: "${SWARNDB_SEARCH_TIMEOUT_MS:-5000}"
+      SWARNDB_BULK_TIMEOUT_MS: "${SWARNDB_BULK_TIMEOUT_MS:-300000}"
+      SWARNDB_MAX_EF_SEARCH: "${SWARNDB_MAX_EF_SEARCH:-10000}"
+      SWARNDB_MAX_BATCH_LOCK_SIZE: "${SWARNDB_MAX_BATCH_LOCK_SIZE:-10000}"
+      SWARNDB_MAX_WAL_FLUSH_INTERVAL: "${SWARNDB_MAX_WAL_FLUSH_INTERVAL:-100000}"
+      SWARNDB_MAX_EF_CONSTRUCTION: "${SWARNDB_MAX_EF_CONSTRUCTION:-2000}"
+      SWARNDB_TIERED_HOT_CAPACITY: "${SWARNDB_TIERED_HOT_CAPACITY:-100000}"
     volumes:
       - swarndb_data:/data
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 10s
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 512M
-          cpus: "1.0"
+          memory: 2G
+          cpus: "2.0"
 
 volumes:
   swarndb_data:

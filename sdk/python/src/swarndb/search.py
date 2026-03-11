@@ -353,11 +353,13 @@ class SearchAPI:
             SearchError: If the search operation fails.
             ValueError: If an invalid strategy is provided.
         """
+        from swarndb.vectors import _validate_vector
         if strategy not in _VALID_STRATEGIES:
             raise ValueError(
                 f"Invalid search strategy {strategy!r}. "
                 f"Must be one of: {', '.join(sorted(_VALID_STRATEGIES))}"
             )
+        _validate_vector(vector, "query vector")
 
         request = search_pb2.SearchRequest(
             collection=collection,
@@ -422,11 +424,14 @@ class SearchAPI:
             SearchError: If the batch search operation fails.
             ValueError: If an invalid strategy is provided.
         """
+        from swarndb.vectors import _validate_vector
         if strategy not in _VALID_STRATEGIES:
             raise ValueError(
                 f"Invalid search strategy {strategy!r}. "
                 f"Must be one of: {', '.join(sorted(_VALID_STRATEGIES))}"
             )
+        for i, qv in enumerate(queries):
+            _validate_vector(qv, f"query vector [{i}]")
 
         proto_filter = filter._to_proto() if filter is not None else None
 

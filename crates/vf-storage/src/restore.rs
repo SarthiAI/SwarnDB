@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Collection restore from tar.gz backup archives.
 //!
@@ -22,6 +21,9 @@ use crate::backup::{BackupManifest, ManifestEntry};
 use crate::error::{StorageError, StorageResult};
 use crate::util::hex_encode;
 
+/// Default allowed file extensions for restore operations.
+const DEFAULT_ALLOWED_EXTENSIONS: &[&str] = &["bin", "wal", "json", "seg", "vfs", "log", "old", "dat"];
+
 // ── Options & Result ────────────────────────────────────────────────────────
 
 /// Options controlling how a backup archive is restored.
@@ -34,6 +36,11 @@ pub struct RestoreOptions {
     /// Optional override for the target directory. When `None`, files are
     /// extracted into `target_dir` as passed to [`restore_backup`].
     pub target_dir_override: Option<PathBuf>,
+
+    /// Additional file extensions to allow during restore, beyond the defaults
+    /// ("bin", "wal", "json", "seg", "vfs", "log", "old", "dat").
+    /// Useful for plugins or custom storage backends that use non-standard extensions.
+    pub extra_allowed_extensions: Vec<String>,
 }
 
 impl Default for RestoreOptions {
@@ -41,6 +48,7 @@ impl Default for RestoreOptions {
         Self {
             verify_checksums: true,
             target_dir_override: None,
+            extra_allowed_extensions: Vec::new(),
         }
     }
 }
@@ -122,6 +130,22 @@ pub fn restore_backup(
                     "path traversal detected: archive entry '{}' contains unsafe path components",
                     entry_path_str,
                 )));
+            }
+
+            // Task 274: Validate file extension against allowlist.
+            let rel_path_obj = Path::new(rel_path);
+            let extension = rel_path_obj
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let ext_allowed = DEFAULT_ALLOWED_EXTENSIONS.contains(&extension)
+                || options.extra_allowed_extensions.iter().any(|e| e.as_str() == extension);
+            if !ext_allowed {
+                log::warn!(
+                    "Restore: skipping file '{}' with disallowed extension '{}'",
+                    rel_path, extension
+                );
+                continue;
             }
 
             // Extract the file to the target directory using the relative path.
@@ -220,7 +244,13 @@ fn verify_extracted_files(
                 )));
             }
         }
-        // Files not listed in the manifest are silently accepted.
+        // Task 273: Reject files not listed in the manifest.
+        if !expected.contains_key(rel_key.as_ref()) {
+            return Err(StorageError::Serialization(format!(
+                "restored file '{}' is not listed in the backup manifest",
+                rel_key
+            )));
+        }
     }
 
     Ok(())

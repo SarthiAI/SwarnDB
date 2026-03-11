@@ -16,4 +16,4 @@ pub use drift::{DriftDetector, DriftReport};
 pub use ghost::{GhostDetector, GhostResult};
 pub use interpolation::Interpolator;
 pub use kmeans::{ClusterAssignment, KMeans, KMeansConfig, KMeansResult};
-pub use pca::{Pca, PcaConfig, PcaResult};
+pub use pca::{Pca, PcaConfig, PcaResult, DEFAULT_MAX_PCA_DIM};

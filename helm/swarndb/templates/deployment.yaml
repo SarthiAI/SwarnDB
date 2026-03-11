@@ -24,14 +24,30 @@ spec:
       labels:
         {{- include "swarndb.selectorLabels" . | nindent 8 }}
     spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ include "swarndb.serviceAccountName" . }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: grpc
               containerPort: {{ .Values.service.grpcPort }}
@@ -42,6 +58,8 @@ spec:
           env:
             - name: SWARNDB_HOST
               value: "0.0.0.0"
+            - name: SWARNDB_DATA_DIR
+              value: /data
             - name: SWARNDB_GRPC_PORT
               valueFrom:
                 configMapKeyRef:
@@ -52,8 +70,6 @@ spec:
                 configMapKeyRef:
                   name: {{ include "swarndb.fullname" . }}
                   key: rest-port
-            - name: SWARNDB_DATA_DIR
-              value: /data
             - name: SWARNDB_LOG_LEVEL
               valueFrom:
                 configMapKeyRef:
@@ -64,6 +80,172 @@ spec:
                 configMapKeyRef:
                   name: {{ include "swarndb.fullname" . }}
                   key: max-connections
+            - name: SWARNDB_WAL_MAX_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: wal-max-size
+            - name: SWARNDB_MAX_MESSAGE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-message-size
+            - name: SWARNDB_MAX_REQUEST_BODY_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-request-body-bytes
+            - name: SWARNDB_CORS_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: cors-origins
+            - name: SWARNDB_TIERED_HOT_CAPACITY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: tiered-hot-capacity
+            - name: SWARNDB_MEMTABLE_FLUSH_THRESHOLD
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: memtable-flush-threshold
+            - name: SWARNDB_MAX_CONCURRENT_SEARCHES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-concurrent-searches
+            - name: SWARNDB_MIN_CONCURRENCY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: min-concurrency
+            - name: SWARNDB_MAX_CONCURRENCY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-concurrency
+            - name: SWARNDB_TARGET_P99_LATENCY_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: target-p99-latency-ms
+            - name: SWARNDB_CONCURRENCY_EMA_ALPHA
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: concurrency-ema-alpha
+            - name: SWARNDB_CONCURRENCY_HIGH_THRESHOLD
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: concurrency-high-threshold
+            - name: SWARNDB_CONCURRENCY_LOW_THRESHOLD
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: concurrency-low-threshold
+            - name: SWARNDB_CONCURRENCY_DECREASE_RATE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: concurrency-decrease-rate
+            - name: SWARNDB_CONCURRENCY_INCREASE_RATE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: concurrency-increase-rate
+            - name: SWARNDB_SEARCH_QUEUE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: search-queue-size
+            - name: SWARNDB_REQUEST_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: request-timeout-ms
+            - name: SWARNDB_SEARCH_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: search-timeout-ms
+            - name: SWARNDB_BULK_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: bulk-timeout-ms
+            - name: SWARNDB_COMPUTE_TIMEOUT_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: compute-timeout-secs
+            - name: SWARNDB_MAX_K
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-k
+            - name: SWARNDB_MAX_EF_SEARCH
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-ef-search
+            - name: SWARNDB_MAX_EF
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-ef
+            - name: SWARNDB_MAX_EF_CONSTRUCTION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-ef-construction
+            - name: SWARNDB_MAX_BATCH_LOCK_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-batch-lock-size
+            - name: SWARNDB_MAX_WAL_FLUSH_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-wal-flush-interval
+            - name: SWARNDB_MAX_BULK_INSERT_MESSAGES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-bulk-insert-messages
+            - name: SWARNDB_MAX_BULK_INSERT_PAYLOAD_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-bulk-insert-payload-bytes
+            - name: SWARNDB_MAX_METADATA_SIZE_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-metadata-size-bytes
+            - name: SWARNDB_MAX_VECTOR_DIMENSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-vector-dimension
+            - name: SWARNDB_MAX_VECTORS_PER_REQUEST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-vectors-per-request
+            - name: SWARNDB_MAX_COLLECTION_NAME_LENGTH
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "swarndb.fullname" . }}
+                  key: max-collection-name-length
+            {{- if .Values.tls.enabled }}
+            - name: SWARNDB_TLS_CERT_PATH
+              value: "/etc/swarndb/tls/tls.crt"
+            - name: SWARNDB_TLS_KEY_PATH
+              value: "/etc/swarndb/tls/tls.key"
+            {{- end }}
             {{- if .Values.auth.enabled }}
             - name: SWARNDB_API_KEYS
               valueFrom:
@@ -102,11 +284,21 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls-certs
+              mountPath: /etc/swarndb/tls
+              readOnly: true
+            {{- end }}
       volumes:
         {{- if .Values.persistence.enabled }}
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "swarndb.fullname" . }}
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.secretName }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

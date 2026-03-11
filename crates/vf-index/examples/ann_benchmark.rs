@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! ANN-benchmarks compatible benchmark suite for SwarnDB HNSW index.
 //!
@@ -305,7 +304,9 @@ pub fn run_benchmark(
         hnsw_config.m,
         hnsw_config.ef_construction,
         hnsw_config.ef_search,
-    );
+        100_000,
+        24,
+    ).expect("valid HNSW params");
     let index = HnswIndex::new(config.dimension, config.metric.clone(), params);
 
     let build_start = Instant::now();

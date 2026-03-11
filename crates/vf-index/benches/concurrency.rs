@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Concurrency benchmark suite: QPS, build throughput, distance functions, DashMap store.
 
@@ -31,7 +30,7 @@ fn random_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 }
 
 fn build_hnsw_index(vectors: &[Vec<f32>], dim: usize) -> HnswIndex {
-    let params = HnswParams::new(16, 100, 50);
+    let params = HnswParams::new(16, 100, 50, 100_000, 24).expect("valid HNSW params");
     let index = HnswIndex::new(dim, DistanceMetricType::Cosine, params);
     for (i, v) in vectors.iter().enumerate() {
         index.add(i as u64, v).unwrap();

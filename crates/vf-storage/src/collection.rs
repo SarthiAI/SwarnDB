@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Collection and CollectionManager for organizing vectors into named groups.
 //!
@@ -9,23 +8,73 @@
 //! immutable on-disk segments. The [`CollectionManager`] manages the lifecycle
 //! of multiple collections under a shared base directory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::{StorageError, StorageResult};
 use crate::format::{DataTypeFlag, WalOp};
+use crate::recovery::RecoveryManager;
 use crate::segment::{Segment, SegmentWriter};
 use crate::wal::WalWriter;
+use crate::FilePermissionConfig;
 use vf_core::store::{InMemoryVectorStore, VectorRecord};
 use vf_core::types::{CollectionConfig, DataTypeConfig, Metadata, VectorId};
 use vf_core::vector::VectorData;
 
-/// Default WAL maximum size before rotation (64 MB).
-const DEFAULT_WAL_MAX_SIZE: u64 = 64 * 1024 * 1024;
+/// Default WAL maximum size before rotation (256 MB).
+const DEFAULT_WAL_MAX_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Default number of vectors in the memtable before flushing to a segment.
-const DEFAULT_MEMTABLE_FLUSH_THRESHOLD: usize = 10_000;
+/// Read WAL max size from `SWARNDB_WAL_MAX_SIZE` env var (in bytes), falling
+/// back to [`DEFAULT_WAL_MAX_SIZE`] when the variable is absent or invalid.
+fn wal_max_size() -> u64 {
+    match std::env::var("SWARNDB_WAL_MAX_SIZE") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(0) => DEFAULT_WAL_MAX_SIZE,
+            Ok(n) => n,
+            Err(_) => DEFAULT_WAL_MAX_SIZE,
+        },
+        Err(_) => DEFAULT_WAL_MAX_SIZE,
+    }
+}
+
+
+/// Validate that a collection name is safe for use in file paths.
+///
+/// Rejects names containing "..", "/", "\", null bytes, or any character
+/// that is not alphanumeric, dash, or underscore. Also rejects empty names.
+fn sanitize_collection_name(name: &str) -> StorageResult<()> {
+    if name.is_empty() {
+        return Err(StorageError::InvalidCollectionName(
+            "collection name must not be empty".into(),
+        ));
+    }
+    if name.contains("..") || name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(StorageError::InvalidCollectionName(format!(
+            "collection name contains forbidden characters: {name:?}"
+        )));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(StorageError::InvalidCollectionName(format!(
+            "collection name contains non-alphanumeric/dash/underscore characters: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify that `target` is strictly within `base_dir` after canonicalization.
+fn verify_path_within(target: &Path, base_dir: &Path) -> StorageResult<()> {
+    let canonical_base = fs::canonicalize(base_dir).map_err(StorageError::Io)?;
+    let canonical_target = fs::canonicalize(target).map_err(StorageError::Io)?;
+    if !canonical_target.starts_with(&canonical_base) {
+        return Err(StorageError::PathTraversal(format!(
+            "resolved path {:?} is outside data directory {:?}",
+            canonical_target, canonical_base
+        )));
+    }
+    Ok(())
+}
 
 // ── Collection ──────────────────────────────────────────────────────────────
 
@@ -38,6 +87,13 @@ pub struct Collection {
     segments: Vec<Segment>,
     next_segment_id: u64,
     collection_dir: PathBuf,
+    #[allow(dead_code)]
+    perm_config: FilePermissionConfig,
+    /// Tombstone set: vector IDs that have been deleted but may still exist in
+    /// on-disk segments. Populated from WAL replay on open and from `delete()`
+    /// calls at runtime. Consulted in `get()` and `load_all_vectors()` to
+    /// filter out stale segment data.
+    deleted_ids: HashSet<VectorId>,
 }
 
 impl Collection {
@@ -45,11 +101,30 @@ impl Collection {
     ///
     /// Creates `base_dir/<name>/` and initialises a fresh WAL and empty memtable.
     pub fn create(base_dir: &Path, config: CollectionConfig) -> StorageResult<Self> {
+        Self::create_with_perms(base_dir, config, FilePermissionConfig::default())
+    }
+
+    /// Create a new collection with custom file/directory permission settings.
+    pub fn create_with_perms(
+        base_dir: &Path,
+        mut config: CollectionConfig,
+        perm_config: FilePermissionConfig,
+    ) -> StorageResult<Self> {
+        // Allow env var override for memtable flush threshold
+        if let Ok(val) = std::env::var("SWARNDB_MEMTABLE_FLUSH_THRESHOLD") {
+            if let Ok(threshold) = val.parse::<usize>() {
+                config.memtable_flush_threshold = threshold;
+            }
+        }
+        sanitize_collection_name(&config.name)?;
         let collection_dir = base_dir.join(&config.name);
         fs::create_dir_all(&collection_dir).map_err(StorageError::Io)?;
 
+        // Set directory permissions using configurable mode.
+        perm_config.apply_dir_permissions(&collection_dir)?;
+
         let wal_path = collection_dir.join("wal.log");
-        let wal = WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE)?;
+        let wal = WalWriter::create(&wal_path, wal_max_size())?;
 
         let memtable = InMemoryVectorStore::new(config.dimension);
 
@@ -61,6 +136,8 @@ impl Collection {
             segments: Vec::new(),
             next_segment_id: 0,
             collection_dir,
+            perm_config,
+            deleted_ids: HashSet::new(),
         })
     }
 
@@ -69,11 +146,27 @@ impl Collection {
     /// Re-opens the WAL for append, creates a fresh memtable, and scans for
     /// existing segment files (sorted by id ascending).
     pub fn open(collection_dir: &Path, config: CollectionConfig) -> StorageResult<Self> {
+        Self::open_with_perms(collection_dir, config, FilePermissionConfig::default())
+    }
+
+    /// Open an existing collection with custom file/directory permission settings.
+    pub fn open_with_perms(
+        collection_dir: &Path,
+        mut config: CollectionConfig,
+        perm_config: FilePermissionConfig,
+    ) -> StorageResult<Self> {
+        // Allow env var override for memtable flush threshold
+        if let Ok(val) = std::env::var("SWARNDB_MEMTABLE_FLUSH_THRESHOLD") {
+            if let Ok(threshold) = val.parse::<usize>() {
+                config.memtable_flush_threshold = threshold;
+            }
+        }
         let wal_path = collection_dir.join("wal.log");
+        let wal_size = wal_max_size();
         let wal = if wal_path.exists() {
-            WalWriter::open(&wal_path, DEFAULT_WAL_MAX_SIZE)?
+            WalWriter::open(&wal_path, wal_size)?
         } else {
-            WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE)?
+            WalWriter::create(&wal_path, wal_size)?
         };
 
         let memtable = InMemoryVectorStore::new(config.dimension);
@@ -102,6 +195,17 @@ impl Collection {
 
         let next_segment_id = segments.last().map_or(0, |s| s.id() + 1);
 
+        // Replay WAL to rebuild memtable state and collect delete tombstones.
+        let wal_path = collection_dir.join("wal.log");
+        let deleted_ids = if wal_path.exists() {
+            RecoveryManager::replay_wal_collecting_deletes(
+                &wal_path,
+                &memtable,
+            )?
+        } else {
+            HashSet::new()
+        };
+
         Ok(Collection {
             name: config.name.clone(),
             config,
@@ -110,6 +214,8 @@ impl Collection {
             segments,
             next_segment_id,
             collection_dir: collection_dir.to_path_buf(),
+            perm_config,
+            deleted_ids,
         })
     }
 
@@ -129,10 +235,21 @@ impl Collection {
         self.wal.append(WalOp::Insert, 0, &payload)?;
 
         let record = VectorRecord::new(id, data, metadata);
-        // Ignore AlreadyExists from memtable — WAL is the source of truth.
-        let _ = self.memtable.insert(record);
+        // AlreadyExists is expected (overwrite scenario) — WAL is the source of truth.
+        // DimensionMismatch after WAL write indicates an inconsistent state; log it.
+        if let Err(e) = self.memtable.insert(record) {
+            match &e {
+                vf_core::store::StoreError::AlreadyExists(_) => { /* expected for overwrites */ }
+                other => {
+                    log::warn!("memtable insert failed after WAL write for id {id}: {other}");
+                }
+            }
+        }
 
-        if self.memtable.len() >= DEFAULT_MEMTABLE_FLUSH_THRESHOLD {
+        // Clear any prior tombstone — vector is alive again.
+        self.deleted_ids.remove(&id);
+
+        if self.memtable.len() >= self.config.memtable_flush_threshold {
             self.flush_memtable()?;
         }
 
@@ -156,9 +273,20 @@ impl Collection {
         if self.memtable.update(id, data.clone(), metadata.clone()).is_err() {
             if let Some(d) = data {
                 let record = VectorRecord::new(id, d, metadata);
-                let _ = self.memtable.insert(record);
+                // AlreadyExists is expected; other errors indicate inconsistency.
+                if let Err(e) = self.memtable.insert(record) {
+                    match &e {
+                        vf_core::store::StoreError::AlreadyExists(_) => {}
+                        other => {
+                            log::warn!("memtable insert (update fallback) failed after WAL write for id {id}: {other}");
+                        }
+                    }
+                }
             }
         }
+
+        // Clear any prior tombstone — vector is alive again.
+        self.deleted_ids.remove(&id);
 
         Ok(())
     }
@@ -175,6 +303,9 @@ impl Collection {
         // Ignore not-found — the vector may only be in segments.
         let _ = self.memtable.delete(id);
 
+        // Record tombstone so segment reads are filtered.
+        self.deleted_ids.insert(id);
+
         Ok(())
     }
 
@@ -185,6 +316,12 @@ impl Collection {
     ///
     /// Returns `None` if the vector is not found anywhere.
     pub fn get(&self, id: VectorId) -> StorageResult<Option<(Vec<f32>, Option<Metadata>)>> {
+        // Tombstone check: if the id has been deleted, it should not be visible
+        // even if it still exists in segments.
+        if self.deleted_ids.contains(&id) {
+            return Ok(None);
+        }
+
         // Check memtable first.
         if let Ok(record) = self.memtable.get(id) {
             return Ok(Some((record.data.to_f32_vec(), record.metadata.clone())));
@@ -263,6 +400,11 @@ impl Collection {
         self.memtable.len()
     }
 
+    /// Returns a reference to the set of deleted vector IDs (tombstones).
+    pub fn deleted_ids(&self) -> &HashSet<VectorId> {
+        &self.deleted_ids
+    }
+
     /// Load all vectors from segments and memtable for index rebuilding.
     ///
     /// Returns `(VectorId, Vec<f32>, Option<Metadata>)` tuples. Segments are
@@ -288,8 +430,10 @@ impl Collection {
             map.insert(id, (record.data.to_f32_vec(), record.metadata));
         }
 
+        // Filter out tombstoned vectors before returning.
         let result: Vec<(VectorId, Vec<f32>, Option<Metadata>)> = map
             .into_iter()
+            .filter(|(id, _)| !self.deleted_ids.contains(id))
             .map(|(id, (data, meta))| (id, data, meta))
             .collect();
 
@@ -304,6 +448,7 @@ impl Collection {
 pub struct CollectionManager {
     collections: HashMap<String, Collection>,
     base_path: PathBuf,
+    perm_config: FilePermissionConfig,
 }
 
 impl CollectionManager {
@@ -312,7 +457,15 @@ impl CollectionManager {
     /// Each immediate subdirectory that contains a `config.json` is treated as
     /// a collection and opened automatically.
     pub fn new(base_path: &Path) -> StorageResult<Self> {
+        Self::new_with_perms(base_path, FilePermissionConfig::default())
+    }
+
+    /// Create a new manager with custom file/directory permission settings.
+    pub fn new_with_perms(base_path: &Path, perm_config: FilePermissionConfig) -> StorageResult<Self> {
         fs::create_dir_all(base_path).map_err(StorageError::Io)?;
+
+        // Set directory permissions using configurable mode.
+        perm_config.apply_dir_permissions(base_path)?;
 
         let mut collections = HashMap::new();
 
@@ -333,7 +486,7 @@ impl CollectionManager {
                 let config: CollectionConfig = serde_json::from_slice(&config_bytes)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-                let collection = Collection::open(&path, config)?;
+                let collection = Collection::open_with_perms(&path, config, perm_config.clone())?;
                 let name = collection.name().to_string();
                 collections.insert(name, collection);
             }
@@ -342,6 +495,7 @@ impl CollectionManager {
         Ok(CollectionManager {
             collections,
             base_path: base_path.to_path_buf(),
+            perm_config,
         })
     }
 
@@ -350,6 +504,7 @@ impl CollectionManager {
     /// Writes `config.json` into the collection directory and initialises
     /// the WAL and memtable.
     pub fn create_collection(&mut self, config: CollectionConfig) -> StorageResult<()> {
+        sanitize_collection_name(&config.name)?;
         if self.collections.contains_key(&config.name) {
             return Err(StorageError::CollectionAlreadyExists(config.name.clone()));
         }
@@ -357,12 +512,24 @@ impl CollectionManager {
         let collection_dir = self.base_path.join(&config.name);
         fs::create_dir_all(&collection_dir).map_err(StorageError::Io)?;
 
-        // Persist config as JSON.
+        // Set directory permissions using configurable mode.
+        self.perm_config.apply_dir_permissions(&collection_dir)?;
+
+        // Persist config as JSON (atomic write: tmp file then rename).
         let config_json = serde_json::to_string_pretty(&config)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        fs::write(collection_dir.join("config.json"), config_json).map_err(StorageError::Io)?;
+        let config_path = collection_dir.join("config.json");
+        let tmp_path = collection_dir.join("config.json.tmp");
+        {
+            let mut f = fs::File::create(&tmp_path).map_err(StorageError::Io)?;
+            f.write_all(config_json.as_bytes()).map_err(StorageError::Io)?;
+            f.sync_all().map_err(StorageError::Io)?;
+        }
+        fs::rename(&tmp_path, &config_path).map_err(StorageError::Io)?;
+        // Set file permissions using configurable mode.
+        self.perm_config.apply_file_permissions(&config_path)?;
 
-        let collection = Collection::create(&self.base_path, config)?;
+        let collection = Collection::create_with_perms(&self.base_path, config, self.perm_config.clone())?;
         let name = collection.name().to_string();
         self.collections.insert(name, collection);
 
@@ -374,12 +541,17 @@ impl CollectionManager {
     /// Removes the collection from memory and deletes the entire collection
     /// directory from disk.
     pub fn drop_collection(&mut self, name: &str) -> StorageResult<()> {
+        sanitize_collection_name(name)?;
         self.collections.remove(name).ok_or_else(|| {
             StorageError::CollectionNotFound(name.to_string())
         })?;
 
         let collection_dir = self.base_path.join(name);
         if collection_dir.exists() {
+            // Verify resolved path is within our data directory to prevent
+            // symlink-based deletion outside the expected directory.
+            verify_path_within(&collection_dir, &self.base_path)?;
+
             fs::remove_dir_all(&collection_dir).map_err(|e| {
                 StorageError::CollectionDropFailed(format!(
                     "failed to remove {}: {e}",

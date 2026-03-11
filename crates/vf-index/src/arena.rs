@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Arena allocator for HNSW graph nodes.
 //!
@@ -9,6 +8,7 @@
 //! fragmentation. Nodes are allocated in fixed-size chunks; existing chunks are
 //! never reallocated so references obtained via index remain stable.
 
+use std::collections::HashSet;
 use vf_core::types::VectorId;
 
 /// Compact handle into the arena. Upper bits encode the chunk index, lower bits
@@ -155,9 +155,20 @@ impl NodeArena {
     // ── Private helpers ─────────────────────────────────────────────────
 
     /// Encode a `(chunk_index, offset)` pair into a single `ArenaNodeId`.
+    ///
+    /// Uses checked casts to prevent silent truncation on 64-bit systems.
+    ///
+    /// # Panics
+    /// Panics if `chunk_idx` or `offset` exceed `u32::MAX`.
     #[inline]
     fn encode_id(chunk_idx: usize, offset: usize, shift: u32) -> ArenaNodeId {
-        ((chunk_idx as u32) << shift) | (offset as u32)
+        let chunk_u32: u32 = chunk_idx
+            .try_into()
+            .expect("NodeArena: chunk_idx exceeds u32::MAX");
+        let offset_u32: u32 = offset
+            .try_into()
+            .expect("NodeArena: offset exceeds u32::MAX");
+        (chunk_u32 << shift) | offset_u32
     }
 
     /// Decode an `ArenaNodeId` back into `(chunk_index, offset)`.
@@ -191,6 +202,8 @@ pub struct VectorArena {
     slot_count: usize,
     /// Free-list of reusable slot indices from prior deletions.
     free_slots: Vec<usize>,
+    /// Set of currently freed slot indices for double-free and use-after-free protection.
+    freed_set: HashSet<usize>,
 }
 
 impl VectorArena {
@@ -202,17 +215,28 @@ impl VectorArena {
             dimension,
             slot_count: 0,
             free_slots: Vec::new(),
+            freed_set: HashSet::new(),
         }
     }
 
     /// Creates a new vector arena pre-allocated for `capacity` vectors.
+    ///
+    /// # Panics
+    /// Panics if `dimension * capacity` overflows `usize`.
     pub fn with_capacity(dimension: usize, capacity: usize) -> Self {
         assert!(dimension > 0, "VectorArena dimension must be > 0");
+        let total_capacity = dimension.checked_mul(capacity).unwrap_or_else(|| {
+            panic!(
+                "VectorArena::with_capacity: overflow computing dimension ({}) * capacity ({})",
+                dimension, capacity
+            )
+        });
         Self {
-            data: Vec::with_capacity(dimension * capacity),
+            data: Vec::with_capacity(total_capacity),
             dimension,
             slot_count: 0,
             free_slots: Vec::new(),
+            freed_set: HashSet::new(),
         }
     }
 
@@ -233,6 +257,7 @@ impl VectorArena {
 
         if let Some(slot) = self.free_slots.pop() {
             // Reuse a freed slot — overwrite in place.
+            self.freed_set.remove(&slot);
             let start = slot * self.dimension;
             self.data[start..start + self.dimension].copy_from_slice(vector);
             slot
@@ -261,7 +286,13 @@ impl VectorArena {
     /// next `push` that reuses this slot. Callers must not access the slot
     /// after freeing it.
     pub fn free(&mut self, slot: usize) {
-        debug_assert!(slot < self.slot_count, "VectorArena::free: slot out of bounds");
+        assert!(slot < self.slot_count, "VectorArena::free: slot {} out of bounds (slot_count={})", slot, self.slot_count);
+        assert!(
+            !self.freed_set.contains(&slot),
+            "VectorArena::free: double-free detected on slot {}",
+            slot
+        );
+        self.freed_set.insert(slot);
         self.free_slots.push(slot);
     }
 
@@ -281,6 +312,7 @@ impl VectorArena {
     pub fn clear(&mut self) {
         self.data.clear();
         self.free_slots.clear();
+        self.freed_set.clear();
         self.slot_count = 0;
     }
 }

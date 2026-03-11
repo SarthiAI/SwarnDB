@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Crash recovery utilities for the SwarnDB storage engine.
 //!
@@ -9,8 +8,10 @@
 //! integrity, and orchestrates full collection recovery after an unclean
 //! shutdown.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use bincode::Options;
 use log::{info, warn};
 
 use crate::error::{StorageError, StorageResult};
@@ -20,6 +21,9 @@ use crate::wal::WalReader;
 use vf_core::store::{InMemoryVectorStore, VectorRecord};
 use vf_core::types::{Metadata, VectorId};
 use vf_core::vector::VectorData;
+
+/// Maximum size for bincode deserialization (256 MB).
+const MAX_DESER_SIZE: u64 = 256 * 1024 * 1024;
 
 // ── Supporting structs ──────────────────────────────────────────────────────
 
@@ -136,6 +140,82 @@ impl RecoveryManager {
         Ok(stats)
     }
 
+    /// Replay a WAL file into the given memtable AND return the set of
+    /// deleted vector IDs (tombstones).
+    ///
+    /// This is used by `Collection::open` to rebuild both the memtable state
+    /// and the tombstone set from the WAL in a single pass. Insert/update
+    /// entries remove IDs from the tombstone set; delete entries add them.
+    pub fn replay_wal_collecting_deletes(
+        wal_path: &Path,
+        memtable: &InMemoryVectorStore,
+    ) -> StorageResult<HashSet<VectorId>> {
+        let mut deleted_ids = HashSet::new();
+
+        if !wal_path.exists() {
+            return Ok(deleted_ids);
+        }
+
+        let reader = WalReader::open(wal_path)?;
+        info!("Replaying WAL (with tombstone collection) from {:?}", wal_path);
+
+        for result in reader {
+            match result {
+                Ok(entry) => {
+                    match entry.op {
+                        WalOp::Insert => {
+                            if let Ok(()) = Self::apply_insert(&entry.payload, memtable) {
+                                // Extract the vector id to clear any prior tombstone.
+                                if let Ok((id, _, _)) = bincode::DefaultOptions::new()
+                                    .with_limit(MAX_DESER_SIZE)
+                                    .deserialize::<(VectorId, VectorData, Option<Metadata>)>(&entry.payload)
+                                {
+                                    deleted_ids.remove(&id);
+                                }
+                            }
+                        }
+                        WalOp::Update => {
+                            if let Ok(()) = Self::apply_update(&entry.payload, memtable) {
+                                // Extract the vector id to clear any prior tombstone.
+                                if let Ok((id, _, _)) = bincode::DefaultOptions::new()
+                                    .with_limit(MAX_DESER_SIZE)
+                                    .deserialize::<(VectorId, Option<VectorData>, Option<Metadata>)>(&entry.payload)
+                                {
+                                    deleted_ids.remove(&id);
+                                }
+                            }
+                        }
+                        WalOp::Delete => {
+                            // Extract the vector id and add to tombstones.
+                            if let Ok(id) = bincode::DefaultOptions::new()
+                                .with_limit(MAX_DESER_SIZE)
+                                .deserialize::<VectorId>(&entry.payload)
+                            {
+                                let _ = Self::apply_delete(&entry.payload, memtable);
+                                deleted_ids.insert(id);
+                            }
+                        }
+                        WalOp::CreateCollection | WalOp::DropCollection => {}
+                    }
+                }
+                Err(StorageError::ChecksumMismatch { .. }) => {
+                    warn!("WAL CRC mismatch during tombstone replay at {:?}. Stopping.", wal_path);
+                    break;
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+
+        info!(
+            "WAL tombstone replay complete: {} deleted IDs collected",
+            deleted_ids.len()
+        );
+
+        Ok(deleted_ids)
+    }
+
     /// Verify the integrity of a single segment file.
     ///
     /// Opens the segment, validates its header (magic + checksum), and
@@ -244,7 +324,9 @@ impl RecoveryManager {
         memtable: &InMemoryVectorStore,
     ) -> StorageResult<()> {
         let (id, data, metadata): (VectorId, VectorData, Option<Metadata>) =
-            bincode::deserialize(payload)?;
+            bincode::DefaultOptions::new()
+                .with_limit(MAX_DESER_SIZE)
+                .deserialize(payload)?;
 
         let record = VectorRecord::new(id, data, metadata);
 
@@ -273,7 +355,9 @@ impl RecoveryManager {
         memtable: &InMemoryVectorStore,
     ) -> StorageResult<()> {
         let (id, data, metadata): (VectorId, Option<VectorData>, Option<Metadata>) =
-            bincode::deserialize(payload)?;
+            bincode::DefaultOptions::new()
+                .with_limit(MAX_DESER_SIZE)
+                .deserialize(payload)?;
 
         match memtable.update(id, data.clone(), metadata.clone()) {
             Ok(()) => Ok(()),
@@ -303,7 +387,9 @@ impl RecoveryManager {
         payload: &[u8],
         memtable: &InMemoryVectorStore,
     ) -> StorageResult<()> {
-        let id: VectorId = bincode::deserialize(payload)?;
+        let id: VectorId = bincode::DefaultOptions::new()
+            .with_limit(MAX_DESER_SIZE)
+            .deserialize(payload)?;
 
         match memtable.delete(id) {
             Ok(_) => Ok(()),

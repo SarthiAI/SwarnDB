@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,16 +89,13 @@ pub struct ProbeState {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: String::new(),
     })
 }
 
 async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
     let collections = state.collections.read();
-    let total_vectors: u64 = collections
-        .values()
-        .map(|c| c.store.len() as u64)
-        .sum();
+    let total_vectors: u64 = collections.values().map(|c| c.store.len() as u64).sum();
     Json(ReadyResponse {
         ready: true,
         collections: collections.len(),
@@ -125,37 +121,28 @@ async fn healthz() -> Json<ProbeResponse> {
 ///
 /// Checks:
 ///   - `collections_accessible`: can acquire a read lock on the collections map
-///   - `collections_loaded`: at least one collection exists OR server just started
+///   - `initialized`: server has completed its startup sequence
 async fn readyz(State(state): State<ProbeState>) -> impl IntoResponse {
     let mut checks: HashMap<String, String> = HashMap::new();
     let mut all_ok = true;
 
     // Check 1: collections are accessible (can acquire read lock without blocking forever).
-    // `parking_lot::RwLock::try_read` returns None if the lock cannot be acquired.
     match state.app.collections.try_read() {
-        Some(guard) => {
-            checks.insert("collections_accessible".to_string(), "ok".to_string());
-
-            // Check 2: at least one collection exists, or server just started (not yet initialized).
-            let has_collections = !guard.is_empty();
-            let just_started = !state.server_status.is_initialized();
-            if has_collections || just_started {
-                checks.insert("collections_loaded".to_string(), "ok".to_string());
-            } else {
-                checks.insert(
-                    "collections_loaded".to_string(),
-                    "no collections loaded".to_string(),
-                );
-                all_ok = false;
-            }
+        Some(_guard) => {
+            checks.insert("storage".to_string(), "ok".to_string());
         }
         None => {
-            checks.insert(
-                "collections_accessible".to_string(),
-                "lock unavailable".to_string(),
-            );
+            checks.insert("storage".to_string(), "unavailable".to_string());
             all_ok = false;
         }
+    }
+
+    // Check 2: server has completed initialization (data loading grace period).
+    if state.server_status.is_initialized() {
+        checks.insert("initialized".to_string(), "ok".to_string());
+    } else {
+        checks.insert("initialized".to_string(), "pending".to_string());
+        all_ok = false;
     }
 
     let response = ProbeResponse {

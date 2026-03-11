@@ -49,6 +49,12 @@ class CollectionAPI:
         Raises:
             CollectionExistsError: If a collection with this name already exists.
         """
+        from swarndb.vectors import _validate_collection_name
+        _validate_collection_name(name)
+
+        if default_threshold != 0.0 and (default_threshold <= 0.0 or default_threshold > 1.0):
+            raise ValueError("default_threshold must be >0.0 and <=1.0 (use 0.0 for server default)")
+
         request = collection_pb2.CreateCollectionRequest(
             name=name,
             dimension=dimension,
@@ -65,6 +71,7 @@ class CollectionAPI:
             distance_metric=distance_metric,
             vector_count=0,
             default_threshold=default_threshold,
+            status="ready",
         )
 
     def get(self, name: str) -> CollectionInfo:
@@ -89,6 +96,7 @@ class CollectionAPI:
             distance_metric=response.distance_metric,
             vector_count=response.vector_count,
             default_threshold=response.default_threshold,
+            status=response.status or "active",
         )
 
     def delete(self, name: str) -> bool:
@@ -126,6 +134,7 @@ class CollectionAPI:
                 distance_metric=c.distance_metric,
                 vector_count=c.vector_count,
                 default_threshold=c.default_threshold,
+                status=c.status or "active",
             )
             for c in response.collections
         ]

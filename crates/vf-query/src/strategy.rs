@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 
@@ -110,7 +109,7 @@ impl QueryExecutor {
         metadata_store: &HashMap<VectorId, Metadata>,
         ef_search: Option<usize>,
     ) -> Result<Vec<ScoredResult>, QueryError> {
-        let expanded_k = k * oversample_factor;
+        let expanded_k = k.saturating_mul(oversample_factor);
         let results = index.search(query, expanded_k, ef_search)?;
 
         // Compile filter once, evaluate many times without AST traversal
@@ -191,6 +190,12 @@ impl QueryExecutor {
     }
 }
 
+/// Convert a `RoaringBitmap` (u32 IDs) to a `Vec<VectorId>` (u64).
+///
+/// **Note:** `RoaringBitmap` only stores u32 values, so any `VectorId`
+/// above `u32::MAX` (4,294,967,295) will never appear in bitmap-filtered
+/// results. This is acceptable for current workloads but should be
+/// revisited if VectorId space exceeds 4B.
 fn bitmap_to_candidates(bitmap: &RoaringBitmap) -> Vec<VectorId> {
     bitmap.iter().map(|id| id as u64).collect()
 }

@@ -9,11 +9,12 @@ service GraphService {
   rpc SetThreshold(SetThresholdRequest) returns (SetThresholdResponse);
 }
 
+// Server enforces max message size (default 4MB). Configure via SWARNDB_MAX_MESSAGE_SIZE.
 message GetRelatedRequest {
-  string collection = 1;
+  string collection = 1;     // max 128 chars
   uint64 vector_id = 2;
-  float threshold = 3;
-  uint32 max_results = 4;
+  float threshold = 3;       // 0.0-1.0
+  uint32 max_results = 4;    // 1-10000
 }
 
 message GraphEdge {
@@ -26,11 +27,11 @@ message GetRelatedResponse {
 }
 
 message TraverseRequest {
-  string collection = 1;
+  string collection = 1;     // max 128 chars
   uint64 start_id = 2;
-  uint32 depth = 3;
-  float threshold = 4;
-  uint32 max_results = 5;
+  uint32 depth = 3;          // 1-10
+  float threshold = 4;       // 0.0-1.0
+  uint32 max_results = 5;    // 1-10000
 }
 
 message TraversalNode {

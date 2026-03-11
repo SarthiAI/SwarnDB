@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,8 +10,13 @@ use vf_core::types::{DistanceMetricType, SimilarityThreshold, VectorId};
 
 static LOGICAL_CLOCK: AtomicU64 = AtomicU64::new(1);
 
+/// Returns a monotonically increasing timestamp for edge creation ordering.
+/// Uses AcqRel ordering for proper cross-thread visibility and wrapping_add
+/// to handle the (astronomically unlikely) u64 wrap-around gracefully.
 fn next_timestamp() -> u64 {
-    LOGICAL_CLOCK.fetch_add(1, Ordering::Relaxed)
+    // fetch_add already wraps on overflow for AtomicU64. Using AcqRel
+    // ensures the increment is visible to other threads immediately.
+    LOGICAL_CLOCK.fetch_add(1, Ordering::AcqRel)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,15 +33,18 @@ pub struct GraphConfig {
     pub max_edges_per_node: usize,
     pub max_traversal_depth: usize,
     pub distance_metric: DistanceMetricType,
+    /// Number of nearest neighbors to search when computing graph edges.
+    pub graph_neighbors_k: usize,
 }
 
 impl Default for GraphConfig {
     fn default() -> Self {
         Self {
             default_threshold: 0.7,
-            max_edges_per_node: 50,
-            max_traversal_depth: 5,
+            max_edges_per_node: 100,
+            max_traversal_depth: 10,
             distance_metric: DistanceMetricType::Cosine,
+            graph_neighbors_k: 10,
         }
     }
 }
@@ -93,6 +100,18 @@ impl Default for GraphNode {
     }
 }
 
+/// The core virtual graph data structure storing similarity-based relationships
+/// between vectors.
+///
+/// # Thread Safety
+///
+/// `VirtualGraph` is **not** internally synchronized. It uses a plain `HashMap`
+/// for node storage, so concurrent reads and writes will cause data races.
+///
+/// Callers **must** provide external synchronization (e.g., wrap in
+/// `parking_lot::RwLock` or `std::sync::Mutex`) when accessing from multiple
+/// threads. The server layer (`vf-server`) wraps this in an `RwLock` for
+/// safe concurrent access.
 pub struct VirtualGraph {
     nodes: HashMap<VectorId, GraphNode>,
     config: GraphConfig,

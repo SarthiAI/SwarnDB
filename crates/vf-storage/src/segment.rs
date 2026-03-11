@@ -1,16 +1,17 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Segment file reader (`Segment`) and writer (`SegmentWriter`).
 //!
 //! A segment is an immutable, memory-mapped file that stores vectors and their
 //! optional metadata. See [`crate::format`] for the on-disk layout.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use bincode::Options;
 use memmap2::Mmap;
 
 use crate::error::{StorageError, StorageResult};
@@ -18,6 +19,15 @@ use crate::format::{DataTypeFlag, SegmentHeader, SEGMENT_HEADER_SIZE};
 use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{Metadata, VectorId};
 use vf_core::vector::VectorData;
+
+/// Maximum size for bincode deserialization (256 MB).
+const MAX_DESER_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Maximum metadata entry count to prevent unbounded scanning.
+const MAX_META_ENTRIES: usize = 10_000_000;
+
+/// Maximum size for a single metadata blob (64 MB).
+const MAX_META_LEN: usize = 64 * 1024 * 1024;
 
 // ── Segment (read-only) ─────────────────────────────────────────────────────
 
@@ -30,6 +40,8 @@ pub struct Segment {
     header: SegmentHeader,
     /// Size of one vector entry in the data region: 8 (id) + dim * element_size.
     vector_entry_size: usize,
+    /// O(1) metadata lookup: maps VectorId → byte offset of the metadata payload in the mmap.
+    meta_index: HashMap<VectorId, (usize, usize)>,
 }
 
 impl Segment {
@@ -52,6 +64,21 @@ impl Segment {
         let header = SegmentHeader::read_from(&mut cursor)?;
         header.validate()?;
 
+        // Task 268: Validate data_offset and meta_offset are within file bounds.
+        let file_size = mmap.len() as u64;
+        if header.data_offset > file_size {
+            return Err(StorageError::SegmentInvalidHeader(format!(
+                "data_offset {} exceeds file size {}",
+                header.data_offset, file_size
+            )));
+        }
+        if header.meta_offset > file_size {
+            return Err(StorageError::SegmentInvalidHeader(format!(
+                "meta_offset {} exceeds file size {}",
+                header.meta_offset, file_size
+            )));
+        }
+
         // Compute entry size. Vectors are always stored as f32 on disk (4 bytes per element),
         // regardless of the header's data_type field.
         let vector_entry_size = 8 + (header.dimension as usize) * 4;
@@ -59,12 +86,16 @@ impl Segment {
         // Extract segment id from filename stem.
         let id = Self::parse_segment_id(path)?;
 
+        // Build metadata offset index for O(1) lookups.
+        let meta_index = Self::build_meta_index(&mmap, &header)?;
+
         Ok(Segment {
             id,
             path: path.to_path_buf(),
             mmap,
             header,
             vector_entry_size,
+            meta_index,
         })
     }
 
@@ -163,43 +194,19 @@ impl Segment {
 
     /// Look up metadata for the given vector id in the metadata region.
     ///
+    /// Uses a pre-built HashMap index for O(1) lookup instead of linear scan.
     /// Returns `None` if no metadata entry exists for this id.
     pub fn get_metadata(&self, target_id: VectorId) -> StorageResult<Option<Metadata>> {
-        let meta_start = self.header.meta_offset as usize;
-        let file_len = self.mmap.len();
+        let &(payload_offset, meta_len) = match self.meta_index.get(&target_id) {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
 
-        if meta_start >= file_len {
-            // No metadata region at all.
-            return Ok(None);
-        }
-
-        let mut pos = meta_start;
-        while pos + 12 <= file_len {
-            // Read id (u64 LE).
-            let id = u64::from_le_bytes(self.mmap[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-
-            // Read meta_len (u32 LE).
-            let meta_len =
-                u32::from_le_bytes(self.mmap[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-
-            if pos + meta_len > file_len {
-                return Err(StorageError::TruncatedData {
-                    expected: pos + meta_len,
-                    actual: file_len,
-                });
-            }
-
-            if id == target_id {
-                let meta: Metadata = bincode::deserialize(&self.mmap[pos..pos + meta_len])?;
-                return Ok(Some(meta));
-            }
-
-            pos += meta_len;
-        }
-
-        Ok(None)
+        // Task 267: Use size-limited bincode deserialization.
+        let meta: Metadata = bincode::DefaultOptions::new()
+            .with_limit(MAX_DESER_SIZE)
+            .deserialize(&self.mmap[payload_offset..payload_offset + meta_len])?;
+        Ok(Some(meta))
     }
 
     // ── Iteration ────────────────────────────────────────────────────────
@@ -211,6 +218,60 @@ impl Segment {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
+
+    /// Scan the metadata region once and build a HashMap from VectorId to
+    /// (payload_offset, payload_length) for O(1) lookups.
+    fn build_meta_index(
+        mmap: &Mmap,
+        header: &SegmentHeader,
+    ) -> StorageResult<HashMap<VectorId, (usize, usize)>> {
+        let meta_start = header.meta_offset as usize;
+        let file_len = mmap.len();
+
+        if meta_start >= file_len {
+            return Ok(HashMap::new());
+        }
+
+        let mut index = HashMap::new();
+        let mut pos = meta_start;
+        let mut entries_scanned: usize = 0;
+
+        while pos + 12 <= file_len {
+            entries_scanned += 1;
+            if entries_scanned > MAX_META_ENTRIES {
+                return Err(StorageError::SegmentInvalidHeader(format!(
+                    "metadata region exceeds maximum entry count ({})",
+                    MAX_META_ENTRIES
+                )));
+            }
+
+            let id = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+
+            let meta_len =
+                u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            if meta_len > MAX_META_LEN {
+                return Err(StorageError::SegmentInvalidHeader(format!(
+                    "metadata entry length {} exceeds maximum ({})",
+                    meta_len, MAX_META_LEN
+                )));
+            }
+
+            if pos + meta_len > file_len {
+                return Err(StorageError::TruncatedData {
+                    expected: pos + meta_len,
+                    actual: file_len,
+                });
+            }
+
+            index.insert(id, (pos, meta_len));
+            pos += meta_len;
+        }
+
+        Ok(index)
+    }
 
     /// Validate that `index` is within bounds.
     fn check_index(&self, index: usize) -> StorageResult<()> {
@@ -264,8 +325,15 @@ impl SegmentWriter {
         // Vectors are always stored as f32 on disk (4 bytes per element),
         // regardless of the data_type parameter (which is recorded in the header
         // for informational/provenance purposes).
-        let vector_entry_size = 8 + (dimension as usize) * 4;
-        let vector_data_size = records.len() * vector_entry_size;
+        // Task 278: Use checked arithmetic for size calculations.
+        let vector_entry_size = 8usize.checked_add((dimension as usize).checked_mul(4).ok_or_else(|| {
+            StorageError::SegmentInvalidHeader("integer overflow computing vector entry size".into())
+        })?).ok_or_else(|| {
+            StorageError::SegmentInvalidHeader("integer overflow computing vector entry size".into())
+        })?;
+        let vector_data_size = records.len().checked_mul(vector_entry_size).ok_or_else(|| {
+            StorageError::SegmentInvalidHeader("integer overflow computing vector data size".into())
+        })?;
 
         // Pre-serialize all metadata entries so we know the total size.
         let mut meta_entries: Vec<(VectorId, Vec<u8>)> = Vec::new();
@@ -276,12 +344,20 @@ impl SegmentWriter {
             }
         }
 
-        let metadata_size: usize = meta_entries
-            .iter()
-            .map(|(_, bytes)| 8 + 4 + bytes.len()) // id + meta_len + payload
-            .sum();
+        let mut metadata_size: usize = 0;
+        for (_, bytes) in &meta_entries {
+            let entry_size = 8usize.checked_add(4).unwrap()
+                .checked_add(bytes.len()).ok_or_else(|| {
+                    StorageError::SegmentInvalidHeader("integer overflow computing metadata size".into())
+                })?;
+            metadata_size = metadata_size.checked_add(entry_size).ok_or_else(|| {
+                StorageError::SegmentInvalidHeader("integer overflow computing total metadata size".into())
+            })?;
+        }
 
-        let total_size = SEGMENT_HEADER_SIZE + vector_data_size + metadata_size;
+        let total_size = SEGMENT_HEADER_SIZE.checked_add(vector_data_size).and_then(|s| s.checked_add(metadata_size)).ok_or_else(|| {
+            StorageError::SegmentInvalidHeader("integer overflow computing total segment size".into())
+        })?;
 
         // Create the file with a mutable mmap.
         let mut mmap = crate::mmap::create(path, total_size)?;
@@ -326,6 +402,13 @@ impl SegmentWriter {
 
         // Flush to disk.
         crate::mmap::sync(&mmap)?;
+
+        // Fsync parent directory to ensure the new segment file entry is persisted.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
 
         Ok(())
     }

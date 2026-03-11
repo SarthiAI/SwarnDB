@@ -7,6 +7,8 @@ and bulk insert with optional progress bars for bulk operations.
 from __future__ import annotations
 
 import logging
+import random
+import re
 import time
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
@@ -85,8 +87,43 @@ def _from_proto_metadata(m: common_pb2.Metadata) -> Dict[str, Any]:
             result[key] = list(mv.string_list_value.values)
         else:
             # Fallback: try string_value (default for proto3)
+            logger.debug(
+                "Unknown metadata value type for key %r, falling back to string_value",
+                key,
+            )
             result[key] = mv.string_value
     return result
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+_COLLECTION_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")
+
+
+def _validate_collection_name(name: str) -> None:
+    """Validate collection name format."""
+    if not name or not _COLLECTION_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid collection name {name!r}. Must be 1-128 chars, "
+            "alphanumeric with dashes/underscores/dots/colons, starting with alphanumeric."
+        )
+
+
+def _validate_metadata_keys(metadata: Dict[str, Any]) -> None:
+    """Validate metadata keys are non-empty strings."""
+    for key in metadata:
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                f"Metadata keys must be non-empty strings, got {key!r}"
+            )
+
+
+def _validate_vector(vector: List[float], label: str = "vector") -> None:
+    """Validate that a vector is non-empty and has positive dimensions."""
+    if not vector or len(vector) == 0:
+        raise ValueError(f"{label} must be non-empty with dimensions > 0")
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +160,11 @@ class VectorAPI:
         Returns:
             The assigned vector ID.
         """
+        _validate_collection_name(collection)
+        _validate_vector(vector)
+        if metadata:
+            _validate_metadata_keys(metadata)
+
         request = vector_pb2.InsertRequest(
             collection=collection,
             vector=_to_proto_vector(vector),
@@ -246,11 +288,18 @@ class VectorAPI:
         index_mode: Optional[str] = None,
         skip_metadata_index: bool = False,
         parallel_build: bool = False,
+        retry_on_failure: bool = True,
     ) -> BulkInsertResult:
         """Bulk insert vectors using streaming RPC.
 
         Streams InsertRequest messages to the server. Optionally displays a
         progress bar via tqdm when ``show_progress=True``.
+
+        .. warning::
+            Bulk insert is **not idempotent**. If a retry occurs after a
+            partial server-side commit, duplicate data may be inserted.
+            Set ``retry_on_failure=False`` to disable retries for
+            non-idempotent bulk operations.
 
         Args:
             collection: Target collection name.
@@ -379,11 +428,17 @@ class VectorAPI:
         # BulkInsert is stream_unary: we stream requests, get one response.
         # Cannot use _call (which is for unary-unary), so call stub directly
         # with retry logic.
-        metadata = self._client._metadata()
         call_timeout = self._client._timeout
         last_error: Optional[grpc.RpcError] = None
+        max_attempts = (self._client._max_retries + 1) if retry_on_failure else 1
+        retry_start = time.monotonic()
 
-        for attempt in range(self._client._max_retries + 1):
+        retryable = frozenset({
+            grpc.StatusCode.UNAVAILABLE,
+            grpc.StatusCode.DEADLINE_EXCEEDED,
+        })
+
+        for attempt in range(max_attempts):
             try:
                 if use_optimized_rpc:
                     logger.info(
@@ -402,13 +457,11 @@ class VectorAPI:
                     response = self._client._vector_stub.BulkInsertWithOptions(
                         _options_request_iterator(),
                         timeout=call_timeout,
-                        metadata=metadata,
                     )
                 else:
                     response = self._client._vector_stub.BulkInsert(
                         _request_iterator(),
                         timeout=call_timeout,
-                        metadata=metadata,
                     )
                 return BulkInsertResult(
                     inserted_count=response.inserted_count,
@@ -418,12 +471,11 @@ class VectorAPI:
                 last_error = exc
                 code = exc.code()
 
-                retryable = frozenset({
-                    grpc.StatusCode.UNAVAILABLE,
-                    grpc.StatusCode.DEADLINE_EXCEEDED,
-                })
-                if code in retryable and attempt < self._client._max_retries:
-                    delay = self._client._retry_delay * (2 ** attempt)
+                if code in retryable and attempt < max_attempts - 1:
+                    elapsed = time.monotonic() - retry_start
+                    if elapsed >= self._client._total_retry_timeout:
+                        raise self._client._translate_error(exc) from exc
+                    delay = self._client._retry_delay * (2 ** attempt) + random.uniform(0, self._client._retry_delay)
                     logger.debug(
                         "Retrying BulkInsert (attempt %d/%d) after %s, "
                         "backoff %.2fs",

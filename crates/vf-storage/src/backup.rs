@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Collection backup: snapshot segments, config, and WAL into a tar.gz archive
 //! with a SHA-256 manifest for integrity verification.
@@ -20,6 +19,9 @@ use tar::Builder;
 use crate::error::{StorageError, StorageResult};
 use crate::util::hex_encode;
 
+/// Default maximum total backup size (64 GB).
+const DEFAULT_MAX_BACKUP_SIZE: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Options controlling how a backup is created.
 #[derive(Debug, Clone)]
 pub struct BackupOptions {
@@ -27,6 +29,9 @@ pub struct BackupOptions {
     pub compression_level: u32,
     /// Whether to include WAL files in the backup. Default: true.
     pub include_wal: bool,
+    /// Maximum total backup size in bytes. Default: 64 GB.
+    /// Set to `0` to disable the size check entirely.
+    pub max_backup_size: u64,
 }
 
 impl Default for BackupOptions {
@@ -34,6 +39,7 @@ impl Default for BackupOptions {
         Self {
             compression_level: 6,
             include_wal: true,
+            max_backup_size: DEFAULT_MAX_BACKUP_SIZE,
         }
     }
 }
@@ -173,6 +179,21 @@ pub fn create_backup(
     let archive_name = format!("{collection_name}_{timestamp}.tar.gz");
     let archive_path = output_dir.join(&archive_name);
 
+    // Task 270: Check total backup size before reading into memory.
+    let mut total_backup_size: u64 = 0;
+    for (_rel_path, abs_path) in &backup_files {
+        let meta = fs::metadata(abs_path).map_err(StorageError::Io)?;
+        total_backup_size = total_backup_size.saturating_add(meta.len());
+    }
+    if options.max_backup_size > 0 && total_backup_size > options.max_backup_size {
+        return Err(StorageError::Serialization(format!(
+            "total backup size ({} bytes) exceeds maximum allowed ({} bytes). \
+             Consider compacting or archiving the collection first, \
+             or increase max_backup_size in BackupOptions.",
+            total_backup_size, options.max_backup_size
+        )));
+    }
+
     // Read all file contents and compute hashes
     let mut file_contents: Vec<(String, Vec<u8>)> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
@@ -278,5 +299,6 @@ mod tests {
         let opts = BackupOptions::default();
         assert_eq!(opts.compression_level, 6);
         assert!(opts.include_wal);
+        assert_eq!(opts.max_backup_size, 64 * 1024 * 1024 * 1024);
     }
 }

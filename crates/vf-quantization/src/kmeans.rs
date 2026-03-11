@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! K-means clustering utility for product quantization codebook training.
 
@@ -10,29 +9,46 @@ use rand::SeedableRng;
 use rand::Rng;
 use rayon::prelude::*;
 
+use crate::error::QuantizationError;
+
 /// Result of k-means clustering.
 #[derive(Debug, Clone)]
 pub struct KMeansResult {
     /// k centroids, each of `subvector_dim` dimensions.
     pub centroids: Vec<Vec<f32>>,
     /// Cluster assignment (0..k-1) for each training vector.
-    pub assignments: Vec<u8>,
+    pub assignments: Vec<u32>,
 }
 
 /// Run k-means clustering on the given data.
 ///
 /// # Arguments
 /// * `data` — training subvectors (each slice has the same dimensionality)
-/// * `k` — number of clusters (typically 256 for PQ so codes fit in u8)
+/// * `k` — number of clusters (up to 65536 for IVF partitions; PQ uses 256)
 /// * `max_iters` — maximum Lloyd iterations before stopping
 /// * `seed` — RNG seed for reproducible k-means++ initialization
 ///
-/// # Panics
-/// Panics if `data` is empty or `k` is 0.
-pub fn kmeans(data: &[&[f32]], k: usize, max_iters: usize, seed: u64) -> KMeansResult {
-    assert!(!data.is_empty(), "kmeans: data must not be empty");
-    assert!(k > 0, "kmeans: k must be > 0");
-    assert!(k <= 256, "kmeans: k must be <= 256 (u8 assignment type)");
+/// # Errors
+/// Returns `QuantizationError` if `data` is empty or `k` is 0.
+pub fn kmeans(
+    data: &[&[f32]],
+    k: usize,
+    max_iters: usize,
+    seed: u64,
+) -> Result<KMeansResult, QuantizationError> {
+    if data.is_empty() {
+        return Err(QuantizationError::EmptyTrainingData);
+    }
+    if k == 0 {
+        return Err(QuantizationError::InvalidParameter(
+            "k must be > 0".into(),
+        ));
+    }
+    if data[0].is_empty() {
+        return Err(QuantizationError::InvalidParameter(
+            "dimension must be > 0".into(),
+        ));
+    }
 
     let n = data.len();
     let dim = data[0].len();
@@ -45,23 +61,26 @@ pub fn kmeans(data: &[&[f32]], k: usize, max_iters: usize, seed: u64) -> KMeansR
 
     // Pad with copies of the last centroid if effective_k < k.
     while centroids.len() < k {
-        centroids.push(centroids.last().unwrap().clone());
+        match centroids.last() {
+            Some(last) => centroids.push(last.clone()),
+            None => centroids.push(vec![0.0f32; dim]),
+        }
     }
 
-    let mut assignments = vec![0u8; n];
+    let mut assignments = vec![0u32; n];
 
     for _iter in 0..max_iters {
         // --- Assignment step (parallel) ---
-        let new_assignments: Vec<u8> = data
+        let new_assignments: Vec<u32> = data
             .par_iter()
             .map(|point| {
-                let mut best_idx = 0u8;
+                let mut best_idx = 0u32;
                 let mut best_dist = f32::MAX;
                 for (ci, centroid) in centroids.iter().enumerate() {
                     let d = squared_euclidean(point, centroid);
                     if d < best_dist {
                         best_dist = d;
-                        best_idx = ci as u8;
+                        best_idx = ci as u32;
                     }
                 }
                 best_idx
@@ -99,10 +118,10 @@ pub fn kmeans(data: &[&[f32]], k: usize, max_iters: usize, seed: u64) -> KMeansR
         }
     }
 
-    KMeansResult {
+    Ok(KMeansResult {
         centroids,
         assignments,
-    }
+    })
 }
 
 /// K-means++ initialization: pick initial centroids with probability proportional
@@ -126,7 +145,10 @@ fn kmeans_plus_plus_init(
 
     for _c in 1..k {
         // Update min distances with the most recently added centroid.
-        let last_centroid = centroids.last().unwrap();
+        let last_centroid = match centroids.last() {
+            Some(c) => c,
+            None => break, // Should not happen, but avoid panic
+        };
         let mut total_weight: f64 = 0.0;
 
         for i in 0..n {
@@ -197,7 +219,7 @@ mod tests {
             .map(|v| v.as_slice())
             .collect();
 
-        let result = kmeans(&all, 2, 100, 42);
+        let result = kmeans(&all, 2, 100, 42).unwrap();
 
         assert_eq!(result.centroids.len(), 2);
         assert_eq!(result.assignments.len(), 100);

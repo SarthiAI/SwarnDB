@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Optional
 
 from ._helpers import _to_proto_vector
+from .vectors import _validate_vector
 from ._proto import common_pb2, vector_math_pb2
 from .types import (
     ClusterAssignment,
@@ -80,6 +81,7 @@ class MathAPI:
             GhostVector(
                 id=g.id,
                 isolation_score=g.isolation_score,
+                compute_time_us=response.compute_time_us,
             )
             for g in response.ghosts
         ]
@@ -108,6 +110,7 @@ class MathAPI:
             CollectionNotFoundError: If the collection does not exist.
             MathError: If the operation fails.
         """
+        _validate_vector(direction, "direction vector")
         request = vector_math_pb2.ConeSearchRequest(
             collection=collection,
             direction=_to_proto_vector(direction),
@@ -121,6 +124,7 @@ class MathAPI:
                 id=r.id,
                 cosine_similarity=r.cosine_similarity,
                 angle_radians=r.angle_radians,
+                compute_time_us=response.compute_time_us,
             )
             for r in response.results
         ]
@@ -187,6 +191,8 @@ class MathAPI:
         Raises:
             MathError: If the operation fails.
         """
+        _validate_vector(a, "vector a")
+        _validate_vector(b, "vector b")
         request = vector_math_pb2.InterpolateRequest(
             a=_to_proto_vector(a),
             b=_to_proto_vector(b),
@@ -225,6 +231,8 @@ class MathAPI:
         Raises:
             MathError: If the operation fails.
         """
+        _validate_vector(a, "vector a")
+        _validate_vector(b, "vector b")
         request = vector_math_pb2.InterpolateRequest(
             a=_to_proto_vector(a),
             b=_to_proto_vector(b),
@@ -283,6 +291,7 @@ class MathAPI:
             mean_distance_window2=response.mean_distance_window2,
             spread_change=response.spread_change,
             has_drifted=response.has_drifted,
+            compute_time_us=response.compute_time_us,
         )
 
     # ------------------------------------------------------------------
@@ -337,6 +346,7 @@ class MathAPI:
             ],
             iterations=response.iterations,
             converged=response.converged,
+            compute_time_us=response.compute_time_us,
         )
 
     # ------------------------------------------------------------------
@@ -379,6 +389,7 @@ class MathAPI:
             explained_variance=list(response.explained_variance),
             mean=list(response.mean.values),
             projected=[list(p.values) for p in response.projected],
+            compute_time_us=response.compute_time_us,
         )
 
     # ------------------------------------------------------------------
@@ -407,6 +418,9 @@ class MathAPI:
         Raises:
             MathError: If the operation fails.
         """
+        _validate_vector(a, "vector a")
+        _validate_vector(b, "vector b")
+        _validate_vector(c, "vector c")
         request = vector_math_pb2.ComputeAnalogyRequest(
             a=_to_proto_vector(a),
             b=_to_proto_vector(b),
@@ -508,6 +522,7 @@ class MathAPI:
             CollectionNotFoundError: If the collection does not exist.
             MathError: If the operation fails.
         """
+        _validate_vector(query, "query vector")
         # proto field is named "lambda" which is a Python keyword;
         # protobuf Python codegen maps it via keyword argument syntax.
         request = vector_math_pb2.DiversitySampleRequest(
@@ -525,6 +540,7 @@ class MathAPI:
                 id=r.id,
                 relevance_score=r.relevance_score,
                 mmr_score=r.mmr_score,
+                compute_time_us=response.compute_time_us,
             )
             for r in response.results
         ]

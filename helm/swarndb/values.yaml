@@ -3,7 +3,7 @@
 # Container image configuration
 image:
   repository: swarndb
-  tag: latest
+  tag: "0.1.0"
   pullPolicy: IfNotPresent
 
 # Number of replicas
@@ -48,11 +48,62 @@ autoscaling:
 
 # SwarnDB configuration
 config:
+  # Logging
   logLevel: info
+
+  # Network
+  maxMessageSize: 67108864        # 64 MB
+  maxRequestBodyBytes: 268435456  # 256 MB
+  corsOrigins: ""
+
+  # Storage
+  walMaxSize: 268435456           # 256 MB
+  tieredHotCapacity: 100000
+  memtableFlushThreshold: 50000
+
+  # Connection limits
   maxConnections: 1000
+
+  # Concurrency control
+  maxConcurrentSearches: 500
+  minConcurrency: 10
+  maxConcurrency: 200
+  targetP99LatencyMs: 500
+  concurrencyEmaAlpha: "0.1"
+  concurrencyHighThreshold: "1.2"
+  concurrencyLowThreshold: "0.5"
+  concurrencyDecreaseRate: "0.10"
+  concurrencyIncreaseRate: "0.05"
+  searchQueueSize: 1000
+
+  # Timeouts
   requestTimeoutMs: 30000
+  searchTimeoutMs: 5000
+  bulkTimeoutMs: 300000
+  computeTimeoutSecs: 30
+
+  # Search limits
+  maxK: 10000
+  maxEfSearch: 10000
+
+  # HNSW index tuning
+  maxEf: 100000
+  maxEfConstruction: 2000
+
+  # Bulk insert limits
+  maxBatchLockSize: 10000
+  maxWalFlushInterval: 100000
+  maxBulkInsertMessages: 100000
+  maxBulkInsertPayloadBytes: 536870912  # 512 MB
+
+  # Validation limits
+  maxMetadataSizeBytes: 4194304   # 4 MB
+  maxVectorDimension: 65536
+  maxVectorsPerRequest: 10000
+  maxCollectionNameLength: 256
 
 # Authentication
+# Enable auth and configure apiKeys for production use.
 auth:
   enabled: false
   apiKeys: []
@@ -67,6 +118,25 @@ podAnnotations: {}
 
 # Service account
 serviceAccount:
-  create: false
+  create: true
   name: ""
   annotations: {}
+
+# TLS configuration
+tls:
+  # Enable TLS for gRPC and REST endpoints
+  enabled: false
+  # Name of the K8s Secret containing tls.crt and tls.key
+  secretName: ""
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: swarndb.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []

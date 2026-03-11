@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
+import warnings
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -42,7 +45,6 @@ from swarndb.exceptions import (
     AuthenticationError,
     CollectionExistsError,
     CollectionNotFoundError,
-    ConnectionError,
     DimensionMismatchError,
     GraphError,
     MathError,
@@ -71,7 +73,12 @@ from swarndb.types import (
     VectorRecord,
 )
 from swarndb._helpers import _to_proto_vector
-from swarndb.vectors import _from_proto_metadata, _to_proto_metadata
+from swarndb.vectors import _from_proto_metadata, _to_proto_metadata, _validate_vector, _validate_collection_name, _validate_metadata_keys
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 logger = logging.getLogger(__name__)
 
@@ -100,32 +107,45 @@ class _AsyncClientCallDetails(grpc.aio.ClientCallDetails):
         self.wait_for_ready = wait_for_ready
 
 
-class _AsyncAuthInterceptor(grpc.aio.UnaryUnaryClientInterceptor):
-    """Async interceptor that injects an API key into every unary-unary call."""
+class _AsyncAuthInterceptor(
+    grpc.aio.UnaryUnaryClientInterceptor,
+    grpc.aio.UnaryStreamClientInterceptor,
+    grpc.aio.StreamUnaryClientInterceptor,
+    grpc.aio.StreamStreamClientInterceptor,
+):
+    """Async interceptor that injects an API key into all RPC patterns."""
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
-    async def intercept_unary_unary(
-        self,
-        continuation,
-        client_call_details,
-        request,
-    ):
+    def _inject_metadata(self, client_call_details):
         """Add X-API-Key metadata to the outgoing call."""
         metadata: list[tuple[str, str]] = []
         if client_call_details.metadata is not None:
-            metadata = list(client_call_details.metadata)
+            metadata = [
+                (k, v) for k, v in client_call_details.metadata
+                if k.lower() != "x-api-key"
+            ]
         metadata.append(("x-api-key", self._api_key))
-
-        new_details = _AsyncClientCallDetails(
+        return _AsyncClientCallDetails(
             method=client_call_details.method,
             timeout=client_call_details.timeout,
             metadata=metadata,
             credentials=client_call_details.credentials,
             wait_for_ready=client_call_details.wait_for_ready,
         )
-        return await continuation(new_details, request)
+
+    async def intercept_unary_unary(self, continuation, client_call_details, request):
+        return await continuation(self._inject_metadata(client_call_details), request)
+
+    async def intercept_unary_stream(self, continuation, client_call_details, request):
+        return await continuation(self._inject_metadata(client_call_details), request)
+
+    async def intercept_stream_unary(self, continuation, client_call_details, request_iterator):
+        return await continuation(self._inject_metadata(client_call_details), request_iterator)
+
+    async def intercept_stream_stream(self, continuation, client_call_details, request_iterator):
+        return await continuation(self._inject_metadata(client_call_details), request_iterator)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +168,9 @@ class AsyncSwarnDBClient:
             results = await client.search.query("my_collection", [0.1] * 128, k=5)
     """
 
+    _DEFAULT_MAX_RETRIES_CAP = 50
+    _DEFAULT_TOTAL_RETRY_TIMEOUT = 300.0
+
     def __init__(
         self,
         host: str = "localhost",
@@ -158,18 +181,55 @@ class AsyncSwarnDBClient:
         max_retries: int = 3,
         retry_delay: float = 0.5,
         timeout: float = 30.0,
+        total_retry_timeout: float = _DEFAULT_TOTAL_RETRY_TIMEOUT,
+        max_retries_cap: int = _DEFAULT_MAX_RETRIES_CAP,
+        max_message_size: int = 256 * 1024 * 1024,
         options: Optional[Sequence[Tuple[str, Any]]] = None,
+        ca_cert_path: Optional[str] = None,
+        client_cert_path: Optional[str] = None,
+        client_key_path: Optional[str] = None,
     ) -> None:
         self._host = host
         self._port = port
         self._api_key = api_key
         self._secure = secure
+        self._max_retries_cap = max_retries_cap
+        if max_retries > self._max_retries_cap:
+            raise ValueError(
+                f"max_retries={max_retries} exceeds maximum allowed value "
+                f"of {self._max_retries_cap}"
+            )
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._timeout = timeout
+        self._total_retry_timeout = total_retry_timeout
+
+        # Warn when using insecure channel
+        if not secure:
+            warnings.warn(
+                "Using insecure gRPC channel (secure=False). "
+                "Use secure=True in production.",
+                stacklevel=2,
+            )
+
+        # Warn when API key is transmitted without TLS
+        if api_key and not secure:
+            warnings.warn(
+                "API key transmitted over insecure channel. "
+                "Use secure=True in production.",
+                stacklevel=2,
+            )
 
         target = f"{host}:{port}"
         channel_options = list(options) if options else []
+
+        # Add keepalive and message size options
+        channel_options.extend([
+            ("grpc.keepalive_time_ms", 30000),
+            ("grpc.keepalive_timeout_ms", 10000),
+            ("grpc.max_send_message_length", max_message_size),
+            ("grpc.max_receive_message_length", max_message_size),
+        ])
 
         # Build interceptor list
         interceptors: list[grpc.aio.ClientInterceptor] = []
@@ -178,7 +238,25 @@ class AsyncSwarnDBClient:
 
         # Create async channel
         if secure:
-            credentials = grpc.ssl_channel_credentials()
+            if ca_cert_path or client_cert_path:
+                root_certs = None
+                private_key = None
+                certificate_chain = None
+                if ca_cert_path:
+                    with open(ca_cert_path, "rb") as f:
+                        root_certs = f.read()
+                if client_cert_path and client_key_path:
+                    with open(client_key_path, "rb") as f:
+                        private_key = f.read()
+                    with open(client_cert_path, "rb") as f:
+                        certificate_chain = f.read()
+                credentials = grpc.ssl_channel_credentials(
+                    root_certificates=root_certs,
+                    private_key=private_key,
+                    certificate_chain=certificate_chain,
+                )
+            else:
+                credentials = grpc.ssl_channel_credentials()
             self._channel = grpc.aio.secure_channel(
                 target, credentials,
                 options=channel_options,
@@ -267,6 +345,7 @@ class AsyncSwarnDBClient:
         """
         call_timeout = timeout if timeout is not None else self._timeout
         last_error: Optional[grpc.RpcError] = None
+        retry_start = time.monotonic()
 
         for attempt in range(self._max_retries + 1):
             try:
@@ -280,7 +359,10 @@ class AsyncSwarnDBClient:
 
                 # Only retry on transient errors
                 if code in _RETRYABLE_CODES and attempt < self._max_retries:
-                    delay = self._retry_delay * (2 ** attempt)
+                    elapsed = time.monotonic() - retry_start
+                    if elapsed >= self._total_retry_timeout:
+                        raise self._translate_error(exc) from exc
+                    delay = self._retry_delay * (2 ** attempt) + random.uniform(0, self._retry_delay)
                     logger.debug(
                         "Retrying async gRPC call (attempt %d/%d) after %s "
                         "error, backoff %.2fs",
@@ -299,10 +381,8 @@ class AsyncSwarnDBClient:
         assert last_error is not None
         raise self._translate_error(last_error) from last_error
 
-    def _metadata(self) -> Optional[Sequence[Tuple[str, str]]]:
-        """Return auth metadata if api_key is set."""
-        if self._api_key:
-            return (("x-api-key", self._api_key),)
+    def _metadata(self) -> None:
+        """Auth metadata is handled by the interceptor. Returns None."""
         return None
 
     @staticmethod
@@ -315,8 +395,9 @@ class AsyncSwarnDBClient:
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close the async gRPC channel."""
+        """Close the async gRPC channel and scrub credentials."""
         await self._channel.close()
+        self._api_key = None
 
     async def __aenter__(self) -> AsyncSwarnDBClient:
         return self
@@ -325,10 +406,7 @@ class AsyncSwarnDBClient:
         await self.close()
 
     def __repr__(self) -> str:
-        return (
-            f"AsyncSwarnDBClient(host={self._host!r}, port={self._port}, "
-            f"secure={self._secure})"
-        )
+        return f"AsyncSwarnDBClient(host={self._host!r}, port={self._port}, secure={self._secure})"
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +444,7 @@ class AsyncCollectionAPI:
         Raises:
             CollectionExistsError: If a collection with this name already exists.
         """
+        _validate_collection_name(name)
         request = collection_pb2.CreateCollectionRequest(
             name=name,
             dimension=dimension,
@@ -382,6 +461,7 @@ class AsyncCollectionAPI:
             distance_metric=distance_metric,
             vector_count=0,
             default_threshold=default_threshold,
+            status="ready",
         )
 
     async def get(self, name: str) -> CollectionInfo:
@@ -406,6 +486,7 @@ class AsyncCollectionAPI:
             distance_metric=response.distance_metric,
             vector_count=response.vector_count,
             default_threshold=response.default_threshold,
+            status=response.status or "active",
         )
 
     async def delete(self, name: str) -> bool:
@@ -443,6 +524,7 @@ class AsyncCollectionAPI:
                 distance_metric=c.distance_metric,
                 vector_count=c.vector_count,
                 default_threshold=c.default_threshold,
+                status=c.status or "active",
             )
             for c in response.collections
         ]
@@ -539,6 +621,11 @@ class AsyncVectorAPI:
         Returns:
             The assigned vector ID.
         """
+        _validate_collection_name(collection)
+        _validate_vector(vector)
+        if metadata:
+            _validate_metadata_keys(metadata)
+
         request = vector_pb2.InsertRequest(
             collection=collection,
             vector=_to_proto_vector(vector),
@@ -573,7 +660,7 @@ class AsyncVectorAPI:
             self._client._vector_stub.Get, request
         )
         return VectorRecord(
-            id=str(response.id),
+            id=response.id,
             vector=list(response.vector.values),
             metadata=_from_proto_metadata(response.metadata),
         )
@@ -638,6 +725,7 @@ class AsyncVectorAPI:
         metadata_list: Optional[List[Dict[str, Any]]] = None,
         ids: Optional[List[int]] = None,
         batch_size: int = 1000,
+        show_progress: bool = False,
         batch_lock_size: Optional[int] = None,
         defer_graph: bool = False,
         wal_flush_every: Optional[int] = None,
@@ -645,10 +733,18 @@ class AsyncVectorAPI:
         index_mode: Optional[str] = None,
         skip_metadata_index: bool = False,
         parallel_build: bool = False,
+        retry_on_failure: bool = True,
     ) -> BulkInsertResult:
         """Bulk insert vectors using async streaming RPC.
 
         Streams InsertRequest messages to the server via an async generator.
+        Optionally displays a progress bar via tqdm when ``show_progress=True``.
+
+        .. warning::
+            Bulk insert is **not idempotent**. If a retry occurs after a
+            partial server-side commit, duplicate data may be inserted.
+            Set ``retry_on_failure=False`` to disable retries for
+            non-idempotent bulk operations.
 
         Args:
             collection: Target collection name.
@@ -658,6 +754,8 @@ class AsyncVectorAPI:
             ids: Optional per-vector IDs (must match length of ``vectors``
                 if provided). Use 0 for auto-assignment.
             batch_size: Number of vectors per streaming batch.
+            show_progress: If True, display a tqdm progress bar. Requires
+                tqdm to be installed.
             batch_lock_size: Vectors per lock acquisition (server default=1,
                 max=10000). Higher values reduce lock overhead.
             defer_graph: If True, skip graph computation during insert.
@@ -671,6 +769,8 @@ class AsyncVectorAPI:
                 insert for faster ingestion.
             parallel_build: If True, use parallel HNSW construction
                 (only effective with ``index_mode="deferred"``).
+            retry_on_failure: If False, disable retries for this call
+                to avoid duplicate data on partial failures.
 
         Returns:
             A BulkInsertResult with inserted_count and any errors.
@@ -678,6 +778,7 @@ class AsyncVectorAPI:
         Raises:
             ValueError: If metadata_list or ids length doesn't match vectors,
                 or if index_mode is not a valid value.
+            ImportError: If show_progress is True but tqdm is not installed.
         """
         total = len(vectors)
 
@@ -705,6 +806,12 @@ class AsyncVectorAPI:
                 "parallel_build=True requires index_mode='deferred'"
             )
 
+        if show_progress and tqdm is None:
+            raise ImportError(
+                "tqdm is required for progress bars. "
+                "Install it with: pip install tqdm"
+            )
+
         # Build options to determine which RPC to use
         options = BulkInsertOptions(
             batch_lock_size=batch_lock_size,
@@ -718,8 +825,18 @@ class AsyncVectorAPI:
         use_optimized_rpc = options.has_non_defaults()
 
         async def _request_iterator() -> AsyncIterator[vector_pb2.InsertRequest]:
-            """Yield InsertRequest messages asynchronously."""
-            for i in range(total):
+            """Yield InsertRequest messages, optionally with progress."""
+            iterator = range(total)
+
+            if show_progress and tqdm is not None:
+                iterator = tqdm(
+                    iterator,
+                    total=total,
+                    desc="Bulk inserting vectors",
+                    unit="vec",
+                )
+
+            for i in iterator:
                 req = vector_pb2.InsertRequest(
                     collection=collection,
                     vector=_to_proto_vector(vectors[i]),
@@ -756,11 +873,12 @@ class AsyncVectorAPI:
 
         # BulkInsert is stream_unary: stream requests, get one response.
         # Cannot use _call (unary-unary), so call stub directly with retry.
-        metadata = self._client._metadata()
         call_timeout = self._client._timeout
         last_error: Optional[grpc.RpcError] = None
+        max_attempts = (self._client._max_retries + 1) if retry_on_failure else 1
+        retry_start = time.monotonic()
 
-        for attempt in range(self._client._max_retries + 1):
+        for attempt in range(max_attempts):
             try:
                 if use_optimized_rpc:
                     logger.info(
@@ -779,13 +897,11 @@ class AsyncVectorAPI:
                     response = await self._client._vector_stub.BulkInsertWithOptions(
                         _options_request_iterator(),
                         timeout=call_timeout,
-                        metadata=metadata,
                     )
                 else:
                     response = await self._client._vector_stub.BulkInsert(
                         _request_iterator(),
                         timeout=call_timeout,
-                        metadata=metadata,
                     )
                 return BulkInsertResult(
                     inserted_count=response.inserted_count,
@@ -795,8 +911,11 @@ class AsyncVectorAPI:
                 last_error = exc
                 code = exc.code()
 
-                if code in _RETRYABLE_CODES and attempt < self._client._max_retries:
-                    delay = self._client._retry_delay * (2 ** attempt)
+                if code in _RETRYABLE_CODES and attempt < max_attempts - 1:
+                    elapsed = time.monotonic() - retry_start
+                    if elapsed >= self._client._total_retry_timeout:
+                        raise self._client._translate_error(exc) from exc
+                    delay = self._client._retry_delay * (2 ** attempt) + random.uniform(0, self._client._retry_delay)
                     logger.debug(
                         "Retrying async BulkInsert (attempt %d/%d) after %s, "
                         "backoff %.2fs",
@@ -865,6 +984,7 @@ class AsyncSearchAPI:
                 f"Invalid search strategy {strategy!r}. "
                 f"Must be one of: {', '.join(sorted(_VALID_STRATEGIES))}"
             )
+        _validate_vector(vector, "query vector")
 
         request = search_pb2.SearchRequest(
             collection=collection,
@@ -934,6 +1054,8 @@ class AsyncSearchAPI:
                 f"Invalid search strategy {strategy!r}. "
                 f"Must be one of: {', '.join(sorted(_VALID_STRATEGIES))}"
             )
+        for i, qv in enumerate(queries):
+            _validate_vector(qv, f"query vector [{i}]")
 
         proto_filter = filter._to_proto() if filter is not None else None
 
@@ -1168,6 +1290,7 @@ class AsyncMathAPI:
             GhostVector(
                 id=g.id,
                 isolation_score=g.isolation_score,
+                compute_time_us=response.compute_time_us,
             )
             for g in response.ghosts
         ]
@@ -1192,6 +1315,7 @@ class AsyncMathAPI:
             CollectionNotFoundError: If the collection does not exist.
             MathError: If the operation fails.
         """
+        _validate_vector(direction, "direction vector")
         request = vector_math_pb2.ConeSearchRequest(
             collection=collection,
             direction=_to_proto_vector(direction),
@@ -1205,6 +1329,7 @@ class AsyncMathAPI:
                 id=r.id,
                 cosine_similarity=r.cosine_similarity,
                 angle_radians=r.angle_radians,
+                compute_time_us=response.compute_time_us,
             )
             for r in response.results
         ]
@@ -1263,6 +1388,8 @@ class AsyncMathAPI:
         Raises:
             MathError: If the operation fails.
         """
+        _validate_vector(a, "vector a")
+        _validate_vector(b, "vector b")
         request = vector_math_pb2.InterpolateRequest(
             a=_to_proto_vector(a),
             b=_to_proto_vector(b),
@@ -1297,6 +1424,8 @@ class AsyncMathAPI:
         Raises:
             MathError: If the operation fails.
         """
+        _validate_vector(a, "vector a")
+        _validate_vector(b, "vector b")
         request = vector_math_pb2.InterpolateRequest(
             a=_to_proto_vector(a),
             b=_to_proto_vector(b),
@@ -1351,6 +1480,7 @@ class AsyncMathAPI:
             mean_distance_window2=response.mean_distance_window2,
             spread_change=response.spread_change,
             has_drifted=response.has_drifted,
+            compute_time_us=response.compute_time_us,
         )
 
     async def cluster(
@@ -1401,6 +1531,7 @@ class AsyncMathAPI:
             ],
             iterations=response.iterations,
             converged=response.converged,
+            compute_time_us=response.compute_time_us,
         )
 
     async def reduce_dimensions(
@@ -1439,6 +1570,7 @@ class AsyncMathAPI:
             explained_variance=list(response.explained_variance),
             mean=list(response.mean.values),
             projected=[list(p.values) for p in response.projected],
+            compute_time_us=response.compute_time_us,
         )
 
     async def analogy(
@@ -1463,6 +1595,9 @@ class AsyncMathAPI:
         Raises:
             MathError: If the operation fails.
         """
+        _validate_vector(a, "vector a")
+        _validate_vector(b, "vector b")
+        _validate_vector(c, "vector c")
         request = vector_math_pb2.ComputeAnalogyRequest(
             a=_to_proto_vector(a),
             b=_to_proto_vector(b),
@@ -1554,6 +1689,7 @@ class AsyncMathAPI:
             CollectionNotFoundError: If the collection does not exist.
             MathError: If the operation fails.
         """
+        _validate_vector(query, "query vector")
         request = vector_math_pb2.DiversitySampleRequest(
             collection=collection,
             query=_to_proto_vector(query),
@@ -1569,6 +1705,7 @@ class AsyncMathAPI:
                 id=r.id,
                 relevance_score=r.relevance_score,
                 mmr_score=r.mmr_score,
+                compute_time_us=response.compute_time_us,
             )
             for r in response.results
         ]

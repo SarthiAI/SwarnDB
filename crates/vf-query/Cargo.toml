@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 roaring = { workspace = true }
 rayon = { workspace = true }
 rand = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

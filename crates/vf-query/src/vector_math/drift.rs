@@ -20,13 +20,14 @@ impl DriftDetector {
     }
 
     /// Compare two sets of vectors for distribution drift.
+    /// Returns None if either window is empty or if vectors have mismatched dimensions.
     pub fn detect(&self, window1: &[&[f32]], window2: &[&[f32]]) -> Option<DriftReport> {
         if window1.is_empty() || window2.is_empty() {
             return None;
         }
 
-        let centroid1 = compute_centroid(window1);
-        let centroid2 = compute_centroid(window2);
+        let centroid1 = compute_centroid(window1)?;
+        let centroid2 = compute_centroid(window2)?;
 
         let centroid_shift = self.distance_fn.compute(&centroid1, &centroid2);
 
@@ -70,12 +71,18 @@ impl DriftDetector {
     }
 }
 
-fn compute_centroid(vectors: &[&[f32]]) -> Vec<f32> {
-    debug_assert!(
-        !vectors.is_empty(),
-        "compute_centroid called with empty input"
-    );
+fn compute_centroid(vectors: &[&[f32]]) -> Option<Vec<f32>> {
+    if vectors.is_empty() {
+        return None;
+    }
     let dim = vectors[0].len();
+    if dim == 0 {
+        return None;
+    }
+    // Check all vectors have the same dimension
+    if vectors.iter().any(|v| v.len() != dim) {
+        return None;
+    }
     let n = vectors.len() as f32;
     let mut centroid = vec![0.0f32; dim];
     for v in vectors {
@@ -86,7 +93,7 @@ fn compute_centroid(vectors: &[&[f32]]) -> Vec<f32> {
     for c in &mut centroid {
         *c /= n;
     }
-    centroid
+    Some(centroid)
 }
 
 #[cfg(test)]

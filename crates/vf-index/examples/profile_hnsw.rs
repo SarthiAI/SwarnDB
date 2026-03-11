@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Profiling binary for HNSW index.
 //!
@@ -29,7 +28,7 @@ fn generate_random_vector(rng: &mut StdRng, dim: usize) -> Vec<f32> {
 fn main() {
     let mut rng = StdRng::seed_from_u64(42);
 
-    let params = HnswParams::new(16, 200, 50);
+    let params = HnswParams::new(16, 200, 50, 100_000, 24).expect("valid HNSW params");
     let index = HnswIndex::new(DIMENSION, DistanceMetricType::Euclidean, params);
 
     // --- Insert phase ---

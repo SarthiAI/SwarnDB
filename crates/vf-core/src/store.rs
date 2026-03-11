@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use crate::types::{Metadata, VectorId};
 use crate::vector::VectorData;
@@ -295,7 +294,16 @@ impl InMemoryVectorStore {
     }
 
     /// Bulk insert multiple vectors. Stops on first error.
-    /// Note: This is NOT transactional — records inserted before an error remain in the store.
+    ///
+    /// **Non-transactional:** If insertion fails mid-batch (e.g., due to a
+    /// duplicate ID or dimension mismatch), records successfully inserted
+    /// before the error remain in the store and are NOT rolled back.
+    ///
+    /// This is acceptable for in-memory usage because:
+    /// 1. The store is a memtable layer flushed to durable segments separately.
+    /// 2. Callers can validate inputs (dimensions, uniqueness) before batching.
+    /// 3. Partial insertion is recoverable — the caller knows which ID failed
+    ///    and can retry or compensate.
     pub fn insert_batch(
         &self,
         records: Vec<VectorRecord>,

@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Inverted File Index (IVF) for coarse-grained partitioning of vector space.
 //!
@@ -45,11 +44,11 @@ impl IvfIndex {
     ///
     /// # Arguments
     /// * `dimension` — dimensionality of vectors
-    /// * `num_partitions` — number of Voronoi cells (nlist). Must be 1..=256.
+    /// * `num_partitions` — number of Voronoi cells (nlist). Must be >= 1.
     pub fn new(dimension: usize, num_partitions: usize) -> Result<Self, QuantizationError> {
-        if num_partitions == 0 || num_partitions > 256 {
+        if num_partitions == 0 {
             return Err(QuantizationError::InvalidParameter(format!(
-                "num_partitions must be 1..=256, got {}",
+                "num_partitions must be >= 1, got {}",
                 num_partitions
             )));
         }
@@ -81,7 +80,7 @@ impl IvfIndex {
                 });
             }
         }
-        let result = kmeans::kmeans(vectors, self.num_partitions, max_iters, 42);
+        let result = kmeans::kmeans(vectors, self.num_partitions, max_iters, 42)?;
 
         self.centroids = result.centroids;
         self.inverted_lists = vec![Vec::new(); self.num_partitions];

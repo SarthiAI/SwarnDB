@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Flat (contiguous) adjacency list for cache-friendly HNSW graph traversal.
 //!
@@ -10,6 +9,7 @@
 //! Accessing neighbors for a node at a given layer is a simple slice operation.
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use log;
 use vf_core::types::VectorId;
 
@@ -143,12 +143,19 @@ impl FlatAdjacencyList {
     ///
     /// The neighbors are appended to the end of the contiguous buffer.
     pub fn insert_node(&mut self, id: VectorId, neighbors_per_layer: &[&[VectorId]]) {
-        let offset = self.data.len() as u32;
-        let num_layers = neighbors_per_layer.len() as u8;
+        let offset = u32::try_from(self.data.len()).expect(
+            "FlatAdjacencyList: data buffer offset exceeds u32::MAX"
+        );
+        let num_layers = u8::try_from(neighbors_per_layer.len()).expect(
+            "FlatAdjacencyList: number of layers exceeds u8::MAX (255)"
+        );
         let mut layer_sizes = Vec::with_capacity(neighbors_per_layer.len());
 
         for layer_neighbors in neighbors_per_layer {
-            layer_sizes.push(layer_neighbors.len() as u16);
+            let size = u16::try_from(layer_neighbors.len()).expect(
+                "FlatAdjacencyList: layer neighbor count exceeds u16::MAX (65535)"
+            );
+            layer_sizes.push(size);
             self.data.extend_from_slice(layer_neighbors);
         }
 
@@ -247,16 +254,23 @@ impl FlatAdjacencyList {
         self.wasted_slots += old_total;
 
         // Re-append at end of buffer.
-        let new_offset = self.data.len() as u32;
+        let new_offset = u32::try_from(self.data.len()).expect(
+            "FlatAdjacencyList: data buffer offset exceeds u32::MAX"
+        );
         let mut new_layer_sizes = Vec::with_capacity(num_layers);
         for layer_data in &all_layers {
-            new_layer_sizes.push(layer_data.len() as u16);
+            let size = u16::try_from(layer_data.len()).expect(
+                "FlatAdjacencyList: layer neighbor count exceeds u16::MAX (65535)"
+            );
+            new_layer_sizes.push(size);
             self.data.extend_from_slice(layer_data);
         }
 
         let layout = self.index.get_mut(&id).unwrap();
         layout.offset = new_offset;
         layout.layer_sizes = new_layer_sizes;
+
+        self.maybe_compact();
 
         true
     }
@@ -370,7 +384,9 @@ impl FlatAdjacencyList {
             let old_start = layout.offset as usize;
             let total = layout.total_size() as usize;
 
-            let new_offset = new_data.len() as u32;
+            let new_offset = u32::try_from(new_data.len()).expect(
+                "FlatAdjacencyList::compact: data buffer offset exceeds u32::MAX"
+            );
             new_data.extend_from_slice(&self.data[old_start..old_start + total]);
             layout.offset = new_offset;
         }

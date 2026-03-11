@@ -1,11 +1,12 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tonic::{Request, Response, Status};
+
+// Compute timeout is now read from AppState (config.compute_timeout_secs).
 
 use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{DistanceMetricType, VectorId};
@@ -65,41 +66,49 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        let (owned_vectors, centroids_input, metric_str, threshold, auto_k) = {
+            let collections = self.state.collections.read();
+            let collection = collections
+                .get(&req.collection)
+                .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
 
-        let owned_vectors = get_vectors_from_store(&collection.store, &[]);
-        let vectors: Vec<(VectorId, &[f32])> = owned_vectors
-            .iter()
-            .map(|(id, v)| (*id, v.as_slice()))
-            .collect();
-
-        let centroids: Vec<Vec<f32>> = if req.centroids.is_empty() {
-            // Auto-cluster to get centroids
-            let auto_k = if req.auto_k == 0 { 8 } else { req.auto_k as usize };
-            let metric = resolve_metric(&req.metric);
-            let config = KMeansConfig {
-                k: auto_k,
-                metric,
-                ..Default::default()
-            };
-            let km = KMeans::new(config);
-            let result = km.cluster(&vectors);
-            result.centroids
-        } else {
-            req.centroids.iter().map(proto_to_vec).collect()
+            let owned_vectors = get_vectors_from_store(&collection.store, &[]);
+            let centroids_input: Vec<Vec<f32>> = req.centroids.iter().map(proto_to_vec).collect();
+            let metric_str = req.metric.clone();
+            let threshold = req.threshold;
+            let auto_k = req.auto_k;
+            (owned_vectors, centroids_input, metric_str, threshold, auto_k)
         };
 
-        let metric = resolve_metric(&req.metric);
-        let detector = GhostDetector::new(req.threshold, metric);
-        let ghosts = detector.detect(&vectors, &centroids);
+        let result = tokio::time::timeout(
+            Duration::from_secs(self.state.compute_timeout_secs),
+            tokio::task::spawn_blocking(move || {
+                let vectors: Vec<(VectorId, &[f32])> = owned_vectors
+                    .iter()
+                    .map(|(id, v)| (*id, v.as_slice()))
+                    .collect();
+
+                let centroids: Vec<Vec<f32>> = if centroids_input.is_empty() {
+                    let k = if auto_k == 0 { 8 } else { auto_k as usize };
+                    let metric = resolve_metric(&metric_str);
+                    let config = KMeansConfig { k, metric, ..Default::default() };
+                    KMeans::new(config).cluster(&vectors).centroids
+                } else {
+                    centroids_input
+                };
+
+                let metric = resolve_metric(&metric_str);
+                let detector = GhostDetector::new(threshold, metric);
+                detector.detect(&vectors, &centroids)
+            })
+        ).await
+            .map_err(|_| Status::deadline_exceeded("compute timeout exceeded"))?
+            .map_err(|_| Status::internal("internal error"))?;
 
         let compute_time_us = timer.elapsed().as_micros() as u64;
 
         Ok(Response::new(proto::DetectGhostsResponse {
-            ghosts: ghosts
+            ghosts: result
                 .into_iter()
                 .map(|g| proto::GhostVector {
                     id: g.id,
@@ -283,27 +292,41 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        let (owned_vectors, metric_str, k, max_iterations, tolerance) = {
+            let collections = self.state.collections.read();
+            let collection = collections
+                .get(&req.collection)
+                .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
 
-        let owned_vectors = get_vectors_from_store(&collection.store, &[]);
-        let vectors: Vec<(VectorId, &[f32])> = owned_vectors
-            .iter()
-            .map(|(id, v)| (*id, v.as_slice()))
-            .collect();
-
-        let metric = resolve_metric(&req.metric);
-        let config = KMeansConfig {
-            k: req.k as usize,
-            max_iterations: if req.max_iterations == 0 { 100 } else { req.max_iterations as usize },
-            tolerance: if req.tolerance == 0.0 { 1e-4 } else { req.tolerance },
-            metric,
+            let owned_vectors = get_vectors_from_store(&collection.store, &[]);
+            let metric_str = req.metric.clone();
+            let k = req.k;
+            let max_iterations = req.max_iterations;
+            let tolerance = req.tolerance;
+            (owned_vectors, metric_str, k, max_iterations, tolerance)
         };
 
-        let km = KMeans::new(config);
-        let result = km.cluster(&vectors);
+        let result = tokio::time::timeout(
+            Duration::from_secs(self.state.compute_timeout_secs),
+            tokio::task::spawn_blocking(move || {
+                let vectors: Vec<(VectorId, &[f32])> = owned_vectors
+                    .iter()
+                    .map(|(id, v)| (*id, v.as_slice()))
+                    .collect();
+
+                let metric = resolve_metric(&metric_str);
+                let config = KMeansConfig {
+                    k: k as usize,
+                    max_iterations: if max_iterations == 0 { 100 } else { max_iterations as usize },
+                    tolerance: if tolerance == 0.0 { 1e-4 } else { tolerance },
+                    metric,
+                };
+
+                KMeans::new(config).cluster(&vectors)
+            })
+        ).await
+            .map_err(|_| Status::deadline_exceeded("compute timeout exceeded"))?
+            .map_err(|_| Status::internal("internal error"))?;
 
         let compute_time_us = timer.elapsed().as_micros() as u64;
 
@@ -450,7 +473,7 @@ impl VectorMathService for VectorMathServiceImpl {
         let k = req.k as usize;
         let lambda = req.lambda;
 
-        let results = DiversitySampler::mmr(&query, &candidates, k, lambda);
+        let results = DiversitySampler::mmr(&query, &candidates, k, lambda, None);
 
         let compute_time_us = timer.elapsed().as_micros() as u64;
 

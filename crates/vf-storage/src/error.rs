@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use thiserror::Error;
 
@@ -67,6 +66,26 @@ pub enum StorageError {
     /// Dropping a collection failed.
     #[error("collection drop failed: {0}")]
     CollectionDropFailed(String),
+
+    /// Collection name contains invalid characters.
+    #[error("invalid collection name: {0}")]
+    InvalidCollectionName(String),
+
+    /// Path escapes the expected data directory (symlink or traversal).
+    #[error("path traversal detected: {0}")]
+    PathTraversal(String),
+
+    /// WAL entry exceeds maximum allowed size.
+    #[error("WAL entry too large: {size} bytes (max {max})")]
+    WalEntryTooLarge { size: usize, max: usize },
+
+    /// Payload length overflows the wire format.
+    #[error("WAL payload too large: {0} bytes exceeds u32 wire format")]
+    WalPayloadOverflow(usize),
+
+    /// File is locked by another process.
+    #[error("file locked by another process: {0}")]
+    FileLocked(String),
 
     // ── Serialization ───────────────────────────────────────────────────
     /// Serialization / deserialization failure (e.g. bincode).

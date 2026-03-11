@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Quantization benchmark suite: encode/decode throughput, distance computation,
 //! and memory comparison across SQ, PQ, and BQ quantizers.
@@ -170,7 +169,7 @@ fn bench_distance_computation(c: &mut Criterion) {
                             black_box(&a_q),
                             black_box(&b_q),
                             &sq,
-                        ));
+                        ).unwrap());
                     });
                 },
             );
@@ -208,12 +207,12 @@ fn bench_distance_computation(c: &mut Criterion) {
                 BenchmarkId::new("pq_table_build", format!("{}d_M{}", dim, m)),
                 |bench| {
                     bench.iter(|| {
-                        black_box(PqDistanceTable::build_euclidean(black_box(query), &pq));
+                        black_box(PqDistanceTable::build_euclidean(black_box(query), &pq).unwrap());
                     });
                 },
             );
 
-            let table = PqDistanceTable::build_euclidean(query, &pq);
+            let table = PqDistanceTable::build_euclidean(query, &pq).unwrap();
             group.bench_function(
                 BenchmarkId::new("pq_table_lookup", format!("{}d_M{}", dim, m)),
                 |bench| {

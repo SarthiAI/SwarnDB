@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use serde::{Deserialize, Serialize};
 use vf_core::types::MetadataValue;
@@ -63,8 +62,50 @@ impl FilterExpression {
         FilterExpression::Lte(field.into(), value)
     }
 
+    /// Maximum number of values allowed in an In filter to prevent unbounded memory usage.
+    /// Raised to 1M to support tag-based filtering with large category sets.
+    pub const MAX_IN_VALUES: usize = 1_000_000;
+
     pub fn r#in(field: impl Into<String>, values: Vec<MetadataValue>) -> Self {
         FilterExpression::In(field.into(), values)
+    }
+
+    /// Validate the filter expression, returning an error if limits are exceeded.
+    pub fn validate(&self) -> Result<(), QueryError> {
+        self.validate_inner(0)
+    }
+
+    /// Maximum nesting depth for filter expressions.
+    const MAX_NESTING_DEPTH: usize = 32;
+
+    fn validate_inner(&self, depth: usize) -> Result<(), QueryError> {
+        if depth > Self::MAX_NESTING_DEPTH {
+            return Err(QueryError::Internal(format!(
+                "filter nesting depth exceeds maximum of {}",
+                Self::MAX_NESTING_DEPTH
+            )));
+        }
+        match self {
+            FilterExpression::And(children) | FilterExpression::Or(children) => {
+                for child in children {
+                    child.validate_inner(depth + 1)?;
+                }
+            }
+            FilterExpression::Not(child) => {
+                child.validate_inner(depth + 1)?;
+            }
+            FilterExpression::In(_, values) => {
+                if values.len() > Self::MAX_IN_VALUES {
+                    return Err(QueryError::Internal(format!(
+                        "In filter has {} values, maximum is {}",
+                        values.len(),
+                        Self::MAX_IN_VALUES
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn between(field: impl Into<String>, low: MetadataValue, high: MetadataValue) -> Self {

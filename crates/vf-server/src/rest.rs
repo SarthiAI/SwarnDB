@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -28,8 +27,8 @@ use crate::metrics;
 use crate::state::{AppState, CollectionState, CollectionStatus, MetadataCache};
 use crate::validation::{
     validate_batch_lock_size, validate_bulk_insert_options, validate_collection_name,
-    validate_ef_construction, validate_ef_search, validate_index_mode, validate_wal_flush_every,
-    ValidationConfig,
+    validate_ef_construction, validate_ef_search, validate_index_mode, validate_vector_data,
+    validate_wal_flush_every, ValidationConfig,
 };
 
 // ── Error handling ──────────────────────────────────────────────────────
@@ -365,6 +364,9 @@ async fn create_collection(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unknown distance metric: {}", req.distance_metric)))?;
 
     let dimension = req.dimension as usize;
+    if req.default_threshold < 0.0 || req.default_threshold > 1.0 {
+        return Err(err(StatusCode::BAD_REQUEST, "default_threshold must be between 0.0 and 1.0"));
+    }
     let threshold = if req.default_threshold > 0.0 { Some(req.default_threshold) } else { None };
 
     let config = CollectionConfig {
@@ -374,35 +376,36 @@ async fn create_collection(
         default_similarity_threshold: threshold,
         max_vectors: req.max_vectors as usize,
         data_type: DataTypeConfig::F32,
+        ..CollectionConfig::default()
     };
 
     let store = InMemoryVectorStore::new(dimension);
-    let index = vf_index::hnsw::HnswIndex::with_defaults(dimension, distance_metric);
+    let mut hnsw_params = vf_index::hnsw::HnswParams::default();
+    hnsw_params.max_ef = state.max_ef;
+    let index = vf_index::hnsw::HnswIndex::new(dimension, distance_metric, hnsw_params);
     let index_manager = IndexManager::with_defaults();
     let graph = match threshold {
         Some(t) => vf_graph::VirtualGraph::with_threshold(t, distance_metric),
         None => vf_graph::VirtualGraph::with_threshold(0.7, distance_metric),
     };
 
-    // Check for duplicate in-memory BEFORE persisting to storage
-    {
-        let collections = state.collections.read();
-        if collections.contains_key(&req.name) {
-            return Err(err(StatusCode::CONFLICT, format!("collection '{}' already exists", req.name)));
-        }
+    // Atomic check-and-create under a single write lock to prevent TOCTOU race
+    let mut collections = state.collections.write();
+    if collections.contains_key(&req.name) {
+        return Err(err(StatusCode::CONFLICT, format!("collection '{}' already exists", req.name)));
     }
 
     // Persist to storage layer
     {
         let mut cm = state.collection_manager.write();
-        if let Err(e) = cm.create_collection(config.clone()) {
-            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("storage create failed: {}", e)));
+        if let Err(_e) = cm.create_collection(config.clone()) {
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "storage create failed"));
         }
     }
 
     let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new(), status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)), deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) };
 
-    let mut collections = state.collections.write();
+    tracing::info!(collection = %req.name, "collection created");
     collections.insert(req.name.clone(), collection_state);
 
     Ok(Json(CreateCollectionRes { name: req.name, success: true }))
@@ -413,7 +416,7 @@ async fn list_collections(
 ) -> Json<ListCollectionsRes> {
     let collections = state.collections.read();
     let list = collections.values().map(|c| {
-        let status_str = c.status.read().unwrap().as_str().to_string();
+        let status_str = c.status.read().map(|s| s.as_str().to_string()).unwrap_or_else(|_| "unknown".to_string());
         CollectionInfo {
             name: c.config.name.clone(),
             dimension: c.config.dimension as u32,
@@ -433,7 +436,7 @@ async fn get_collection(
     let collections = state.collections.read();
     let c = collections.get(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", name)))?;
-    let status_str = c.status.read().unwrap().as_str().to_string();
+    let status_str = c.status.read().map(|s| s.as_str().to_string()).unwrap_or_else(|_| "unknown".to_string());
     Ok(Json(CollectionInfo {
         name: c.config.name.clone(),
         dimension: c.config.dimension as u32,
@@ -460,6 +463,7 @@ async fn delete_collection(
     if collections.remove(&name).is_none() {
         return Err(err(StatusCode::NOT_FOUND, format!("collection '{}' not found", name)));
     }
+    tracing::warn!(collection = %name, "collection deleted");
     Ok(Json(DeleteCollectionRes { success: true }))
 }
 
@@ -482,26 +486,35 @@ async fn insert_vector(
     let coll = collections.get_mut(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    if req.values.len() != coll.config.dimension {
-        return Err(err(StatusCode::BAD_REQUEST, format!("vector dimension mismatch: expected {}, got {}", coll.config.dimension, req.values.len())));
+    if let Err(e) = validate_vector_data(&req.values, coll.config.dimension) {
+        return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
     }
 
     let vector_data = VectorData::F32(req.values.clone());
 
     let assigned_id = if req.id == 0 {
         coll.store.insert_auto_id(vector_data, core_metadata.clone())
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("store insert failed: {}", e)))?
+            .map_err(|e| {
+                tracing::error!("store insert failed: {}", e);
+                err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?
     } else {
         let record = VectorRecord::new(req.id, vector_data, core_metadata.clone());
         coll.store.insert(record)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("store insert failed: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!("store insert failed: {}", e);
+                err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
         req.id
     };
 
     if let Err(e) = coll.index.add(assigned_id, &req.values) {
         // Rollback: remove from store since index add failed
         let _ = coll.store.delete(assigned_id);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("index insert failed: {}", e)));
+        return Err({
+                tracing::error!("index insert failed: {}", e);
+                err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            });
     }
 
     if let Some(ref meta) = core_metadata {
@@ -509,8 +522,9 @@ async fn insert_vector(
     }
 
     // Compute virtual graph edges for the newly inserted vector
+    let graph_k = coll.graph.config().graph_neighbors_k;
     if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-        &mut coll.graph, &coll.index, assigned_id, &req.values, 10,
+        &mut coll.graph, &coll.index, assigned_id, &req.values, graph_k,
     ) {
         tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
     }
@@ -572,8 +586,8 @@ async fn update_vector(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
     if let Some(ref v) = req.values {
-        if v.len() != coll.config.dimension {
-            return Err(err(StatusCode::BAD_REQUEST, format!("vector dimension mismatch: expected {}, got {}", coll.config.dimension, v.len())));
+        if let Err(e) = validate_vector_data(v, coll.config.dimension) {
+            return Err(err(StatusCode::BAD_REQUEST, e.to_string()));
         }
     }
 
@@ -585,7 +599,10 @@ async fn update_vector(
     if let Some(ref values) = req.values {
         let _ = coll.index.remove(id);
         coll.index.add(id, values)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("index update failed: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!("index update failed: {}", e);
+                err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
     }
 
     // Update metadata index if metadata was provided
@@ -749,11 +766,8 @@ async fn bulk_insert(
             };
 
             for pv in chunk {
-                if pv.values.len() != coll.config.dimension {
-                    errors.push(format!(
-                        "item {}: vector dimension mismatch: expected {}, got {}",
-                        pv.index, coll.config.dimension, pv.values.len()
-                    ));
+                if let Err(e) = validate_vector_data(&pv.values, coll.config.dimension) {
+                    errors.push(format!("item {}: {}", pv.index, e));
                     continue;
                 }
 
@@ -796,8 +810,9 @@ async fn bulk_insert(
 
                 // Graph: compute per-vector only if not deferred
                 if !defer_graph {
+                    let graph_k = coll.graph.config().graph_neighbors_k;
                     if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-                        &mut coll.graph, &coll.index, assigned_id, &pv.values, 10,
+                        &mut coll.graph, &coll.index, assigned_id, &pv.values, graph_k,
                     ) {
                         tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
                     }
@@ -845,8 +860,9 @@ async fn bulk_insert(
     if !defer_graph && !inserted_ids.is_empty() {
         let mut collections = state.collections.write();
         if let Some(coll) = collections.get_mut(&collection) {
+            let graph_k = coll.graph.config().graph_neighbors_k;
             if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                &mut coll.graph, &coll.index, &inserted_ids, &inserted_vectors, 10,
+                &mut coll.graph, &coll.index, &inserted_ids, &inserted_vectors, graph_k,
             ) {
                 tracing::warn!(collection = %collection, "graph compute_batch after bulk_insert failed: {}", e);
             }
@@ -916,6 +932,9 @@ async fn search(
 
     if req.query.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "query vector is required"));
+    }
+    if req.k < 1 || req.k > state.max_k {
+        return Err(err(StatusCode::BAD_REQUEST, format!("k must be between 1 and {}", state.max_k)));
     }
 
     let filter = req.filter.as_ref().map(convert_json_filter)
@@ -1139,12 +1158,13 @@ async fn traverse(
 
     let threshold = req.threshold.filter(|&t| t > 0.0);
     let max_results = req.max_results.filter(|&m| m > 0).map(|m| m as usize);
+    let depth = (req.depth as usize).min(100);
 
     let traversal_results = GraphTraversal::traverse(
         &coll.graph,
         req.start_id,
         &TraversalOrder::BreadthFirst,
-        req.depth as usize,
+        depth,
         threshold,
         max_results,
     ).map_err(|e| {
@@ -1171,12 +1191,17 @@ async fn set_threshold(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<SetThresholdReq>,
 ) -> Result<Json<SetThresholdRes>, (StatusCode, Json<ErrorResponse>)> {
+    if req.threshold <= 0.0 || req.threshold > 1.0 {
+        return Err(err(StatusCode::BAD_REQUEST, "threshold must be >0.0 and <=1.0"));
+    }
+
     let mut collections = state.collections.write();
     let coll = collections.get_mut(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
     if req.vector_id == 0 {
         coll.graph.config_mut().default_threshold = req.threshold;
+        coll.config.default_similarity_threshold = Some(req.threshold);
         coll.deferred_graph.store(true, Ordering::Release);
     } else {
         coll.graph.set_vector_threshold(req.vector_id, req.threshold);
@@ -1528,6 +1553,8 @@ struct DiversitySampleResultRes { id: u64, relevance_score: f32, mmr_score: f32 
 #[derive(Serialize)]
 struct DiversitySampleRes { results: Vec<DiversitySampleResultRes>, compute_time_us: u64 }
 
+// Compute timeout is now read from AppState (config.compute_timeout_secs).
+
 // ── Vector Math handlers ────────────────────────────────────────────────
 
 async fn detect_ghosts(
@@ -1535,44 +1562,54 @@ async fn detect_ghosts(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<DetectGhostsReq>,
 ) -> Result<Json<DetectGhostsRes>, (StatusCode, Json<ErrorResponse>)> {
-    let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
-
-    let owned_vectors = get_vectors_from_collection(&coll.store, &[]);
-    let vectors: Vec<(VectorId, &[f32])> = owned_vectors
-        .iter()
-        .map(|(id, v)| (*id, v.as_slice()))
-        .collect();
-
-    let centroids: Vec<Vec<f32>> = match req.centroids {
-        Some(ref c) if !c.is_empty() => c.clone(),
-        _ => {
-            let auto_k = if req.auto_k == 0 { 8 } else { req.auto_k as usize };
-            let metric = resolve_metric(&req.metric);
-            let config = KMeansConfig {
-                k: auto_k,
-                metric,
-                ..Default::default()
-            };
-            let km = KMeans::new(config);
-            let result = km.cluster(&vectors);
-            result.centroids
-        }
+    // Extract data while holding the read lock, then release before CPU work
+    let owned_vectors = {
+        let collections = state.collections.read();
+        let coll = collections.get(&collection)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+        get_vectors_from_collection(&coll.store, &[])
     };
 
-    let metric = resolve_metric(&req.metric);
-    let detector = GhostDetector::new(req.threshold, metric);
-    let ghosts = detector.detect(&vectors, &centroids);
+    let threshold = req.threshold;
+    let centroids_input = req.centroids;
+    let auto_k = req.auto_k;
+    let metric_str = req.metric;
+    let timeout_secs = state.compute_timeout_secs;
 
-    Ok(Json(DetectGhostsRes {
-        ghosts: ghosts.into_iter().map(|g| GhostVectorRes {
-            id: g.id,
-            isolation_score: g.isolation_score,
-        }).collect(),
-        compute_time_us: timer.elapsed().as_micros() as u64,
-    }))
+    let compute = tokio::task::spawn_blocking(move || {
+        let timer = Instant::now();
+        let vectors: Vec<(VectorId, &[f32])> = owned_vectors
+            .iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+
+        let centroids: Vec<Vec<f32>> = match centroids_input {
+            Some(ref c) if !c.is_empty() => c.clone(),
+            _ => {
+                let k = if auto_k == 0 { 8 } else { auto_k as usize };
+                let metric = resolve_metric(&metric_str);
+                let config = KMeansConfig { k, metric, ..Default::default() };
+                KMeans::new(config).cluster(&vectors).centroids
+            }
+        };
+
+        let metric = resolve_metric(&metric_str);
+        let detector = GhostDetector::new(threshold, metric);
+        let ghosts = detector.detect(&vectors, &centroids);
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(Json(DetectGhostsRes {
+            ghosts: ghosts.into_iter().map(|g| GhostVectorRes {
+                id: g.id,
+                isolation_score: g.isolation_score,
+            }).collect(),
+            compute_time_us: timer.elapsed().as_micros() as u64,
+        }))
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), compute)
+        .await
+        .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "compute timeout exceeded"))?
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "compute task failed"))?
 }
 
 async fn cone_search(
@@ -1580,31 +1617,40 @@ async fn cone_search(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ConeSearchReq>,
 ) -> Result<Json<ConeSearchRes>, (StatusCode, Json<ErrorResponse>)> {
-    let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
-
     if req.direction.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "direction vector is required"));
     }
 
-    let owned_vectors = get_vectors_from_collection(&coll.store, &[]);
-    let vectors: Vec<(VectorId, &[f32])> = owned_vectors
-        .iter()
-        .map(|(id, v)| (*id, v.as_slice()))
-        .collect();
+    let owned_vectors = {
+        let collections = state.collections.read();
+        let coll = collections.get(&collection)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+        get_vectors_from_collection(&coll.store, &[])
+    };
 
-    let results = ConeSearch::search(&req.direction, req.aperture_radians, &vectors);
+    let direction = req.direction;
+    let aperture = req.aperture_radians;
 
-    Ok(Json(ConeSearchRes {
-        results: results.into_iter().map(|r| ConeSearchResultRes {
-            id: r.id,
-            cosine_similarity: r.cosine_similarity,
-            angle_radians: r.angle_radians,
-        }).collect(),
-        compute_time_us: timer.elapsed().as_micros() as u64,
-    }))
+    tokio::task::spawn_blocking(move || {
+        let timer = Instant::now();
+        let vectors: Vec<(VectorId, &[f32])> = owned_vectors
+            .iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+
+        let results = ConeSearch::search(&direction, aperture, &vectors);
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(Json(ConeSearchRes {
+            results: results.into_iter().map(|r| ConeSearchResultRes {
+                id: r.id,
+                cosine_similarity: r.cosine_similarity,
+                angle_radians: r.angle_radians,
+            }).collect(),
+            compute_time_us: timer.elapsed().as_micros() as u64,
+        }))
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "compute task failed"))?
 }
 
 async fn compute_centroid(
@@ -1612,30 +1658,38 @@ async fn compute_centroid(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ComputeCentroidReq>,
 ) -> Result<Json<ComputeCentroidRes>, (StatusCode, Json<ErrorResponse>)> {
-    let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let owned_vectors = {
+        let collections = state.collections.read();
+        let coll = collections.get(&collection)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+        get_vectors_from_collection(&coll.store, &req.vector_ids)
+    };
 
-    let owned_vectors = get_vectors_from_collection(&coll.store, &req.vector_ids);
-    let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
-
-    if vec_slices.is_empty() {
+    if owned_vectors.is_empty() {
         return Err(err(StatusCode::NOT_FOUND, "no vectors found"));
     }
 
-    let centroid = if !req.weights.is_empty() {
-        CentroidComputer::compute_weighted(&vec_slices, &req.weights)
-            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "weighted centroid computation failed (dimension or weight mismatch)"))?
-    } else {
-        CentroidComputer::compute(&vec_slices)
-            .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "centroid computation failed"))?
-    };
+    let weights = req.weights;
 
-    Ok(Json(ComputeCentroidRes {
-        centroid,
-        compute_time_us: timer.elapsed().as_micros() as u64,
-    }))
+    tokio::task::spawn_blocking(move || {
+        let timer = Instant::now();
+        let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
+
+        let centroid = if !weights.is_empty() {
+            CentroidComputer::compute_weighted(&vec_slices, &weights)
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "weighted centroid computation failed (dimension or weight mismatch)"))?
+        } else {
+            CentroidComputer::compute(&vec_slices)
+                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "centroid computation failed"))?
+        };
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(Json(ComputeCentroidRes {
+            centroid,
+            compute_time_us: timer.elapsed().as_micros() as u64,
+        }))
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "compute task failed"))?
 }
 
 async fn interpolate(
@@ -1679,36 +1733,45 @@ async fn detect_drift(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<DetectDriftReq>,
 ) -> Result<Json<DetectDriftRes>, (StatusCode, Json<ErrorResponse>)> {
-    let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
-
-    let owned_w1 = get_vectors_from_collection(&coll.store, &req.window1_ids);
-    let owned_w2 = get_vectors_from_collection(&coll.store, &req.window2_ids);
-
-    let w1_slices: Vec<&[f32]> = owned_w1.iter().map(|(_, v)| v.as_slice()).collect();
-    let w2_slices: Vec<&[f32]> = owned_w2.iter().map(|(_, v)| v.as_slice()).collect();
-
-    let metric = resolve_metric(&req.metric);
-    let detector = DriftDetector::new(metric);
-
-    let report = detector.detect(&w1_slices, &w2_slices)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "drift detection failed (empty windows)"))?;
-
-    let has_drifted = match req.threshold {
-        Some(t) if t > 0.0 => report.centroid_shift > t,
-        _ => false,
+    let (owned_w1, owned_w2) = {
+        let collections = state.collections.read();
+        let coll = collections.get(&collection)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+        let w1 = get_vectors_from_collection(&coll.store, &req.window1_ids);
+        let w2 = get_vectors_from_collection(&coll.store, &req.window2_ids);
+        (w1, w2)
     };
 
-    Ok(Json(DetectDriftRes {
-        centroid_shift: report.centroid_shift,
-        mean_distance_window1: report.mean_distance_window1,
-        mean_distance_window2: report.mean_distance_window2,
-        spread_change: report.spread_change,
-        has_drifted,
-        compute_time_us: timer.elapsed().as_micros() as u64,
-    }))
+    let metric_str = req.metric;
+    let threshold = req.threshold;
+
+    tokio::task::spawn_blocking(move || {
+        let timer = Instant::now();
+        let w1_slices: Vec<&[f32]> = owned_w1.iter().map(|(_, v)| v.as_slice()).collect();
+        let w2_slices: Vec<&[f32]> = owned_w2.iter().map(|(_, v)| v.as_slice()).collect();
+
+        let metric = resolve_metric(&metric_str);
+        let detector = DriftDetector::new(metric);
+
+        let report = detector.detect(&w1_slices, &w2_slices)
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "drift detection failed (empty windows)"))?;
+
+        let has_drifted = match threshold {
+            Some(t) if t > 0.0 => report.centroid_shift > t,
+            _ => false,
+        };
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(Json(DetectDriftRes {
+            centroid_shift: report.centroid_shift,
+            mean_distance_window1: report.mean_distance_window1,
+            mean_distance_window2: report.mean_distance_window2,
+            spread_change: report.spread_change,
+            has_drifted,
+            compute_time_us: timer.elapsed().as_micros() as u64,
+        }))
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "compute task failed"))?
 }
 
 async fn cluster(
@@ -1716,39 +1779,54 @@ async fn cluster(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ClusterReq>,
 ) -> Result<Json<ClusterRes>, (StatusCode, Json<ErrorResponse>)> {
-    let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
-
-    let owned_vectors = get_vectors_from_collection(&coll.store, &[]);
-    let vectors: Vec<(VectorId, &[f32])> = owned_vectors
-        .iter()
-        .map(|(id, v)| (*id, v.as_slice()))
-        .collect();
-
-    let metric = resolve_metric(&req.metric);
-    let config = KMeansConfig {
-        k: req.k as usize,
-        max_iterations: if req.max_iterations == 0 { 100 } else { req.max_iterations as usize },
-        tolerance: if req.tolerance == 0.0 { 1e-4 } else { req.tolerance },
-        metric,
+    let owned_vectors = {
+        let collections = state.collections.read();
+        let coll = collections.get(&collection)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+        get_vectors_from_collection(&coll.store, &[])
     };
 
-    let km = KMeans::new(config);
-    let result = km.cluster(&vectors);
+    let metric_str = req.metric;
+    let k = req.k;
+    let max_iterations = req.max_iterations;
+    let tolerance = req.tolerance;
+    let timeout_secs = state.compute_timeout_secs;
 
-    Ok(Json(ClusterRes {
-        centroids: result.centroids,
-        assignments: result.assignments.into_iter().map(|a| ClusterAssignmentRes {
-            id: a.id,
-            cluster: a.cluster as u32,
-            distance_to_centroid: a.distance_to_centroid,
-        }).collect(),
-        iterations: result.iterations as u32,
-        converged: result.converged,
-        compute_time_us: timer.elapsed().as_micros() as u64,
-    }))
+    let compute = tokio::task::spawn_blocking(move || {
+        let timer = Instant::now();
+        let vectors: Vec<(VectorId, &[f32])> = owned_vectors
+            .iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+
+        let metric = resolve_metric(&metric_str);
+        let config = KMeansConfig {
+            k: k as usize,
+            max_iterations: if max_iterations == 0 { 100 } else { max_iterations as usize },
+            tolerance: if tolerance == 0.0 { 1e-4 } else { tolerance },
+            metric,
+        };
+
+        let km = KMeans::new(config);
+        let result = km.cluster(&vectors);
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(Json(ClusterRes {
+            centroids: result.centroids,
+            assignments: result.assignments.into_iter().map(|a| ClusterAssignmentRes {
+                id: a.id,
+                cluster: a.cluster as u32,
+                distance_to_centroid: a.distance_to_centroid,
+            }).collect(),
+            iterations: result.iterations as u32,
+            converged: result.converged,
+            compute_time_us: timer.elapsed().as_micros() as u64,
+        }))
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), compute)
+        .await
+        .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "compute timeout exceeded"))?
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "compute task failed"))?
 }
 
 async fn reduce_dimensions(
@@ -1756,30 +1834,37 @@ async fn reduce_dimensions(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ReduceDimensionsReq>,
 ) -> Result<Json<ReduceDimensionsRes>, (StatusCode, Json<ErrorResponse>)> {
-    let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
-
-    let owned_vectors = get_vectors_from_collection(&coll.store, &req.vector_ids);
-    let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
+    let owned_vectors = {
+        let collections = state.collections.read();
+        let coll = collections.get(&collection)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+        get_vectors_from_collection(&coll.store, &req.vector_ids)
+    };
 
     let n_components = if req.n_components == 0 { 2 } else { req.n_components as usize };
-    let pca = Pca::new(PcaConfig {
-        n_components,
-        ..Default::default()
-    });
 
-    let result = pca.fit_transform(&vec_slices)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "PCA failed (need at least 2 vectors with matching dimensions)"))?;
+    tokio::task::spawn_blocking(move || {
+        let timer = Instant::now();
+        let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
 
-    Ok(Json(ReduceDimensionsRes {
-        components: result.components,
-        explained_variance: result.explained_variance,
-        mean: result.mean,
-        projected: result.projected,
-        compute_time_us: timer.elapsed().as_micros() as u64,
-    }))
+        let pca = Pca::new(PcaConfig {
+            n_components,
+            ..Default::default()
+        });
+
+        let result = pca.fit_transform(&vec_slices)
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "PCA failed (need at least 2 vectors with matching dimensions)"))?;
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(Json(ReduceDimensionsRes {
+            components: result.components,
+            explained_variance: result.explained_variance,
+            mean: result.mean,
+            projected: result.projected,
+            compute_time_us: timer.elapsed().as_micros() as u64,
+        }))
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "compute task failed"))?
 }
 
 async fn compute_analogy(
@@ -1824,29 +1909,39 @@ async fn diversity_sample(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<DiversitySampleReq>,
 ) -> Result<Json<DiversitySampleRes>, (StatusCode, Json<ErrorResponse>)> {
-    let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
-
     if req.query.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "query vector is required"));
     }
 
-    let owned_candidates = get_vectors_from_collection(&coll.store, &req.candidate_ids);
-    let candidates: Vec<(VectorId, &[f32])> = owned_candidates
-        .iter()
-        .map(|(id, v)| (*id, v.as_slice()))
-        .collect();
+    let owned_candidates = {
+        let collections = state.collections.read();
+        let coll = collections.get(&collection)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+        get_vectors_from_collection(&coll.store, &req.candidate_ids)
+    };
 
-    let results = DiversitySampler::mmr(&req.query, &candidates, req.k as usize, req.lambda);
+    let query = req.query;
+    let k = req.k;
+    let lambda = req.lambda;
 
-    Ok(Json(DiversitySampleRes {
-        results: results.into_iter().map(|r| DiversitySampleResultRes {
-            id: r.id,
-            relevance_score: r.relevance_score,
-            mmr_score: r.mmr_score,
-        }).collect(),
-        compute_time_us: timer.elapsed().as_micros() as u64,
-    }))
+    tokio::task::spawn_blocking(move || {
+        let timer = Instant::now();
+        let candidates: Vec<(VectorId, &[f32])> = owned_candidates
+            .iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+
+        let results = DiversitySampler::mmr(&query, &candidates, k as usize, lambda, None);
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(Json(DiversitySampleRes {
+            results: results.into_iter().map(|r| DiversitySampleResultRes {
+                id: r.id,
+                relevance_score: r.relevance_score,
+                mmr_score: r.mmr_score,
+            }).collect(),
+            compute_time_us: timer.elapsed().as_micros() as u64,
+        }))
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "compute task failed"))?
 }

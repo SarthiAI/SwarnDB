@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Segment file format constants, header structures, and WAL entry definitions.
 //!
@@ -153,13 +152,26 @@ impl SegmentHeader {
         crc32fast::hash(&buf)
     }
 
-    /// Validate magic, version, and checksum.
+    /// Validate magic, version, dimension, and checksum.
     pub fn validate(&self) -> StorageResult<()> {
         if self.magic != SEGMENT_MAGIC {
             return Err(StorageError::BadMagic {
                 expected: SEGMENT_MAGIC,
                 found: self.magic,
             });
+        }
+        // Task 659: Only reject future versions, not old ones.
+        if self.version > SEGMENT_VERSION {
+            return Err(StorageError::SegmentInvalidHeader(format!(
+                "unsupported segment version {}: maximum supported version is {}",
+                self.version, SEGMENT_VERSION
+            )));
+        }
+        // Task 282: Reject dimension 0.
+        if self.dimension == 0 {
+            return Err(StorageError::SegmentInvalidHeader(
+                "segment dimension must be greater than 0".into(),
+            ));
         }
         let computed = self.compute_checksum();
         if self.checksum != computed {

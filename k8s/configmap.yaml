@@ -7,10 +7,92 @@ metadata:
     app.kubernetes.io/name: swarndb
     app.kubernetes.io/component: config
 data:
+  # ---- Network ----
   SWARNDB_HOST: "0.0.0.0"
   SWARNDB_GRPC_PORT: "50051"
   SWARNDB_REST_PORT: "8080"
+  # Max gRPC message size in bytes (64 MB)
+  SWARNDB_MAX_MESSAGE_SIZE: "67108864"
+  # Max REST request body size in bytes (256 MB)
+  SWARNDB_MAX_REQUEST_BODY_BYTES: "268435456"
+  # Allowed CORS origins (comma-separated, empty = allow all)
+  SWARNDB_CORS_ORIGINS: ""
+
+  # ---- Storage ----
   SWARNDB_DATA_DIR: "/data"
+  # Max WAL file size in bytes (256 MB)
+  SWARNDB_WAL_MAX_SIZE: "268435456"
+  # Max vectors in hot tier before promotion to warm
+  SWARNDB_TIERED_HOT_CAPACITY: "100000"
+  # Flush memtable to disk after this many entries
+  SWARNDB_MEMTABLE_FLUSH_THRESHOLD: "50000"
+
+  # ---- Logging ----
   SWARNDB_LOG_LEVEL: "info"
+
+  # ---- Connection Limits ----
   SWARNDB_MAX_CONNECTIONS: "1000"
+
+  # ---- Concurrency Control ----
+  # Max concurrent search requests
+  SWARNDB_MAX_CONCURRENT_SEARCHES: "500"
+  # Adaptive concurrency minimum
+  SWARNDB_MIN_CONCURRENCY: "10"
+  # Adaptive concurrency maximum
+  SWARNDB_MAX_CONCURRENCY: "200"
+  # Target p99 latency in ms for adaptive concurrency
+  SWARNDB_TARGET_P99_LATENCY_MS: "500"
+  # EMA smoothing factor for latency tracking (0.0-1.0)
+  SWARNDB_CONCURRENCY_EMA_ALPHA: "0.1"
+  # Latency multiplier that triggers concurrency decrease
+  SWARNDB_CONCURRENCY_HIGH_THRESHOLD: "1.2"
+  # Latency multiplier that triggers concurrency increase
+  SWARNDB_CONCURRENCY_LOW_THRESHOLD: "0.5"
+  # Rate to decrease concurrency when latency is high
+  SWARNDB_CONCURRENCY_DECREASE_RATE: "0.10"
+  # Rate to increase concurrency when latency is low
+  SWARNDB_CONCURRENCY_INCREASE_RATE: "0.05"
+  # Max queued requests when at concurrency capacity
+  SWARNDB_SEARCH_QUEUE_SIZE: "1000"
+
+  # ---- Timeouts ----
+  # General request timeout in ms
   SWARNDB_REQUEST_TIMEOUT_MS: "30000"
+  # Search query timeout in ms
+  SWARNDB_SEARCH_TIMEOUT_MS: "5000"
+  # Bulk insert timeout in ms (5 min)
+  SWARNDB_BULK_TIMEOUT_MS: "300000"
+  # Compute-intensive operation timeout in seconds
+  SWARNDB_COMPUTE_TIMEOUT_SECS: "30"
+
+  # ---- Search Limits ----
+  # Max allowed k value for search queries
+  SWARNDB_MAX_K: "10000"
+  # Max ef_search per query (higher = more accurate, slower)
+  SWARNDB_MAX_EF_SEARCH: "10000"
+  # Max effective search width cap for HNSW
+  SWARNDB_MAX_EF: "100000"
+
+  # ---- HNSW Index Tuning ----
+  # Max ef_construction override for bulk insert
+  SWARNDB_MAX_EF_CONSTRUCTION: "2000"
+
+  # ---- Bulk Insert Limits ----
+  # Max vectors locked during batch operations
+  SWARNDB_MAX_BATCH_LOCK_SIZE: "10000"
+  # WAL flush interval limit for bulk insert
+  SWARNDB_MAX_WAL_FLUSH_INTERVAL: "100000"
+  # Max messages in a single gRPC bulk_insert stream
+  SWARNDB_MAX_BULK_INSERT_MESSAGES: "100000"
+  # Max total payload bytes in bulk_insert stream (512 MB)
+  SWARNDB_MAX_BULK_INSERT_PAYLOAD_BYTES: "536870912"
+
+  # ---- Validation Limits ----
+  # Max metadata size per vector in bytes (4 MB)
+  SWARNDB_MAX_METADATA_SIZE_BYTES: "4194304"
+  # Max allowed vector dimension
+  SWARNDB_MAX_VECTOR_DIMENSION: "65536"
+  # Max vectors in a single request
+  SWARNDB_MAX_VECTORS_PER_REQUEST: "10000"
+  # Max collection name length
+  SWARNDB_MAX_COLLECTION_NAME_LENGTH: "256"

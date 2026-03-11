@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::sync::atomic::Ordering;
 
@@ -94,11 +93,12 @@ impl GraphService for GraphServiceImpl {
             None
         };
 
+        let depth = (req.depth as usize).min(100);
         let traversal_results = GraphTraversal::traverse(
             &collection.graph,
             req.start_id,
             &TraversalOrder::BreadthFirst,
-            req.depth as usize,
+            depth,
             threshold,
             max_results,
         )
@@ -123,6 +123,12 @@ impl GraphService for GraphServiceImpl {
     ) -> Result<Response<SetThresholdResponse>, Status> {
         let req = request.into_inner();
 
+        if req.threshold <= 0.0 || req.threshold > 1.0 {
+            return Err(Status::invalid_argument(
+                "threshold must be >0.0 and <=1.0",
+            ));
+        }
+
         let mut collections = self.state.collections.write();
         let collection = collections
             .get_mut(&req.collection)
@@ -133,6 +139,7 @@ impl GraphService for GraphServiceImpl {
         if req.vector_id == 0 {
             // Update collection-level default threshold
             collection.graph.config_mut().default_threshold = req.threshold;
+            collection.config.default_similarity_threshold = Some(req.threshold);
             collection.deferred_graph.store(true, Ordering::Release);
         } else {
             // Set per-vector threshold override

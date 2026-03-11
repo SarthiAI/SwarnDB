@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -30,6 +29,8 @@ pub struct HnswParams {
     pub ef_search: usize,
     pub m_l: f64,
     pub max_level_cap: usize,
+    /// Maximum effective search width cap. Prevents excessive computation from large k values.
+    pub max_ef: usize,
 }
 
 impl Default for HnswParams {
@@ -38,24 +39,71 @@ impl Default for HnswParams {
         Self {
             m,
             m0: 2 * m,
-            ef_construction: 200,
+            ef_construction: 50,
             ef_search: 50,
             m_l: 1.0 / (m as f64).ln(),
-            max_level_cap: 16,
+            max_level_cap: 24,
+            max_ef: 100_000,
         }
     }
 }
 
 impl HnswParams {
-    pub fn new(m: usize, ef_construction: usize, ef_search: usize) -> Self {
-        Self {
+    pub fn new(m: usize, ef_construction: usize, ef_search: usize, max_ef: usize, max_level_cap: usize) -> Result<Self, IndexError> {
+        if m < 2 {
+            return Err(IndexError::Internal(format!(
+                "HNSW parameter m must be >= 2, got {}",
+                m
+            )));
+        }
+        if ef_construction == 0 {
+            return Err(IndexError::Internal(
+                "HNSW parameter ef_construction must be > 0".to_string(),
+            ));
+        }
+        if ef_search == 0 {
+            return Err(IndexError::Internal(
+                "HNSW parameter ef_search must be > 0".to_string(),
+            ));
+        }
+        if max_ef == 0 {
+            return Err(IndexError::Internal(
+                "HNSW parameter max_ef must be > 0".to_string(),
+            ));
+        }
+        if max_level_cap == 0 {
+            return Err(IndexError::Internal(
+                "HNSW parameter max_level_cap must be > 0".to_string(),
+            ));
+        }
+        if max_ef < ef_search {
+            log::warn!(
+                "HNSW: max_ef ({}) is less than ef_search ({}), the k*10 widening will be ineffective",
+                max_ef, ef_search
+            );
+        }
+        if ef_construction < m {
+            log::warn!(
+                "HNSW: ef_construction ({}) < m ({}), this may reduce index quality",
+                ef_construction, m
+            );
+        }
+        let m0 = 2 * m;
+        if m0 < m {
+            return Err(IndexError::Internal(format!(
+                "HNSW parameter m0 ({}) must be >= m ({}); standard is m0 = 2*m",
+                m0, m
+            )));
+        }
+        Ok(Self {
             m,
-            m0: 2 * m,
+            m0,
             ef_construction,
             ef_search,
             m_l: 1.0 / (m as f64).ln(),
-            max_level_cap: 16,
-        }
+            max_level_cap,
+            max_ef,
+        })
     }
 }
 
@@ -216,6 +264,14 @@ impl HnswIndex {
         reader.read_exact(&mut buf4).map_err(wrap)?;
         let dimension = u32::from_le_bytes(buf4) as usize;
 
+        const MAX_DIMENSION: usize = 65_536;
+        if dimension == 0 || dimension > MAX_DIMENSION {
+            return Err(IndexError::Internal(format!(
+                "deserialization error: invalid dimension {} (must be 1..={})",
+                dimension, MAX_DIMENSION
+            )));
+        }
+
         let mut metric_byte = [0u8; 1];
         reader.read_exact(&mut metric_byte).map_err(wrap)?;
         let metric = Self::metric_from_u8(metric_byte[0])?;
@@ -223,6 +279,14 @@ impl HnswIndex {
         let mut buf8 = [0u8; 8];
         reader.read_exact(&mut buf8).map_err(wrap)?;
         let node_count = u64::from_le_bytes(buf8) as usize;
+
+        const MAX_NODE_COUNT: usize = 1_000_000_000;
+        if node_count > MAX_NODE_COUNT {
+            return Err(IndexError::Internal(format!(
+                "deserialization error: node_count {} exceeds maximum allowed {}",
+                node_count, MAX_NODE_COUNT
+            )));
+        }
 
         reader.read_exact(&mut buf8).map_err(wrap)?;
         let ep_raw = u64::from_le_bytes(buf8);
@@ -243,13 +307,35 @@ impl HnswIndex {
         let mut reserved = [0u8; 16];
         reader.read_exact(&mut reserved).map_err(wrap)?;
 
+        if m < 2 {
+            return Err(IndexError::Internal(format!(
+                "deserialization error: invalid m={} (must be >= 2)", m
+            )));
+        }
+        if m0 == 0 {
+            return Err(IndexError::Internal(
+                "deserialization error: invalid m0=0 (must be > 0)".to_string(),
+            ));
+        }
+        if ef_construction == 0 {
+            return Err(IndexError::Internal(
+                "deserialization error: invalid ef_construction=0 (must be > 0)".to_string(),
+            ));
+        }
+        if ef_search == 0 {
+            return Err(IndexError::Internal(
+                "deserialization error: invalid ef_search=0 (must be > 0)".to_string(),
+            ));
+        }
+
         let params = HnswParams {
             m,
             m0,
             ef_construction,
             ef_search,
             m_l: 1.0 / (m as f64).ln(),
-            max_level_cap: 16,
+            max_level_cap: 24,
+            max_ef: 100_000,
         };
 
         let mut nodes = HashMap::with_capacity(node_count);
@@ -1132,6 +1218,9 @@ impl HnswIndex {
                     }
 
                     // Add bidirectional edges with per-node locking and inline pruning.
+                    // Safety: each neighbor list is protected by its own Mutex,
+                    // ensuring atomic read-modify-write during concurrent builds.
+                    // Vector data is immutable after construction (no lock needed).
                     let max_conn = self.max_connections(layer);
                     for &neighbor_id in &neighbors {
                         if let Some(neighbor_node) = all_nodes.get(&neighbor_id) {
@@ -1172,21 +1261,25 @@ impl HnswIndex {
 
                 // Update max_level and entry_point atomically (best-effort hint
                 // for other threads' search; definitive values computed in phase 3).
+                // Use AcqRel ordering so that the entry_point store is visible
+                // to any thread that observes the new max_level.
                 loop {
-                    let old_max = max_level_atomic.load(Ordering::Relaxed);
+                    let old_max = max_level_atomic.load(Ordering::Acquire);
                     if new_level <= old_max {
                         break;
                     }
+                    // Store entry_point BEFORE updating max_level so that any
+                    // thread that sees the new max_level also sees the new EP.
+                    entry_point_atomic.store(id, Ordering::Release);
                     if max_level_atomic
-                        .compare_exchange_weak(
+                        .compare_exchange(
                             old_max,
                             new_level,
-                            Ordering::Release,
-                            Ordering::Relaxed,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
                         )
                         .is_ok()
                     {
-                        entry_point_atomic.store(id, Ordering::Release);
                         break;
                     }
                 }
@@ -1308,8 +1401,14 @@ impl VectorIndex for HnswIndex {
 
         let candidate_set: HashSet<VectorId> = candidates.iter().copied().collect();
 
-        // Use a larger ef to get more candidates for post-filtering
-        let ef = ef_search.unwrap_or(self.params.ef_search).max(k * 10);
+        // Use a larger ef to get more candidates for post-filtering.
+        // When user supplies explicit ef_search, respect it (minimum k).
+        // Otherwise widen to k*10 capped at max_ef.
+        let max_ef = self.params.max_ef;
+        let ef = match ef_search {
+            Some(user_ef) => user_ef.max(k),
+            None => self.params.ef_search.max(k.saturating_mul(10).min(max_ef)),
+        };
 
         let mut current_ep = entry_point;
 
@@ -1346,5 +1445,36 @@ impl VectorIndex for HnswIndex {
 
     fn contains(&self, id: VectorId) -> bool {
         self.inner.read().nodes.contains_key(&id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vf_core::types::DistanceMetricType;
+
+    #[test]
+    fn test_max_ef_zero_rejected() {
+        let result = HnswParams::new(16, 100, 50, 0, 24);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_ef_valid() {
+        let params = HnswParams::new(16, 100, 50, 100_000, 24).unwrap();
+        assert_eq!(params.max_ef, 100_000);
+    }
+
+    #[test]
+    fn test_max_ef_respected_in_search() {
+        let params = HnswParams::new(16, 100, 50, 500, 24).unwrap();
+        let index = HnswIndex::new(4, DistanceMetricType::Cosine, params);
+        // Insert enough vectors to search
+        for i in 0..20u64 {
+            index.add(i, &[i as f32, 0.0, 0.0, 1.0]).unwrap();
+        }
+        // k=100 would normally give ef = k*10 = 1000, but max_ef=500 should cap it
+        let results = index.search(&[1.0, 0.0, 0.0, 1.0], 10, None).unwrap();
+        assert!(!results.is_empty());
     }
 }

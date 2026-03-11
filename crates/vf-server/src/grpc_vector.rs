@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! gRPC VectorService handler implementation.
 
@@ -9,6 +8,7 @@ use tonic::{Request, Response, Status};
 
 use crate::convert::{core_to_proto_metadata, proto_to_core_metadata};
 use crate::proto::swarndb::v1::vector_service_server::VectorService;
+use crate::validation::validate_vector_data;
 use std::sync::atomic::Ordering;
 
 use crate::proto::swarndb::v1::{
@@ -25,6 +25,17 @@ use crate::validation::{
 use vf_core::store::VectorRecord;
 use vf_core::vector::VectorData;
 use vf_index::traits::VectorIndex;
+
+/// Sanitize a string for safe inclusion in log messages by removing control chars.
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect()
+}
+
+// MAX_BULK_INSERT_MESSAGES and MAX_BULK_INSERT_PAYLOAD_BYTES are now
+// configurable via AppState (config.max_bulk_insert_messages / max_bulk_insert_payload_bytes).
 
 pub struct VectorServiceImpl {
     state: AppState,
@@ -70,8 +81,13 @@ impl VectorService for VectorServiceImpl {
 
         let mut collections = self.state.collections.write();
         let coll = collections.get_mut(&req.collection).ok_or_else(|| {
-            Status::not_found(format!("collection '{}' not found", req.collection))
+            Status::not_found(format!("collection '{}' not found", sanitize_for_log(&req.collection)))
         })?;
+
+        // Validate vector dimension against collection config
+        if let Err(e) = validate_vector_data(&values, coll.config.dimension) {
+            return Err(Status::invalid_argument(e.to_string()));
+        }
 
         let vector_data = VectorData::F32(values.clone());
 
@@ -79,20 +95,27 @@ impl VectorService for VectorServiceImpl {
             let id = coll
                 .store
                 .insert_auto_id(vector_data, core_metadata.clone())
-                .map_err(|e| Status::internal(format!("store insert failed: {}", e)))?;
+                .map_err(|e| {
+                    tracing::error!("store insert failed: {}", e);
+                    Status::internal("internal error")
+                })?;
             id
         } else {
             let record = VectorRecord::new(req.id, vector_data, core_metadata.clone());
             coll.store
                 .insert(record)
-                .map_err(|e| Status::internal(format!("store insert failed: {}", e)))?;
+                .map_err(|e| {
+                    tracing::error!("store insert failed: {}", e);
+                    Status::internal("internal error")
+                })?;
             req.id
         };
 
         if let Err(e) = coll.index.add(assigned_id, &values) {
             // Rollback: remove from store since index add failed
             let _ = coll.store.delete(assigned_id);
-            return Err(Status::internal(format!("index insert failed: {}", e)));
+            tracing::error!("index insert failed: {}", e);
+            return Err(Status::internal("internal error"));
         }
 
         if let Some(ref meta) = core_metadata {
@@ -100,8 +123,9 @@ impl VectorService for VectorServiceImpl {
         }
 
         // Compute virtual graph edges for the newly inserted vector
+        let graph_k = coll.graph.config().graph_neighbors_k;
         if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-            &mut coll.graph, &coll.index, assigned_id, &values, 10,
+            &mut coll.graph, &coll.index, assigned_id, &values, graph_k,
         ) {
             tracing::warn!(collection = %req.collection, id = assigned_id, "graph compute failed: {}", e);
         }
@@ -251,104 +275,157 @@ impl VectorService for VectorServiceImpl {
         let mut stream = request.into_inner();
         let mut inserted_count: u64 = 0;
         let mut item_index: u64 = 0;
+        let mut total_payload_bytes: u64 = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut batch_vectors: std::collections::HashMap<String, (Vec<u64>, std::collections::HashMap<u64, Vec<f32>>)> = std::collections::HashMap::new();
 
-        while let Some(result) = stream.message().await? {
-            let req = result;
-            let current_item = item_index;
-            item_index += 1;
+        // Batch messages before acquiring the write lock
+        const BATCH_SIZE: usize = 100;
+        let mut message_batch: Vec<(u64, InsertRequest)> = Vec::with_capacity(BATCH_SIZE);
 
-            let proto_vec = match req.vector.as_ref() {
-                Some(v) if !v.values.is_empty() => v,
-                _ => {
-                    errors.push(format!("item {}: missing or empty vector", current_item));
-                    continue;
-                }
-            };
-
-            let values = proto_vec.values.clone();
-            let core_metadata = req.metadata.as_ref().map(proto_to_core_metadata);
-
-            let mut collections = self.state.collections.write();
-            let coll = match collections.get_mut(&req.collection) {
-                Some(c) => c,
-                None => {
-                    errors.push(format!("collection '{}' not found", req.collection));
-                    continue;
-                }
-            };
-
-            let vector_data = VectorData::F32(values.clone());
-
-            let assigned_id = if req.id == 0 {
-                match coll.store.insert_auto_id(vector_data, core_metadata.clone()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        errors.push(format!("store insert failed: {}", e));
-                        continue;
+        loop {
+            // Collect a batch of messages from the stream
+            message_batch.clear();
+            let mut stream_done = false;
+            while message_batch.len() < BATCH_SIZE {
+                match stream.message().await? {
+                    Some(req) => {
+                        let current_item = item_index;
+                        item_index += 1;
+                        if item_index > self.state.max_bulk_insert_messages {
+                            return Err(Status::resource_exhausted(format!(
+                                "bulk_insert stream exceeded maximum message count ({})",
+                                self.state.max_bulk_insert_messages
+                            )));
+                        }
+                        if let Some(ref v) = req.vector {
+                            total_payload_bytes += (v.values.len() * std::mem::size_of::<f32>()) as u64;
+                        }
+                        if total_payload_bytes > self.state.max_bulk_insert_payload_bytes {
+                            return Err(Status::resource_exhausted(format!(
+                                "bulk_insert stream exceeded maximum payload size ({} bytes)",
+                                self.state.max_bulk_insert_payload_bytes
+                            )));
+                        }
+                        message_batch.push((current_item, req));
+                    }
+                    None => {
+                        stream_done = true;
+                        break;
                     }
                 }
-            } else {
-                let record = VectorRecord::new(req.id, vector_data, core_metadata.clone());
-                match coll.store.insert(record) {
-                    Ok(()) => req.id,
-                    Err(e) => {
-                        errors.push(format!("store insert failed for id {}: {}", req.id, e));
-                        continue;
-                    }
-                }
-            };
-
-            if let Err(e) = coll.index.add(assigned_id, &values) {
-                // Rollback: remove from store since index add failed
-                let _ = coll.store.delete(assigned_id);
-                errors.push(format!("item {}: index insert failed for id {}: {}", current_item, assigned_id, e));
-                continue;
             }
 
-            if let Some(ref meta) = core_metadata {
-                coll.index_manager.index_record(assigned_id, meta);
+            if message_batch.is_empty() {
+                break;
             }
 
-            // Compute virtual graph edges for the newly inserted vector
-            if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-                &mut coll.graph, &coll.index, assigned_id, &values, 10,
-            ) {
-                tracing::warn!(collection = %req.collection, id = assigned_id, "graph compute failed: {}", e);
-            }
-
-            // Save values for batch graph recomputation before they're moved
-            let values_for_graph = values.clone();
-
-            // Persist to storage layer (best-effort)
+            // Process the entire batch under a single write lock
             {
-                let mut cm = self.state.collection_manager.write();
-                if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
-                    if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(values), core_metadata) {
-                        tracing::warn!(collection = %req.collection, id = assigned_id, "storage bulk insert failed: {}", e);
-                    }
-                }
-            }
+                let mut collections = self.state.collections.write();
 
-            let entry = batch_vectors.entry(req.collection.clone()).or_insert_with(|| (Vec::new(), std::collections::HashMap::new()));
-            entry.0.push(assigned_id);
-            entry.1.insert(assigned_id, values_for_graph);
-            inserted_count += 1;
+                for (current_item, req) in &message_batch {
+                    let proto_vec = match req.vector.as_ref() {
+                        Some(v) if !v.values.is_empty() => v,
+                        _ => {
+                            errors.push(format!("item {}: missing or empty vector", current_item));
+                            continue;
+                        }
+                    };
+
+                    let values = proto_vec.values.clone();
+                    let core_metadata = req.metadata.as_ref().map(proto_to_core_metadata);
+
+                    let coll = match collections.get_mut(&req.collection) {
+                        Some(c) => c,
+                        None => {
+                            errors.push(format!("item {}: collection not found", current_item));
+                            continue;
+                        }
+                    };
+
+                    // Validate dimension
+                    if values.len() != coll.config.dimension {
+                        errors.push(format!("item {}: dimension mismatch", current_item));
+                        continue;
+                    }
+
+                    let vector_data = VectorData::F32(values.clone());
+
+                    let assigned_id = if req.id == 0 {
+                        match coll.store.insert_auto_id(vector_data, core_metadata.clone()) {
+                            Ok(id) => id,
+                            Err(_e) => {
+                                errors.push(format!("item {}: store insert failed", current_item));
+                                continue;
+                            }
+                        }
+                    } else {
+                        let record = VectorRecord::new(req.id, vector_data, core_metadata.clone());
+                        match coll.store.insert(record) {
+                            Ok(()) => req.id,
+                            Err(_e) => {
+                                errors.push(format!("item {}: store insert failed", current_item));
+                                continue;
+                            }
+                        }
+                    };
+
+                    if let Err(_e) = coll.index.add(assigned_id, &values) {
+                        let _ = coll.store.delete(assigned_id);
+                        errors.push(format!("item {}: index insert failed", current_item));
+                        continue;
+                    }
+
+                    if let Some(ref meta) = core_metadata {
+                        coll.index_manager.index_record(assigned_id, meta);
+                    }
+
+                    // Compute virtual graph edges for the newly inserted vector
+                    let graph_k = coll.graph.config().graph_neighbors_k;
+                    if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
+                        &mut coll.graph, &coll.index, assigned_id, &values, graph_k,
+                    ) {
+                        tracing::warn!(id = assigned_id, "graph compute failed: {}", e);
+                    }
+
+                    let entry = batch_vectors.entry(req.collection.clone()).or_insert_with(|| (Vec::new(), std::collections::HashMap::new()));
+                    entry.0.push(assigned_id);
+                    entry.1.insert(assigned_id, values.clone());
+
+                    // Persist to storage layer (best-effort)
+                    {
+                        let mut cm = self.state.collection_manager.write();
+                        if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
+                            if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(values), core_metadata) {
+                                tracing::warn!(id = assigned_id, "storage bulk insert failed: {}", e);
+                            }
+                        }
+                    }
+
+                    inserted_count += 1;
+                }
+            } // write lock released
+
+            if stream_done {
+                break;
+            }
         }
 
         // Recompute graph edges for all inserted vectors now that the full index is available
         for (coll_name, (ids, vectors_map)) in &batch_vectors {
             let mut collections = self.state.collections.write();
             if let Some(coll) = collections.get_mut(coll_name) {
+                let graph_k = coll.graph.config().graph_neighbors_k;
                 if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                    &mut coll.graph, &coll.index, ids, vectors_map, 10,
+                    &mut coll.graph, &coll.index, ids, vectors_map, graph_k,
                 ) {
-                    tracing::warn!(collection = %coll_name, "graph compute_batch after bulk_insert failed: {}", e);
+                    tracing::warn!("graph compute_batch after bulk_insert failed: {}", e);
                 }
             }
         }
 
+        tracing::info!(inserted = inserted_count, errors = errors.len(), "bulk_insert completed");
         Ok(Response::new(BulkInsertResponse {
             inserted_count,
             errors,
@@ -417,9 +494,11 @@ impl VectorService for VectorServiceImpl {
         let index_mode_deferred = index_mode == "deferred";
         let skip_metadata_index = options.skip_metadata_index;
         let _parallel_build = options.parallel_build; // TODO: use in optimize() with index_mode=deferred
+        let any_deferred = defer_graph || index_mode_deferred || skip_metadata_index;
 
         let mut inserted_count: u64 = 0;
         let mut item_index: u64 = 0;
+        let mut total_payload_bytes: u64 = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut wal_counter: u32 = 0;
         let mut pending_wal: Vec<(String, u64, Vec<f32>, Option<vf_core::types::Metadata>)> = Vec::new();
@@ -551,12 +630,13 @@ impl VectorService for VectorServiceImpl {
 
                     // Graph computation: skip if deferred
                     if !defer_graph {
+                        let graph_k = coll.graph.config().graph_neighbors_k;
                         if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
                             &mut coll.graph,
                             &coll.index,
                             assigned_id,
                             &values,
-                            10,
+                            graph_k,
                         ) {
                             tracing::warn!(
                                 collection = %coll_name,
@@ -616,7 +696,24 @@ impl VectorService for VectorServiceImpl {
                     let current_item = item_index;
                     item_index += 1;
 
-                    if !req.collection.is_empty() {
+                    // Enforce stream limits
+                    if item_index > self.state.max_bulk_insert_messages {
+                        return Err(Status::resource_exhausted(format!(
+                            "bulk_insert_with_options stream exceeded maximum message count ({})",
+                            self.state.max_bulk_insert_messages
+                        )));
+                    }
+                    if let Some(ref v) = req.vector {
+                        total_payload_bytes += (v.values.len() * std::mem::size_of::<f32>()) as u64;
+                    }
+                    if total_payload_bytes > self.state.max_bulk_insert_payload_bytes {
+                        return Err(Status::resource_exhausted(format!(
+                            "bulk_insert_with_options stream exceeded maximum payload size ({} bytes)",
+                            self.state.max_bulk_insert_payload_bytes
+                        )));
+                    }
+
+                    if any_deferred && !req.collection.is_empty() {
                         collections_with_deferrals.insert(req.collection.clone());
                     }
 
@@ -698,8 +795,9 @@ impl VectorService for VectorServiceImpl {
             for (coll_name, (ids, vectors_map)) in &batch_vectors {
                 let mut collections = self.state.collections.write();
                 if let Some(coll) = collections.get_mut(coll_name) {
+                    let graph_k = coll.graph.config().graph_neighbors_k;
                     if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                        &mut coll.graph, &coll.index, ids, vectors_map, 10,
+                        &mut coll.graph, &coll.index, ids, vectors_map, graph_k,
                     ) {
                         tracing::warn!(
                             collection = %coll_name,
@@ -712,7 +810,6 @@ impl VectorService for VectorServiceImpl {
         }
 
         // Set deferred flags and collection status
-        let any_deferred = defer_graph || index_mode_deferred || skip_metadata_index;
         if any_deferred {
             let collections = self.state.collections.read();
             for coll_name in &collections_with_deferrals {

@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Tiered vector storage: hot (RAM), warm (mmap), cold (quantized RAM + disk).
 //!
@@ -11,6 +10,7 @@
 use std::collections::HashMap;
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use vf_core::types::VectorId;
 
 use crate::disk_ann::DiskAnnStore;
@@ -41,8 +41,13 @@ pub struct TierConfig {
 
 impl Default for TierConfig {
     fn default() -> Self {
+        let hot_capacity = std::env::var("SWARNDB_TIERED_HOT_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100_000);
+
         Self {
-            hot_capacity: 100_000,
+            hot_capacity,
             promotion_threshold: 10,
             demotion_threshold: 2,
         }
@@ -83,6 +88,8 @@ pub struct TieredVectorStore {
     config: TierConfig,
     /// Access counters for promotion/demotion decisions.
     access_counts: DashMap<VectorId, u64>,
+    /// Task 284: Mutex to serialize promote/demote operations.
+    tier_transition_lock: Mutex<()>,
 }
 
 impl TieredVectorStore {
@@ -97,6 +104,7 @@ impl TieredVectorStore {
             tier_map: DashMap::new(),
             config,
             access_counts: DashMap::new(),
+            tier_transition_lock: Mutex::new(()),
         }
     }
 
@@ -139,6 +147,7 @@ impl TieredVectorStore {
 
     /// Promote a vector from warm/cold to hot tier.
     pub fn promote(&self, id: VectorId) -> StorageResult<()> {
+        let _guard = self.tier_transition_lock.lock();
         let tier = self
             .tier_map
             .get(&id)
@@ -186,6 +195,7 @@ impl TieredVectorStore {
     /// mmap file to already exist with the vector's data written to it. If no
     /// warm mmap is configured, the vector stays in hot.
     pub fn demote(&self, id: VectorId) -> StorageResult<()> {
+        let _guard = self.tier_transition_lock.lock();
         let tier = self
             .tier_map
             .get(&id)
@@ -198,25 +208,28 @@ impl TieredVectorStore {
                 Ok(())
             }
             StorageTier::Hot => {
-                // Can only demote to warm if warm mmap has this vector's offset.
-                // Update tier_map BEFORE removing from hot so concurrent get()
-                // sees consistent state (tier says Warm while data is still in hot
-                // is safe; the reverse — data gone but tier still Hot — is not).
-                if self.warm_offsets.contains_key(&id) {
+                // Verify the target tier can actually serve the vector before
+                // updating tier_map.  A concurrent get() uses tier_map to
+                // decide where to look, so the tier_map must only point to a
+                // tier that already has the data available.
+                //
+                // Order: verify data readable in target → update tier_map → remove from hot.
+                if self.get_warm_vector(id).is_some() {
                     self.tier_map.insert(id, StorageTier::Warm);
                     self.hot.remove(&id);
                     Ok(())
                 } else if self
                     .cold_store
                     .as_ref()
-                    .map_or(false, |s| s.get_quantized(id).is_some())
+                    .and_then(|s| s.get_full_vector(id))
+                    .is_some()
                 {
-                    // Demote to cold if available there
+                    // Demote to cold only after verifying the full vector is retrievable.
                     self.tier_map.insert(id, StorageTier::Cold);
                     self.hot.remove(&id);
                     Ok(())
                 } else {
-                    // No lower tier available; keep in hot
+                    // No lower tier can serve this vector; keep in hot
                     Ok(())
                 }
             }

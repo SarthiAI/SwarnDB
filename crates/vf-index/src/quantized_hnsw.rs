@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Quantized HNSW index — wraps [`HnswIndex`] with quantized vector storage
 //! for memory-efficient approximate nearest neighbor search with optional
@@ -123,16 +122,33 @@ impl QuantizedHnswIndex {
     /// This inserts the vector into the HNSW graph (for accurate construction),
     /// stores the quantized code (for compact storage), and keeps the full
     /// vector (for re-ranking).
+    ///
+    /// The quantized codes and full vectors are inserted atomically under a
+    /// single lock acquisition to prevent inconsistent state if a crash occurs
+    /// between the two writes.
     pub fn add(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
         // Insert into HNSW graph first (validates dimension, checks duplicates).
         self.hnsw.add(id, vector)?;
 
-        // Compute and store the quantized code.
-        let code = self.quantize_vector(vector)?;
-        self.quantized_codes.write().insert(id, code);
+        // Compute the quantized code before acquiring locks.
+        let code = match self.quantize_vector(vector) {
+            Ok(c) => c,
+            Err(e) => {
+                // Roll back the HNSW insertion on quantization failure.
+                let _ = self.hnsw.remove(id);
+                return Err(e);
+            }
+        };
 
-        // Store the full vector for re-ranking.
-        self.full_vectors.write().insert(id, vector.to_vec());
+        // Acquire both locks together to ensure atomic insertion of auxiliary stores.
+        // This prevents a crash mid-insert from leaving quantized_codes populated
+        // but full_vectors missing (or vice versa).
+        {
+            let mut codes = self.quantized_codes.write();
+            let mut vecs = self.full_vectors.write();
+            codes.insert(id, code);
+            vecs.insert(id, vector.to_vec());
+        }
 
         Ok(())
     }
@@ -239,12 +255,15 @@ impl QuantizedHnswIndex {
                             let dist = match self.metric {
                                 DistanceMetricType::Euclidean => {
                                     sq_euclidean_distance(&query_code, code, sq)
+                                        .unwrap_or(c.score)
                                 }
                                 DistanceMetricType::DotProduct => {
                                     sq_dot_product_distance(&query_code, code, sq)
+                                        .unwrap_or(c.score)
                                 }
                                 DistanceMetricType::Cosine => {
                                     sq_cosine_distance(&query_code, code, sq)
+                                        .unwrap_or(c.score)
                                 }
                                 DistanceMetricType::Manhattan => {
                                     // WARNING: SQ does not support Manhattan distance.
@@ -262,6 +281,9 @@ impl QuantizedHnswIndex {
             }
             QuantizationType::Product(pq) => {
                 let table = match self.metric {
+                    // NOTE: PQ cosine uses Euclidean distance tables. This is
+                    // correct for L2-normalized vectors (cosine ≈ 2 - 2·dot).
+                    // For non-normalized vectors, results may be approximate.
                     DistanceMetricType::Euclidean | DistanceMetricType::Cosine => {
                         PqDistanceTable::build_euclidean(query, pq)
                     }
@@ -274,7 +296,10 @@ impl QuantizedHnswIndex {
                         // approximate Manhattan ordering but are not exact.
                         PqDistanceTable::build_euclidean(query, pq)
                     }
-                };
+                }
+                .map_err(|e| {
+                    IndexError::Internal(format!("PQ distance table build failed: {}", e))
+                })?;
                 candidates
                     .into_iter()
                     .map(|c| {

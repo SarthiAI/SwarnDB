@@ -36,17 +36,18 @@ message FieldFilter {
   repeated MetadataValue values = 4;  // for "in" and "between" ops
 }
 
+// Server enforces max message size (default 4MB). Configure via SWARNDB_MAX_MESSAGE_SIZE.
 message SearchRequest {
-  string collection = 1;
-  Vector query = 2;
-  uint32 k = 3;
+  string collection = 1;     // max 128 chars
+  Vector query = 2;          // dimension must match collection
+  uint32 k = 3;              // 1-10000
   FilterExpression filter = 4;
-  string strategy = 5;  // "auto", "pre_filter", "post_filter"
+  string strategy = 5;       // "auto", "pre_filter", "post_filter"
   bool include_metadata = 6;
   bool include_graph = 7;
-  float graph_threshold = 8;
-  uint32 max_graph_edges = 9;
-  optional uint32 ef_search = 10;
+  float graph_threshold = 8; // 0.0-1.0
+  uint32 max_graph_edges = 9; // 0-1000
+  optional uint32 ef_search = 10; // 1-10000, overrides collection default
 }
 
 message SearchResponse {

@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Disk-based ANN storage: quantized vectors in RAM for fast approximate search,
 //! full-precision vectors on mmap'd disk for re-ranking.
@@ -18,8 +17,11 @@ use crate::mmap;
 /// Magic bytes identifying a DiskANN data file.
 const DISK_ANN_MAGIC: [u8; 4] = *b"VFDA";
 
-/// Header size: magic(4) + dimension(4) + vector_count(8) = 16 bytes.
-const DISK_ANN_HEADER_SIZE: usize = 16;
+/// Header size: magic(4) + dimension(4) + vector_count(8) + checksum(4) = 20 bytes.
+const DISK_ANN_HEADER_SIZE: usize = 20;
+
+/// Maximum vector count to prevent unbounded memory allocation (1B).
+const MAX_VECTOR_COUNT: usize = 1_000_000_000;
 
 /// Disk-based ANN store that keeps quantized vectors in RAM for fast approximate
 /// search and full-precision vectors on mmap'd disk for re-ranking.
@@ -96,10 +98,11 @@ impl DiskAnnStore {
         // Create the mmap file
         let mut mmap_mut = mmap::create(output_path, file_size)?;
 
-        // Write header
+        // Write header (checksum placeholder at offset 16, computed after data)
         mmap_mut[0..4].copy_from_slice(&DISK_ANN_MAGIC);
         mmap_mut[4..8].copy_from_slice(&(dimension as u32).to_le_bytes());
         mmap_mut[8..16].copy_from_slice(&(vectors.len() as u64).to_le_bytes());
+        // Checksum at [16..20] written after all data
 
         // Write vectors and build indices
         let mut quantized_data = HashMap::with_capacity(vectors.len());
@@ -126,6 +129,13 @@ impl DiskAnnStore {
             })?;
             quantized_data.insert(*id, codes);
         }
+
+        // Task 707: Compute CRC32 over header fields AND vector data (skip checksum slot).
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&mmap_mut[0..16]);
+        hasher.update(&mmap_mut[DISK_ANN_HEADER_SIZE..]);
+        let checksum = hasher.finalize();
+        mmap_mut[16..20].copy_from_slice(&checksum.to_le_bytes());
 
         // Flush to disk
         mmap::sync(&mmap_mut)?;
@@ -176,6 +186,27 @@ impl DiskAnnStore {
             u32::from_le_bytes(mmap_read[4..8].try_into().unwrap()) as usize;
         let vector_count =
             u64::from_le_bytes(mmap_read[8..16].try_into().unwrap()) as usize;
+
+        // Task 707: Verify CRC32 checksum over header fields AND vector data.
+        let stored_checksum = u32::from_le_bytes(mmap_read[16..20].try_into().unwrap());
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&mmap_read[0..16]);
+        hasher.update(&mmap_read[DISK_ANN_HEADER_SIZE..]);
+        let computed_checksum = hasher.finalize();
+        if stored_checksum != computed_checksum {
+            return Err(StorageError::ChecksumMismatch {
+                expected: stored_checksum,
+                computed: computed_checksum,
+            });
+        }
+
+        // Task 279: Limit vector count before allocation.
+        if vector_count > MAX_VECTOR_COUNT {
+            return Err(StorageError::SegmentInvalidHeader(format!(
+                "DiskANN vector count {} exceeds maximum allowed ({})",
+                vector_count, MAX_VECTOR_COUNT
+            )));
+        }
 
         if dimension != quantizer.dimension() {
             return Err(StorageError::SegmentDimensionMismatch {

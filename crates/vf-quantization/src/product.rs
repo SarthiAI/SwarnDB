@@ -1,10 +1,9 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Product Quantizer — splits vectors into M subvectors, quantizes each
-//! independently using a 256-entry codebook (codes fit in `u8`).
+//! independently using a configurable codebook (up to 256 entries, codes fit in `u8`).
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -12,13 +11,20 @@ use serde::{Deserialize, Serialize};
 use crate::error::QuantizationError;
 use crate::kmeans;
 
-/// Number of centroids per sub-quantizer (fixed at 256 so each code is a u8).
-const NUM_CENTROIDS: usize = 256;
+/// Default number of centroids per sub-quantizer (256 so each code fits in u8).
+const DEFAULT_NUM_CENTROIDS: usize = 256;
+
+/// Maximum number of centroids allowed (limited by u8 code type).
+const MAX_NUM_CENTROIDS: usize = 256;
 
 /// Product Quantizer that compresses a D-dimensional vector into M bytes.
 ///
 /// After training, each vector is encoded as `M` bytes where byte `m` indexes
 /// into codebook `m`. Decoding concatenates the looked-up centroids.
+///
+/// The codebook size (number of centroids per sub-quantizer) is configurable
+/// up to 256 (the maximum that fits in a u8 code). Use `new_with_codebook_size`
+/// to specify a custom codebook size, or `new` for the default of 256.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizer {
     /// Original vector dimensionality.
@@ -27,7 +33,7 @@ pub struct ProductQuantizer {
     num_subquantizers: usize,
     /// Dimensionality of each subvector (dimension / M).
     subvector_dim: usize,
-    /// Number of centroids per codebook (K = 256).
+    /// Number of centroids per codebook (K, configurable 1..=256).
     num_centroids: usize,
     /// M codebooks, each containing K centroids of `subvector_dim` dimensions.
     /// Layout: `codebooks[m][k][d]`.
@@ -37,7 +43,7 @@ pub struct ProductQuantizer {
 }
 
 impl ProductQuantizer {
-    /// Create a new (untrained) product quantizer.
+    /// Create a new (untrained) product quantizer with the default codebook size (256).
     ///
     /// # Errors
     /// Returns `InvalidParameter` if `dimension` is not evenly divisible by
@@ -46,10 +52,34 @@ impl ProductQuantizer {
         dimension: usize,
         num_subquantizers: usize,
     ) -> Result<Self, QuantizationError> {
+        Self::new_with_codebook_size(dimension, num_subquantizers, DEFAULT_NUM_CENTROIDS)
+    }
+
+    /// Create a new (untrained) product quantizer with a custom codebook size.
+    ///
+    /// # Arguments
+    /// * `dimension` — full vector dimensionality.
+    /// * `num_subquantizers` — number of subvector partitions (M).
+    /// * `num_centroids` — number of centroids per sub-quantizer (1..=256).
+    ///
+    /// # Errors
+    /// Returns `InvalidParameter` if `dimension` is not evenly divisible by
+    /// `num_subquantizers`, if any value is zero, or if `num_centroids` exceeds 256.
+    pub fn new_with_codebook_size(
+        dimension: usize,
+        num_subquantizers: usize,
+        num_centroids: usize,
+    ) -> Result<Self, QuantizationError> {
         if dimension == 0 || num_subquantizers == 0 {
             return Err(QuantizationError::InvalidParameter(
                 "dimension and num_subquantizers must be > 0".into(),
             ));
+        }
+        if num_centroids == 0 || num_centroids > MAX_NUM_CENTROIDS {
+            return Err(QuantizationError::InvalidParameter(format!(
+                "num_centroids must be 1..={}, got {}",
+                MAX_NUM_CENTROIDS, num_centroids
+            )));
         }
         if dimension % num_subquantizers != 0 {
             return Err(QuantizationError::InvalidParameter(format!(
@@ -64,7 +94,7 @@ impl ProductQuantizer {
             dimension,
             num_subquantizers,
             subvector_dim,
-            num_centroids: NUM_CENTROIDS,
+            num_centroids,
             codebooks: Vec::new(),
             trained: false,
         })
@@ -87,7 +117,7 @@ impl ProductQuantizer {
         self.subvector_dim
     }
 
-    /// Number of centroids per codebook (always 256).
+    /// Number of centroids per codebook (configurable, default 256, max 256).
     pub fn num_centroids(&self) -> usize {
         self.num_centroids
     }
@@ -149,7 +179,7 @@ impl ProductQuantizer {
 
             // Use subquantizer index as part of the seed for variety across partitions.
             let seed = 42u64.wrapping_add(m as u64);
-            let result = kmeans::kmeans(&sub_refs, self.num_centroids, max_iters, seed);
+            let result = kmeans::kmeans(&sub_refs, self.num_centroids, max_iters, seed)?;
 
             codebooks.push(result.centroids);
         }

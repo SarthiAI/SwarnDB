@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use crate::filter::FilterExpression;
 use std::cmp::Ordering;
@@ -33,6 +32,8 @@ pub enum FilterOp {
     Exists(String),
     /// Push result of field contains substring/element
     Contains(String, String),
+    /// Always pushes false onto the stack (depth limit exceeded)
+    False,
     /// Pop top, push !top
     Not,
     /// Pop N values, push AND of all
@@ -56,25 +57,41 @@ impl CompiledFilter {
         CompiledFilter { ops }
     }
 
+    /// Maximum nesting depth for filter compilation to prevent stack overflow.
+    const MAX_COMPILE_DEPTH: usize = 32;
+
     /// Recursively emit ops for an expression (post-order: children first, then combinator).
     fn emit(expr: &FilterExpression, ops: &mut Vec<FilterOp>) {
+        Self::emit_with_depth(expr, ops, 0);
+    }
+
+    fn emit_with_depth(expr: &FilterExpression, ops: &mut Vec<FilterOp>, depth: usize) {
+        if depth > Self::MAX_COMPILE_DEPTH {
+            // Exceeding max depth: push a dedicated False op to avoid stack overflow
+            ops.push(FilterOp::False);
+            return;
+        }
+        Self::emit_inner(expr, ops, depth);
+    }
+
+    fn emit_inner(expr: &FilterExpression, ops: &mut Vec<FilterOp>, depth: usize) {
         match expr {
             FilterExpression::And(children) => {
                 let count = children.len();
                 for child in children {
-                    Self::emit(child, ops);
+                    Self::emit_with_depth(child, ops, depth + 1);
                 }
                 ops.push(FilterOp::And(count));
             }
             FilterExpression::Or(children) => {
                 let count = children.len();
                 for child in children {
-                    Self::emit(child, ops);
+                    Self::emit_with_depth(child, ops, depth + 1);
                 }
                 ops.push(FilterOp::Or(count));
             }
             FilterExpression::Not(child) => {
-                Self::emit(child, ops);
+                Self::emit_with_depth(child, ops, depth + 1);
                 ops.push(FilterOp::Not);
             }
             FilterExpression::Eq(f, v) => ops.push(FilterOp::Eq(f.clone(), v.clone())),
@@ -166,6 +183,9 @@ impl CompiledFilter {
                     };
                     stack.push(result);
                 }
+                FilterOp::False => {
+                    stack.push(false);
+                }
                 FilterOp::Not => {
                     if let Some(top) = stack.last_mut() {
                         *top = !*top;
@@ -204,12 +224,22 @@ impl CompiledFilter {
 pub struct FilterEvaluator;
 
 impl FilterEvaluator {
+    /// Maximum nesting depth for tree-walking evaluation.
+    const MAX_EVAL_DEPTH: usize = 32;
+
     /// Evaluate a filter expression against metadata (uncompiled, tree-walking path).
     pub fn evaluate(filter: &FilterExpression, metadata: &Metadata) -> bool {
+        Self::evaluate_with_depth(filter, metadata, 0)
+    }
+
+    fn evaluate_with_depth(filter: &FilterExpression, metadata: &Metadata, depth: usize) -> bool {
+        if depth > Self::MAX_EVAL_DEPTH {
+            return false;
+        }
         match filter {
-            FilterExpression::And(children) => children.iter().all(|c| Self::evaluate(c, metadata)),
-            FilterExpression::Or(children) => children.iter().any(|c| Self::evaluate(c, metadata)),
-            FilterExpression::Not(child) => !Self::evaluate(child, metadata),
+            FilterExpression::And(children) => children.iter().all(|c| Self::evaluate_with_depth(c, metadata, depth + 1)),
+            FilterExpression::Or(children) => children.iter().any(|c| Self::evaluate_with_depth(c, metadata, depth + 1)),
+            FilterExpression::Not(child) => !Self::evaluate_with_depth(child, metadata, depth + 1),
 
             FilterExpression::Eq(field, value) => metadata
                 .get(field)

@@ -37,6 +37,7 @@ class CollectionInfo:
     distance_metric: str
     vector_count: int
     default_threshold: float
+    status: str = "active"
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class GhostVector:
 
     id: int
     isolation_score: float
+    compute_time_us: int = 0
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,7 @@ class ConeSearchResult:
     id: int
     cosine_similarity: float
     angle_radians: float
+    compute_time_us: int = 0
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,7 @@ class DriftReport:
     mean_distance_window2: float
     spread_change: float
     has_drifted: bool
+    compute_time_us: int = 0
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,7 @@ class ClusterResult:
     assignments: List[ClusterAssignment]
     iterations: int
     converged: bool
+    compute_time_us: int = 0
 
 
 @dataclass(frozen=True)
@@ -113,6 +118,7 @@ class PCAResult:
     explained_variance: List[float]
     mean: List[float]
     projected: List[List[float]]
+    compute_time_us: int = 0
 
 
 @dataclass(frozen=True)
@@ -122,6 +128,7 @@ class DiversityResult:
     id: int
     relevance_score: float
     mmr_score: float
+    compute_time_us: int = 0
 
 
 @dataclass(frozen=True)

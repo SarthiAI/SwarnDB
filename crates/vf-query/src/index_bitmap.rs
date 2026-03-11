@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 
@@ -22,9 +21,8 @@ pub enum BitmapKey {
 /// Each unique value gets its own bitmap. Set operations (AND/OR/NOT)
 /// enable efficient multi-filter evaluation.
 ///
-/// Note: RoaringBitmap uses u32 internally. VectorId (u64) is truncated
-/// via `id as u32`. This limits the index to ~4 billion IDs, which is
-/// acceptable for v1.
+/// Note: RoaringBitmap uses u32 internally. VectorId (u64) is converted
+/// via checked `try_into()`, silently skipping IDs that exceed the u32 range.
 pub struct BitmapIndex {
     field_name: String,
     bitmaps: HashMap<BitmapKey, RoaringBitmap>,
@@ -51,7 +49,10 @@ impl BitmapIndex {
     /// For `StringList` values, the ID is inserted into a separate bitmap for each element.
     /// Re-inserting an ID with a different value cleans up stale entries first.
     pub fn insert(&mut self, id: VectorId, value: &MetadataValue) {
-        let id32 = id as u32;
+        let id32: u32 = match id.try_into() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
         // Remove old keys if this ID was previously indexed (Bug 1: reverse mapping)
         if let Some(old_keys) = self.id_to_keys.remove(&id32) {
@@ -91,7 +92,10 @@ impl BitmapIndex {
 
     /// Remove a vector ID from all bitmaps.
     pub fn remove(&mut self, id: VectorId) {
-        let id32 = id as u32;
+        let id32: u32 = match id.try_into() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
         self.all_ids.remove(id32);
 
         // Use reverse map to only touch relevant bitmaps (Bug 1)

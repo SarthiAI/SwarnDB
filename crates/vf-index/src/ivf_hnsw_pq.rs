@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! IVF+HNSW+PQ hybrid index for billion-scale vector search.
 //!
@@ -19,7 +18,7 @@
 //! This keeps only compressed data in memory, enabling billion-scale datasets
 //! on a single node.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ordered_float::OrderedFloat;
@@ -53,9 +52,8 @@ struct CompressedEntry {
 /// bookkeeping. For 128-dim vectors with M=16 sub-quantizers, this is ~16 bytes
 /// per vector vs ~512 bytes for full f32 storage (32x compression).
 ///
-/// **Partition limit:** The effective number of partitions is clamped to 256
-/// during `train()` (the maximum k-means cluster count). Requesting more than
-/// 256 partitions will silently reduce to 256.
+/// **Partition limit:** The effective number of partitions is clamped to
+/// `min(num_partitions, training_data_size)` during `train()`.
 ///
 /// **Append-only:** This index supports `add` / `add_batch` but does not
 /// support removing or updating individual vectors after insertion.
@@ -77,6 +75,8 @@ pub struct IvfHnswPqIndex {
     total_vectors: AtomicUsize,
     /// Number of PQ sub-quantizers.
     num_subquantizers: usize,
+    /// Set of all inserted vector IDs for O(1) contains() and duplicate detection.
+    id_index: RwLock<HashSet<VectorId>>,
 }
 
 // Safety: All mutable state is behind RwLock or AtomicUsize.
@@ -124,10 +124,12 @@ impl IvfHnswPqIndex {
         // Coarse quantizer HNSW: small graph, tuned for centroid search.
         // Use smaller params since the centroid set is small.
         let hnsw_params = HnswParams::new(
-            16,  // m
-            64,  // ef_construction — modest for a small graph
-            32,  // ef_search — enough for nprobe lookups
-        );
+            16,      // m
+            64,      // ef_construction — modest for a small graph
+            32,      // ef_search — enough for nprobe lookups
+            100_000, // max_ef
+            24,      // max_level_cap
+        )?;
         let coarse_quantizer = HnswIndex::new(
             dimension,
             vf_core::types::DistanceMetricType::Euclidean,
@@ -148,6 +150,7 @@ impl IvfHnswPqIndex {
             trained: false,
             total_vectors: AtomicUsize::new(0),
             num_subquantizers: pq_subquantizers,
+            id_index: RwLock::new(HashSet::new()),
         })
     }
 
@@ -158,10 +161,9 @@ impl IvfHnswPqIndex {
     /// 2. **HNSW construction** over the centroids for fast coarse assignment
     /// 3. **PQ training** on the residual vectors (vector - nearest centroid)
     ///
-    /// **Note:** The effective partition count is clamped to
-    /// `min(num_partitions, vectors.len(), 256)`. The 256 upper bound comes
-    /// from the PQ codebook size (each sub-quantizer uses 256 centroids via
-    /// k-means). After training, `num_partitions()` reflects the actual count.
+    /// **Note:** If `num_partitions` exceeds the number of training vectors,
+    /// an error is returned (you need at least as many training vectors as
+    /// partitions for meaningful centroids).
     ///
     /// # Arguments
     /// * `vectors` - Training vectors. Should be a representative sample of the
@@ -190,11 +192,20 @@ impl IvfHnswPqIndex {
             }
         }
 
-        // Clamp num_partitions to min(requested, data_size, 256) for k-means.
-        let effective_k = self.num_partitions.min(vectors.len()).min(256);
+        // Validate that we have enough training vectors for the requested partitions.
+        if vectors.len() < self.num_partitions {
+            return Err(IndexError::Internal(format!(
+                "not enough training vectors ({}) for {} partitions; \
+                 provide at least as many training vectors as partitions",
+                vectors.len(),
+                self.num_partitions
+            )));
+        }
+        let effective_k = self.num_partitions;
 
         // Step 1: Run k-means to find partition centroids.
-        let km_result = kmeans::kmeans(vectors, effective_k, kmeans_iters, 42);
+        let km_result = kmeans::kmeans(vectors, effective_k, kmeans_iters, 42)
+            .map_err(|e| IndexError::Internal(format!("kmeans failed: {}", e)))?;
         self.centroids = km_result.centroids;
         self.num_partitions = self.centroids.len();
 
@@ -204,7 +215,8 @@ impl IvfHnswPqIndex {
             .collect();
 
         // Step 2: Build HNSW coarse quantizer from centroids.
-        let hnsw_params = HnswParams::new(16, 64, 32);
+        let hnsw_params = HnswParams::new(16, 64, 32, 100_000, 24)
+            .map_err(|e| IndexError::Internal(format!("failed to create HnswParams: {}", e)))?;
         self.coarse_quantizer = HnswIndex::new(
             self.dimension,
             vf_core::types::DistanceMetricType::Euclidean,
@@ -241,6 +253,7 @@ impl IvfHnswPqIndex {
 
         self.trained = true;
         self.total_vectors.store(0, Ordering::Relaxed);
+        self.id_index.write().clear();
 
         Ok(())
     }
@@ -255,7 +268,8 @@ impl IvfHnswPqIndex {
     /// inverted list has its own lock.
     ///
     /// # Errors
-    /// Returns an error if the index is not trained or dimensions mismatch.
+    /// Returns an error if the index is not trained, dimensions mismatch,
+    /// or the vector ID already exists.
     pub fn add(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
         self.check_trained()?;
         if vector.len() != self.dimension {
@@ -263,6 +277,14 @@ impl IvfHnswPqIndex {
                 expected: self.dimension,
                 actual: vector.len(),
             });
+        }
+
+        // Check for duplicate ID before insertion.
+        {
+            let mut ids = self.id_index.write();
+            if !ids.insert(id) {
+                return Err(IndexError::AlreadyExists(id));
+            }
         }
 
         let partition = self.assign_partition(vector);
@@ -301,6 +323,22 @@ impl IvfHnswPqIndex {
             }
         }
 
+        // Check for duplicates against existing IDs and within the batch.
+        {
+            let mut ids = self.id_index.write();
+            let mut inserted = Vec::new();
+            for &(id, _) in vectors {
+                if !ids.insert(id) {
+                    // Rollback previously inserted IDs
+                    for rollback_id in &inserted {
+                        ids.remove(rollback_id);
+                    }
+                    return Err(IndexError::AlreadyExists(id));
+                }
+                inserted.push(id);
+            }
+        }
+
         // Pre-encode all vectors in parallel, collecting errors properly.
         let pq = self.pq.read();
         let encoded: Result<Vec<(VectorId, usize, Vec<u8>)>, IndexError> = vectors
@@ -315,7 +353,17 @@ impl IvfHnswPqIndex {
             })
             .collect();
         drop(pq);
-        let encoded = encoded?;
+        let encoded = match encoded {
+            Ok(e) => e,
+            Err(err) => {
+                // Rollback id_index on encoding failure
+                let mut ids = self.id_index.write();
+                for &(id, _) in vectors {
+                    ids.remove(&id);
+                }
+                return Err(err);
+            }
+        };
 
         // Insert into inverted lists (sequentially per-partition for minimal contention).
         for (id, partition, codes) in encoded {
@@ -383,7 +431,8 @@ impl IvfHnswPqIndex {
             let query_residual = compute_residual(query, &self.centroids[partition_id]);
 
             // Build PQ distance table for this residual.
-            let dist_table = PqDistanceTable::build_euclidean(&query_residual, &pq);
+            let dist_table = PqDistanceTable::build_euclidean(&query_residual, &pq)
+                .map_err(|e| IndexError::Internal(format!("PQ distance table build failed: {}", e)))?;
 
             // Scan all entries in this partition.
             let list = self.inverted_lists[partition_id].read();
@@ -589,10 +638,8 @@ impl VectorIndex for IvfHnswPqIndex {
     }
 
     fn contains(&self, id: VectorId) -> bool {
-        // Scan all inverted lists for the ID.
-        self.inverted_lists
-            .iter()
-            .any(|list| list.read().iter().any(|entry| entry.id == id))
+        // O(1) lookup via the ID index set.
+        self.id_index.read().contains(&id)
     }
 }
 
@@ -626,6 +673,7 @@ mod tests {
         assert!(IvfHnswPqIndex::new(128, 0, 8).is_err());
         assert!(IvfHnswPqIndex::new(128, 4, 0).is_err());
         assert!(IvfHnswPqIndex::new(127, 4, 8).is_err()); // not divisible
+        assert!(IvfHnswPqIndex::new(128, 512, 8).is_ok()); // >256 partitions now supported
     }
 
     #[test]

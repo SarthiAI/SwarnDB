@@ -1,0 +1,42 @@
+# ============================================================================
+# WARNING: BENCHMARKING ONLY - NOT FOR PRODUCTION USE
+# This compose file disables authentication and uses extreme timeouts
+# for benchmark workloads. Never use this configuration in production.
+# ============================================================================
+version: "3.8"
+
+services:
+  swarndb:
+    build: .
+    container_name: swarndb
+    ports:
+      - "127.0.0.1:50051:50051"
+      - "127.0.0.1:8080:8080"
+    environment:
+      SWARNDB_HOST: "0.0.0.0"
+      SWARNDB_GRPC_PORT: "50051"
+      SWARNDB_REST_PORT: "8080"
+      SWARNDB_DATA_DIR: "/data"
+      SWARNDB_LOG_LEVEL: "info"
+      SWARNDB_API_KEYS: ""
+      SWARNDB_BULK_TIMEOUT_MS: "3600000"
+      SWARNDB_REQUEST_TIMEOUT_MS: "3600000"
+      SWARNDB_SEARCH_TIMEOUT_MS: "60000"
+    volumes:
+      - swarndb_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 25G
+          cpus: "8.0"
+
+volumes:
+  swarndb_data:
+    driver: local

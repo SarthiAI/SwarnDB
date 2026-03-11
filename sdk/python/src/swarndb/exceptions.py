@@ -26,8 +26,9 @@ class SwarnDBError(Exception):
 # --- Connection errors ---
 
 
-class ConnectionError(SwarnDBError):
+class SwarnDBConnectionError(SwarnDBError):
     """Raised when a connection to SwarnDB cannot be established or is lost."""
+
 
 
 class AuthenticationError(SwarnDBError):

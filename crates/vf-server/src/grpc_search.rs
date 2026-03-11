@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -44,6 +43,10 @@ impl SearchService for SearchServiceImpl {
         let collection = collections
             .get(&req.collection)
             .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+
+        if req.k < 1 || req.k > self.state.max_k {
+            return Err(Status::invalid_argument(format!("k must be between 1 and {}", self.state.max_k)));
+        }
 
         let query_vector = req
             .query

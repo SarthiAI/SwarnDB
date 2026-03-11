@@ -16,12 +16,13 @@ service VectorMathService {
 }
 
 // Ghost detection
+// Server enforces max message size (default 4MB). Configure via SWARNDB_MAX_MESSAGE_SIZE.
 message DetectGhostsRequest {
-  string collection = 1;
-  float threshold = 2;
-  repeated Vector centroids = 3;  // if empty, auto-cluster with k
-  uint32 auto_k = 4;  // k for auto-clustering, default 8
-  string metric = 5;  // "euclidean", "cosine", etc.
+  string collection = 1;          // max 128 chars
+  float threshold = 2;            // 0.0-1.0
+  repeated Vector centroids = 3;  // if empty, auto-cluster with k; max 1000
+  uint32 auto_k = 4;              // k for auto-clustering, 1-1000, default 8
+  string metric = 5;              // "euclidean", "cosine", etc.
 }
 
 message GhostVector {
@@ -98,11 +99,11 @@ message DetectDriftResponse {
 
 // Clustering
 message ClusterRequest {
-  string collection = 1;
-  uint32 k = 2;
-  uint32 max_iterations = 3;
-  float tolerance = 4;
-  string metric = 5;
+  string collection = 1;      // max 128 chars
+  uint32 k = 2;               // 1-10000
+  uint32 max_iterations = 3;  // 1-10000, default 100
+  float tolerance = 4;        // > 0.0
+  string metric = 5;          // "euclidean", "cosine", etc.
 }
 
 message ClusterAssignmentProto {
@@ -121,9 +122,9 @@ message ClusterResponse {
 
 // PCA
 message ReduceDimensionsRequest {
-  string collection = 1;
-  uint32 n_components = 2;
-  repeated uint64 vector_ids = 3;  // if empty, use all
+  string collection = 1;              // max 128 chars
+  uint32 n_components = 2;            // 1-dimension, must be <= collection dimension
+  repeated uint64 vector_ids = 3;     // if empty, use all; max 100000
 }
 
 message ReduceDimensionsResponse {
@@ -156,11 +157,11 @@ message ComputeAnalogyResponse {
 
 // Diversity sampling
 message DiversitySampleRequest {
-  string collection = 1;
-  Vector query = 2;
-  uint32 k = 3;
-  float lambda = 4;  // 0.0 = pure diversity, 1.0 = pure relevance
-  repeated uint64 candidate_ids = 5;  // if empty, use all
+  string collection = 1;              // max 128 chars
+  Vector query = 2;                   // dimension must match collection
+  uint32 k = 3;                       // 1-10000
+  float lambda = 4;                   // 0.0 = pure diversity, 1.0 = pure relevance
+  repeated uint64 candidate_ids = 5;  // if empty, use all; max 100000
 }
 
 message DiversitySampleResult {

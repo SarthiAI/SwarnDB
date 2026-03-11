@@ -1,3 +1,8 @@
+# NOTE: The default PVC uses ReadWriteOnce (RWO) access mode, which binds to a single node.
+# Scaling beyond 1 replica requires either:
+#   1. Changing the PVC to ReadWriteMany (RWX) with a compatible storage class, or
+#   2. Using a StatefulSet with per-replica PVCs.
+# With RWO, pods scheduled on different nodes will fail to mount the volume.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

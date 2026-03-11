@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Hamming distance functions for binary quantized vectors.
 //!
@@ -34,6 +33,9 @@ pub fn hamming_distance_batch(query: &[u64], candidates: &[&[u64]]) -> Vec<u32> 
 /// packed bits), so trailing padding bits don't affect the result.
 #[inline]
 pub fn normalized_hamming_distance(a: &[u64], b: &[u64], dimension: usize) -> f32 {
+    if dimension == 0 {
+        return 0.0;
+    }
     let h = hamming_distance(a, b);
     h as f32 / dimension as f32
 }
@@ -49,6 +51,9 @@ pub fn normalized_hamming_distance(a: &[u64], b: &[u64], dimension: usize) -> f3
 /// and how well binary quantization preserves angular relationships.
 #[inline]
 pub fn hamming_to_cosine_estimate(hamming: u32, dimension: usize) -> f32 {
+    if dimension == 0 {
+        return 0.0;
+    }
     2.0 * hamming as f32 / dimension as f32
 }
 

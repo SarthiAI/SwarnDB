@@ -1,3 +1,4 @@
+use log;
 use vf_core::types::VectorId;
 
 #[derive(Debug, Clone)]
@@ -9,15 +10,34 @@ pub struct DiversityResult {
 
 pub struct DiversitySampler;
 
+/// Default maximum number of candidates to prevent quadratic CPU cost (DoS).
+const DEFAULT_MAX_CANDIDATES: usize = 1_000_000;
+
 impl DiversitySampler {
     /// Select k most diverse vectors using MMR.
     /// lambda: 1.0 = pure relevance, 0.0 = pure diversity.
+    ///
+    /// `max_candidates`: optional cap on input size (defaults to 1,000,000).
+    /// Candidates are truncated to this limit to prevent quadratic CPU cost
+    /// from the pairwise similarity computation.
     pub fn mmr(
         query: &[f32],
         candidates: &[(VectorId, &[f32])],
         k: usize,
         lambda: f32,
+        max_candidates: Option<usize>,
     ) -> Vec<DiversityResult> {
+        let cap = max_candidates.unwrap_or(DEFAULT_MAX_CANDIDATES);
+        let candidates = if candidates.len() > cap {
+            log::warn!(
+                "MMR candidates ({}) exceed max_candidates ({}), truncating",
+                candidates.len(),
+                cap
+            );
+            &candidates[..cap]
+        } else {
+            candidates
+        };
         let k = k.min(candidates.len());
         if k == 0 || candidates.is_empty() {
             return Vec::new();
@@ -74,7 +94,26 @@ impl DiversitySampler {
     }
 
     /// Select k most diverse vectors from a set (no query — maximize mutual distance).
-    pub fn max_diversity(candidates: &[(VectorId, &[f32])], k: usize) -> Vec<VectorId> {
+    ///
+    /// `max_candidates`: optional cap on input size (defaults to 1,000,000).
+    /// Candidates are truncated to this limit to prevent quadratic CPU cost
+    /// from the pairwise distance computation.
+    pub fn max_diversity(
+        candidates: &[(VectorId, &[f32])],
+        k: usize,
+        max_candidates: Option<usize>,
+    ) -> Vec<VectorId> {
+        let cap = max_candidates.unwrap_or(DEFAULT_MAX_CANDIDATES);
+        let candidates = if candidates.len() > cap {
+            log::warn!(
+                "max_diversity candidates ({}) exceed max_candidates ({}), truncating",
+                candidates.len(),
+                cap
+            );
+            &candidates[..cap]
+        } else {
+            candidates
+        };
         let k = k.min(candidates.len());
         if k == 0 || candidates.is_empty() {
             return Vec::new();
@@ -175,7 +214,7 @@ mod tests {
         let v2 = normalize(&[0.7, 0.7, 0.0]);
         let v3 = normalize(&[0.0, 1.0, 0.0]);
         let candidates: Vec<(VectorId, &[f32])> = vec![(1, &v1), (2, &v2), (3, &v3)];
-        let results = DiversitySampler::mmr(&query, &candidates, 3, 1.0);
+        let results = DiversitySampler::mmr(&query, &candidates, 3, 1.0, None);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, 1);
     }
@@ -184,7 +223,7 @@ mod tests {
     fn test_mmr_empty() {
         let query = [1.0, 0.0];
         let candidates: Vec<(VectorId, &[f32])> = vec![];
-        let results = DiversitySampler::mmr(&query, &candidates, 5, 0.5);
+        let results = DiversitySampler::mmr(&query, &candidates, 5, 0.5, None);
         assert!(results.is_empty());
     }
 
@@ -195,13 +234,13 @@ mod tests {
         let v3 = normalize(&[0.0, 1.0, 0.0]);
         let v4 = normalize(&[0.0, 0.0, 1.0]);
         let candidates: Vec<(VectorId, &[f32])> = vec![(1, &v1), (2, &v2), (3, &v3), (4, &v4)];
-        let result = DiversitySampler::max_diversity(&candidates, 3);
+        let result = DiversitySampler::max_diversity(&candidates, 3, None);
         assert_eq!(result.len(), 3);
     }
 
     #[test]
     fn test_max_diversity_empty() {
         let candidates: Vec<(VectorId, &[f32])> = vec![];
-        assert!(DiversitySampler::max_diversity(&candidates, 5).is_empty());
+        assert!(DiversitySampler::max_diversity(&candidates, 5, None).is_empty());
     }
 }

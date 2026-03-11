@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Asymmetric distance computation for Product Quantization.
 //!
@@ -15,6 +14,7 @@
 
 use std::sync::OnceLock;
 
+use crate::error::QuantizationError;
 use crate::product::ProductQuantizer;
 
 // ---------------------------------------------------------------------------
@@ -22,14 +22,22 @@ use crate::product::ProductQuantizer;
 // ---------------------------------------------------------------------------
 
 /// Function pointer type for SIMD-dispatched PQ distance kernel.
-/// Arguments: (flat_tables pointer, codes, num_subquantizers) -> distance
-type PqDistanceKernelFn = fn(&[f32], &[u8], usize) -> f32;
+/// Arguments: (flat_tables pointer, codes, num_subquantizers, codebook_size) -> distance
+type PqDistanceKernelFn = fn(&[f32], &[u8], usize, usize) -> f32;
 
 /// Runtime dispatcher that selects the best PQ distance kernel at startup.
+///
+/// Contains only a function pointer (`fn` type), which is `Copy`, `Send`, and
+/// `Sync` by nature. The struct holds no raw pointers, interior mutability, or
+/// thread-local state, so sharing across threads is safe.
 struct PqDistanceDispatcher {
     kernel: PqDistanceKernelFn,
 }
 
+// SAFETY: `PqDistanceDispatcher` contains only a `fn` pointer, which is inherently
+// `Send` and `Sync`. There is no mutable shared state, raw pointers, or
+// non-thread-safe interior mutability. The dispatcher is initialized once via
+// `OnceLock` and only read thereafter.
 unsafe impl Send for PqDistanceDispatcher {}
 unsafe impl Sync for PqDistanceDispatcher {}
 
@@ -43,7 +51,7 @@ impl PqDistanceDispatcher {
     #[cfg(target_arch = "x86_64")]
     fn select_kernel() -> PqDistanceKernelFn {
         if is_x86_feature_detected!("avx2") {
-            |flat_tables, codes, m| unsafe { avx2_pq_distance(flat_tables, codes, m) }
+            |flat_tables, codes, m, k| unsafe { avx2_pq_distance(flat_tables, codes, m, k) }
         } else {
             scalar_pq_distance
         }
@@ -74,11 +82,20 @@ fn get_pq_dispatcher() -> &'static PqDistanceDispatcher {
 // ---------------------------------------------------------------------------
 
 /// Scalar PQ distance: sum of M table lookups.
-fn scalar_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
+///
+/// # Safety invariant
+/// `flat_tables` must have at least `m * k` entries, and `codes` must have
+/// at least `m` entries. These are guaranteed by `PqDistanceTable` construction.
+fn scalar_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize, k: usize) -> f32 {
+    debug_assert!(codes.len() >= m, "codes length must be >= m");
+    debug_assert!(
+        flat_tables.len() >= m * k,
+        "flat_tables must have at least m*k entries"
+    );
     let mut total = 0.0f32;
     for i in 0..m {
-        // Each sub-quantizer table starts at offset i * 256.
-        let idx = i * 256 + codes[i] as usize;
+        // Each sub-quantizer table starts at offset i * k.
+        let idx = i * k + codes[i] as usize;
         total += flat_tables[idx];
     }
     total
@@ -90,8 +107,27 @@ fn scalar_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn avx2_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
+/// SAFETY: Caller must ensure:
+/// - `flat_tables.len() >= m * k` (each sub-quantizer has k f32 entries)
+/// - `codes.len() >= m` (one u8 code per sub-quantizer)
+/// - AVX2 feature is available (enforced by `target_feature` attribute)
+///
+/// All gather indices are of the form `i * k + codes[i]` where `i < m` and
+/// `codes[i] < k`, so the maximum index is `(m-1)*k + (k-1) = m*k - 1`,
+/// which is within bounds of `flat_tables` given the precondition above.
+unsafe fn avx2_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize, k: usize) -> f32 {
     use std::arch::x86_64::*;
+
+    // Bounds check: verify that all indices we will access are within bounds.
+    debug_assert!(codes.len() >= m, "codes length must be >= m");
+    debug_assert!(
+        flat_tables.len() >= m * k,
+        "flat_tables must have at least m*k entries"
+    );
+    if codes.len() < m || flat_tables.len() < m * k {
+        // Fall back to safe scalar computation if bounds are violated.
+        return scalar_pq_distance(flat_tables, codes, m, k);
+    }
 
     let chunks = m / 8;
     let base_ptr = flat_tables.as_ptr();
@@ -101,16 +137,16 @@ unsafe fn avx2_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
     for chunk in 0..chunks {
         let offset = chunk * 8;
 
-        // Build 8 gather indices: index[j] = (offset + j) * 256 + codes[offset + j]
+        // Build 8 gather indices: index[j] = (offset + j) * k + codes[offset + j]
         let indices = _mm256_set_epi32(
-            ((offset + 7) * 256 + codes[offset + 7] as usize) as i32,
-            ((offset + 6) * 256 + codes[offset + 6] as usize) as i32,
-            ((offset + 5) * 256 + codes[offset + 5] as usize) as i32,
-            ((offset + 4) * 256 + codes[offset + 4] as usize) as i32,
-            ((offset + 3) * 256 + codes[offset + 3] as usize) as i32,
-            ((offset + 2) * 256 + codes[offset + 2] as usize) as i32,
-            ((offset + 1) * 256 + codes[offset + 1] as usize) as i32,
-            ((offset + 0) * 256 + codes[offset + 0] as usize) as i32,
+            ((offset + 7) * k + codes[offset + 7] as usize) as i32,
+            ((offset + 6) * k + codes[offset + 6] as usize) as i32,
+            ((offset + 5) * k + codes[offset + 5] as usize) as i32,
+            ((offset + 4) * k + codes[offset + 4] as usize) as i32,
+            ((offset + 3) * k + codes[offset + 3] as usize) as i32,
+            ((offset + 2) * k + codes[offset + 2] as usize) as i32,
+            ((offset + 1) * k + codes[offset + 1] as usize) as i32,
+            ((offset + 0) * k + codes[offset + 0] as usize) as i32,
         );
 
         // Gather 8 f32 values from the flat table using the computed indices.
@@ -133,7 +169,9 @@ unsafe fn avx2_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
     // Scalar tail for remaining subquantizers (m % 8).
     let tail_start = chunks * 8;
     for i in tail_start..m {
-        let idx = i * 256 + codes[i] as usize;
+        let idx = i * k + codes[i] as usize;
+        // SAFETY: idx = i*k + codes[i] where i < m and codes[i] < k,
+        // so idx < m*k <= flat_tables.len() (checked above).
         total += *base_ptr.add(idx);
     }
 
@@ -150,15 +188,17 @@ unsafe fn avx2_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
 /// partial distance between `query_m` and `centroid_{m,k}`. The total distance
 /// to a PQ-encoded vector is `sum_m tables[m][codes[m]]`.
 ///
-/// Internally maintains a flat contiguous buffer (`flat_tables`) of size M*256
+/// Internally maintains a flat contiguous buffer (`flat_tables`) of size M*K
 /// for SIMD gather-friendly access on AVX2 platforms.
 pub struct PqDistanceTable {
-    /// M tables, each with K=256 entries (kept for compatibility).
+    /// M tables, each with K entries (kept for compatibility).
     tables: Vec<Vec<f32>>,
-    /// Flat contiguous buffer: `flat_tables[m * 256 + k] == tables[m][k]`.
-    /// Layout is gather-friendly: all 256 entries for sub-quantizer 0 first,
-    /// then all 256 for sub-quantizer 1, etc.
+    /// Flat contiguous buffer: `flat_tables[m * k + i] == tables[m][i]`.
+    /// Layout is gather-friendly: all K entries for sub-quantizer 0 first,
+    /// then all K for sub-quantizer 1, etc.
     flat_tables: Vec<f32>,
+    /// Codebook size (K) — number of centroids per sub-quantizer.
+    codebook_size: usize,
 }
 
 impl PqDistanceTable {
@@ -171,19 +211,21 @@ impl PqDistanceTable {
     /// squared distances, which equals the squared L2 distance between the
     /// query and the reconstructed vector.
     ///
-    /// # Panics
-    /// Panics if the quantizer is not trained or if the query length does not
-    /// match the quantizer's dimension.
-    pub fn build_euclidean(query: &[f32], pq: &ProductQuantizer) -> Self {
-        assert!(
-            pq.is_trained(),
-            "PqDistanceTable: quantizer must be trained"
-        );
-        assert_eq!(
-            query.len(),
-            pq.dimension(),
-            "PqDistanceTable: query dimension mismatch"
-        );
+    /// Returns an error if the quantizer is not trained or if the query length
+    /// does not match the quantizer's dimension.
+    pub fn build_euclidean(
+        query: &[f32],
+        pq: &ProductQuantizer,
+    ) -> Result<Self, QuantizationError> {
+        if !pq.is_trained() {
+            return Err(QuantizationError::NotTrained);
+        }
+        if query.len() != pq.dimension() {
+            return Err(QuantizationError::DimensionMismatch {
+                expected: pq.dimension(),
+                got: query.len(),
+            });
+        }
 
         let m = pq.num_subquantizers();
         let sub_dim = pq.subvector_dim();
@@ -191,7 +233,7 @@ impl PqDistanceTable {
         let codebooks = pq.codebooks();
 
         let mut tables = Vec::with_capacity(m);
-        let mut flat_tables = Vec::with_capacity(m * 256);
+        let mut flat_tables = Vec::with_capacity(m * k);
 
         for mi in 0..m {
             let q_start = mi * sub_dim;
@@ -211,18 +253,19 @@ impl PqDistanceTable {
                     .sum();
                 table.push(dist);
             }
-            // Pad to exactly 256 entries if k < 256 (shouldn't happen, but safe).
+            // Pad to exactly k entries (safe guard).
             flat_tables.extend_from_slice(&table);
-            for _ in table.len()..256 {
+            for _ in table.len()..k {
                 flat_tables.push(0.0);
             }
             tables.push(table);
         }
 
-        Self {
+        Ok(Self {
             tables,
             flat_tables,
-        }
+            codebook_size: k,
+        })
     }
 
     /// Build a distance table using **negative dot product** (for maximum inner
@@ -234,19 +277,21 @@ impl PqDistanceTable {
     /// We negate so that _lower_ values correspond to _higher_ inner products,
     /// making it compatible with nearest-neighbor search that minimises distance.
     ///
-    /// # Panics
-    /// Panics if the quantizer is not trained or if the query length does not
-    /// match the quantizer's dimension.
-    pub fn build_dot_product(query: &[f32], pq: &ProductQuantizer) -> Self {
-        assert!(
-            pq.is_trained(),
-            "PqDistanceTable: quantizer must be trained"
-        );
-        assert_eq!(
-            query.len(),
-            pq.dimension(),
-            "PqDistanceTable: query dimension mismatch"
-        );
+    /// Returns an error if the quantizer is not trained or if the query length
+    /// does not match the quantizer's dimension.
+    pub fn build_dot_product(
+        query: &[f32],
+        pq: &ProductQuantizer,
+    ) -> Result<Self, QuantizationError> {
+        if !pq.is_trained() {
+            return Err(QuantizationError::NotTrained);
+        }
+        if query.len() != pq.dimension() {
+            return Err(QuantizationError::DimensionMismatch {
+                expected: pq.dimension(),
+                got: query.len(),
+            });
+        }
 
         let m = pq.num_subquantizers();
         let sub_dim = pq.subvector_dim();
@@ -254,7 +299,7 @@ impl PqDistanceTable {
         let codebooks = pq.codebooks();
 
         let mut tables = Vec::with_capacity(m);
-        let mut flat_tables = Vec::with_capacity(m * 256);
+        let mut flat_tables = Vec::with_capacity(m * k);
 
         for mi in 0..m {
             let q_start = mi * sub_dim;
@@ -271,18 +316,19 @@ impl PqDistanceTable {
                     .sum();
                 table.push(-dot);
             }
-            // Pad to exactly 256 entries.
+            // Pad to exactly k entries.
             flat_tables.extend_from_slice(&table);
-            for _ in table.len()..256 {
+            for _ in table.len()..k {
                 flat_tables.push(0.0);
             }
             tables.push(table);
         }
 
-        Self {
+        Ok(Self {
             tables,
             flat_tables,
-        }
+            codebook_size: k,
+        })
     }
 
     /// Compute the approximate distance to a single PQ-encoded vector.
@@ -300,7 +346,7 @@ impl PqDistanceTable {
         );
 
         let m = self.tables.len();
-        (get_pq_dispatcher().kernel)(&self.flat_tables, codes, m)
+        (get_pq_dispatcher().kernel)(&self.flat_tables, codes, m, self.codebook_size)
     }
 
     /// Compute distances to a batch of PQ-encoded vectors.
@@ -343,7 +389,7 @@ mod tests {
     fn test_euclidean_table_distance_nonnegative() {
         let pq = trained_pq();
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.1).collect();
-        let table = PqDistanceTable::build_euclidean(&query, &pq);
+        let table = PqDistanceTable::build_euclidean(&query, &pq).unwrap();
 
         let codes = pq.encode(&query).unwrap();
         let dist = table.distance(&codes);
@@ -354,7 +400,7 @@ mod tests {
     fn test_dot_product_table() {
         let pq = trained_pq();
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.1).collect();
-        let table = PqDistanceTable::build_dot_product(&query, &pq);
+        let table = PqDistanceTable::build_dot_product(&query, &pq).unwrap();
 
         let codes = pq.encode(&query).unwrap();
         let _dist = table.distance(&codes);
@@ -366,7 +412,7 @@ mod tests {
     fn test_distance_batch() {
         let pq = trained_pq();
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.1).collect();
-        let table = PqDistanceTable::build_euclidean(&query, &pq);
+        let table = PqDistanceTable::build_euclidean(&query, &pq).unwrap();
 
         let v1: Vec<f32> = vec![0.0; 8];
         let v2: Vec<f32> = vec![1.0; 8];
@@ -382,12 +428,13 @@ mod tests {
     fn test_flat_tables_layout() {
         let pq = trained_pq();
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.1).collect();
-        let table = PqDistanceTable::build_euclidean(&query, &pq);
+        let table = PqDistanceTable::build_euclidean(&query, &pq).unwrap();
 
         // Verify flat_tables matches tables for each subquantizer.
+        let k = table.codebook_size;
         for (mi, t) in table.tables.iter().enumerate() {
             for (ki, &val) in t.iter().enumerate() {
-                let flat_idx = mi * 256 + ki;
+                let flat_idx = mi * k + ki;
                 assert_eq!(
                     table.flat_tables[flat_idx], val,
                     "flat_tables mismatch at m={}, k={}",
@@ -401,7 +448,7 @@ mod tests {
     fn test_simd_matches_scalar() {
         let pq = trained_pq();
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.1).collect();
-        let table = PqDistanceTable::build_euclidean(&query, &pq);
+        let table = PqDistanceTable::build_euclidean(&query, &pq).unwrap();
 
         let codes = pq.encode(&query).unwrap();
 
@@ -410,7 +457,7 @@ mod tests {
 
         // Compute via explicit scalar path.
         let scalar_dist =
-            scalar_pq_distance(&table.flat_tables, &codes, table.tables.len());
+            scalar_pq_distance(&table.flat_tables, &codes, table.tables.len(), table.codebook_size);
 
         assert!(
             (simd_dist - scalar_dist).abs() < 1e-6,

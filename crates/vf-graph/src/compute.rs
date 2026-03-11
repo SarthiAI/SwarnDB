@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 
@@ -111,6 +110,10 @@ impl RelationshipComputer {
             if let Some(data) = vectors.get(&id) {
                 total += Self::compute_for_vector(graph, index, id, data, k)?;
             }
+        }
+
+        if total == 0 && !vector_ids.is_empty() {
+            log::warn!("compute_batch produced 0 edges for {} vectors — check threshold", vector_ids.len());
         }
 
         Ok(total)

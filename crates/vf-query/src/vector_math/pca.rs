@@ -5,10 +5,16 @@ pub struct PcaResult {
     pub projected: Vec<Vec<f32>>,
 }
 
+/// Default maximum dimensionality for PCA to prevent O(dim^2) memory blow-up.
+pub const DEFAULT_MAX_PCA_DIM: usize = 16384;
+
 pub struct PcaConfig {
     pub n_components: usize,
     pub max_iterations: usize,
     pub tolerance: f32,
+    /// Maximum input dimensionality allowed. Prevents O(dim^2) memory blow-up
+    /// from the covariance matrix. Defaults to `DEFAULT_MAX_PCA_DIM` (16384).
+    pub max_dim: usize,
 }
 
 impl Default for PcaConfig {
@@ -17,6 +23,7 @@ impl Default for PcaConfig {
             n_components: 2,
             max_iterations: 100,
             tolerance: 1e-6,
+            max_dim: DEFAULT_MAX_PCA_DIM,
         }
     }
 }
@@ -36,7 +43,7 @@ impl Pca {
             return None;
         }
         let dim = vectors[0].len();
-        if dim == 0 || vectors.iter().any(|v| v.len() != dim) {
+        if dim == 0 || dim > self.config.max_dim || vectors.iter().any(|v| v.len() != dim) {
             return None;
         }
         let n_components = self.config.n_components.min(dim);

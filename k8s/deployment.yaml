@@ -17,15 +17,18 @@ spec:
         app.kubernetes.io/name: swarndb
         app.kubernetes.io/component: server
     spec:
+      serviceAccountName: swarndb
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       terminationGracePeriodSeconds: 30
       containers:
         - name: swarndb
-          image: swarndb:latest
+          image: swarndb:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: grpc
@@ -55,6 +58,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           livenessProbe:
             httpGet:
               path: /healthz
@@ -80,3 +85,5 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: swarndb-data
+        - name: tmp
+          emptyDir: {}

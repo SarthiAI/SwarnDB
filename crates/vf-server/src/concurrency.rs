@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 //! Connection pooling, request queuing, and adaptive concurrency middleware.
 //!
@@ -43,20 +42,35 @@ pub struct ConcurrencyConfig {
     pub max_concurrency: usize,
     /// Target p99 latency in milliseconds for adaptive control.
     pub target_p99_latency_ms: u64,
+    /// EMA smoothing factor for adaptive concurrency (0.0..=1.0).
+    pub ema_alpha: f64,
+    /// High latency threshold multiplier (e.g. 1.2 means 120% of target triggers decrease).
+    pub high_latency_threshold: f64,
+    /// Low latency threshold multiplier (e.g. 0.5 means 50% of target triggers increase).
+    pub low_latency_threshold: f64,
+    /// Decrease rate when latency is high (e.g. 0.10 means reduce by 10%).
+    pub decrease_rate: f64,
+    /// Increase rate when latency is low (e.g. 0.05 means increase by 5%).
+    pub increase_rate: f64,
 }
 
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_searches: 100,
+            max_concurrent_searches: 500,
             max_concurrent_connections: 1000,
-            search_queue_size: 500,
+            search_queue_size: 1000,
             request_timeout: Duration::from_secs(10),
             search_timeout: Duration::from_secs(5),
             bulk_timeout: Duration::from_secs(30),
             min_concurrency: 10,
             max_concurrency: 200,
             target_p99_latency_ms: 500,
+            ema_alpha: 0.1,
+            high_latency_threshold: 1.2,
+            low_latency_threshold: 0.5,
+            decrease_rate: 0.10,
+            increase_rate: 0.05,
         }
     }
 }
@@ -90,33 +104,33 @@ struct AdaptiveInner {
     max_concurrency: usize,
     /// The semaphore whose permits we adjust.
     semaphore: Arc<Semaphore>,
+    /// High latency threshold multiplier (triggers decrease).
+    high_latency_threshold: f64,
+    /// Low latency threshold multiplier (triggers increase).
+    low_latency_threshold: f64,
+    /// Fraction to decrease limit by when latency is high.
+    decrease_rate: f64,
+    /// Fraction to increase limit by when latency is low.
+    increase_rate: f64,
 }
 
 impl AdaptiveConcurrencyController {
-    /// Create a new adaptive controller.
-    ///
-    /// - `initial_limit`: starting concurrency limit
-    /// - `min_concurrency`: floor for the adaptive limit
-    /// - `max_concurrency`: ceiling for the adaptive limit
-    /// - `target_p99_ms`: target p99 latency in milliseconds
-    /// - `semaphore`: the semaphore to resize
-    pub fn new(
-        initial_limit: usize,
-        min_concurrency: usize,
-        max_concurrency: usize,
-        target_p99_ms: u64,
-        semaphore: Arc<Semaphore>,
-    ) -> Self {
-        let clamped = initial_limit.clamp(min_concurrency, max_concurrency);
+    /// Create a new adaptive controller from a `ConcurrencyConfig` and semaphore.
+    pub fn new(config: &ConcurrencyConfig, initial_limit: usize, semaphore: Arc<Semaphore>) -> Self {
+        let clamped = initial_limit.clamp(config.min_concurrency, config.max_concurrency);
         Self {
             inner: Arc::new(AdaptiveInner {
                 current_limit: AtomicUsize::new(clamped),
                 p99_ema_bits: AtomicU64::new(0u64),
-                alpha: 0.1,
-                target_p99_ms: target_p99_ms as f64,
-                min_concurrency,
-                max_concurrency,
+                alpha: config.ema_alpha,
+                target_p99_ms: config.target_p99_latency_ms as f64,
+                min_concurrency: config.min_concurrency,
+                max_concurrency: config.max_concurrency,
                 semaphore,
+                high_latency_threshold: config.high_latency_threshold,
+                low_latency_threshold: config.low_latency_threshold,
+                decrease_rate: config.decrease_rate,
+                increase_rate: config.increase_rate,
             }),
         }
     }
@@ -154,8 +168,8 @@ impl AdaptiveConcurrencyController {
 
     /// Adjust the concurrency limit based on observed latency.
     ///
-    /// - If p99 EMA > target * 1.2: decrease limit by 10% (clamped to min)
-    /// - If p99 EMA < target * 0.5: increase limit by 5% (clamped to max)
+    /// - If p99 EMA > target * high_latency_threshold: decrease limit by decrease_rate (clamped to min)
+    /// - If p99 EMA < target * low_latency_threshold: increase limit by increase_rate (clamped to max)
     /// - Otherwise: no change
     fn adjust(&self) {
         let ema = self.p99_ema_ms();
@@ -166,13 +180,13 @@ impl AdaptiveConcurrencyController {
         let target = self.inner.target_p99_ms;
         let old_limit = self.inner.current_limit.load(Ordering::Relaxed);
 
-        let new_limit = if ema > target * 1.2 {
-            // Latency too high: reduce by 10%.
-            let reduced = (old_limit as f64 * 0.9).round() as usize;
+        let new_limit = if ema > target * self.inner.high_latency_threshold {
+            // Latency too high: reduce by decrease_rate.
+            let reduced = (old_limit as f64 * (1.0 - self.inner.decrease_rate)).round() as usize;
             reduced.max(self.inner.min_concurrency)
-        } else if ema < target * 0.5 {
-            // Latency well below target: increase by 5%.
-            let increased = (old_limit as f64 * 1.05).round() as usize;
+        } else if ema < target * self.inner.low_latency_threshold {
+            // Latency well below target: increase by increase_rate.
+            let increased = (old_limit as f64 * (1.0 + self.inner.increase_rate)).round() as usize;
             increased.min(self.inner.max_concurrency)
         } else {
             return; // No adjustment needed.
@@ -351,18 +365,11 @@ impl ConcurrencyLimitLayer {
         queue_size: usize,
         timeout: Duration,
         metrics: ConcurrencyMetrics,
-        min_concurrency: usize,
-        max_concurrency: usize,
-        target_p99_ms: u64,
+        config: &ConcurrencyConfig,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
-        let adaptive = AdaptiveConcurrencyController::new(
-            max_concurrent,
-            min_concurrency,
-            max_concurrency,
-            target_p99_ms,
-            semaphore.clone(),
-        );
+        let adaptive =
+            AdaptiveConcurrencyController::new(config, max_concurrent, semaphore.clone());
         Self {
             queue_semaphore: Arc::new(Semaphore::new(max_concurrent + queue_size)),
             semaphore,
@@ -512,9 +519,7 @@ pub fn build_concurrency_layer(
         config.search_queue_size,
         config.request_timeout,
         metrics.clone(),
-        config.min_concurrency,
-        config.max_concurrency,
-        config.target_p99_latency_ms,
+        config,
     );
 
     tracing::info!(
@@ -524,6 +529,11 @@ pub fn build_concurrency_layer(
         min_concurrency = config.min_concurrency,
         max_concurrency = config.max_concurrency,
         target_p99_ms = config.target_p99_latency_ms,
+        ema_alpha = config.ema_alpha,
+        high_threshold = config.high_latency_threshold,
+        low_threshold = config.low_latency_threshold,
+        decrease_rate = config.decrease_rate,
+        increase_rate = config.increase_rate,
         "concurrency layer configured with adaptive control"
     );
 
@@ -544,9 +554,7 @@ pub fn build_search_concurrency_layer(
         config.search_queue_size,
         config.search_timeout,
         metrics.clone(),
-        config.min_concurrency,
-        config.max_concurrency,
-        config.target_p99_latency_ms,
+        config,
     );
 
     tracing::info!(
@@ -556,6 +564,11 @@ pub fn build_search_concurrency_layer(
         min_concurrency = config.min_concurrency,
         max_concurrency = config.max_concurrency,
         target_p99_ms = config.target_p99_latency_ms,
+        ema_alpha = config.ema_alpha,
+        high_threshold = config.high_latency_threshold,
+        low_threshold = config.low_latency_threshold,
+        decrease_rate = config.decrease_rate,
+        increase_rate = config.increase_rate,
         "search concurrency layer configured with adaptive control"
     );
 
@@ -569,15 +582,20 @@ mod tests {
     #[test]
     fn default_config_values() {
         let config = ConcurrencyConfig::default();
-        assert_eq!(config.max_concurrent_searches, 100);
+        assert_eq!(config.max_concurrent_searches, 500);
         assert_eq!(config.max_concurrent_connections, 1000);
-        assert_eq!(config.search_queue_size, 500);
+        assert_eq!(config.search_queue_size, 1000);
         assert_eq!(config.request_timeout, Duration::from_secs(10));
         assert_eq!(config.search_timeout, Duration::from_secs(5));
         assert_eq!(config.bulk_timeout, Duration::from_secs(30));
         assert_eq!(config.min_concurrency, 10);
         assert_eq!(config.max_concurrency, 200);
         assert_eq!(config.target_p99_latency_ms, 500);
+        assert!((config.ema_alpha - 0.1).abs() < f64::EPSILON);
+        assert!((config.high_latency_threshold - 1.2).abs() < f64::EPSILON);
+        assert!((config.low_latency_threshold - 0.5).abs() < f64::EPSILON);
+        assert!((config.decrease_rate - 0.10).abs() < f64::EPSILON);
+        assert!((config.increase_rate - 0.05).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -638,26 +656,39 @@ mod tests {
         assert_eq!(format!("{}", err), "oops");
     }
 
+    /// Helper to build a default config with custom min/max/target.
+    fn test_config(min: usize, max: usize, target_ms: u64) -> ConcurrencyConfig {
+        ConcurrencyConfig {
+            min_concurrency: min,
+            max_concurrency: max,
+            target_p99_latency_ms: target_ms,
+            ..ConcurrencyConfig::default()
+        }
+    }
+
     #[test]
     fn adaptive_controller_initial_state() {
+        let cfg = test_config(10, 200, 500);
         let sem = Arc::new(Semaphore::new(100));
-        let ctrl = AdaptiveConcurrencyController::new(100, 10, 200, 500, sem);
+        let ctrl = AdaptiveConcurrencyController::new(&cfg, 100, sem);
         assert_eq!(ctrl.current_limit(), 100);
         assert_eq!(ctrl.p99_ema_ms(), 0.0);
     }
 
     #[test]
     fn adaptive_controller_clamps_initial_limit() {
+        let cfg = test_config(10, 200, 500);
         let sem = Arc::new(Semaphore::new(5));
-        let ctrl = AdaptiveConcurrencyController::new(5, 10, 200, 500, sem);
+        let ctrl = AdaptiveConcurrencyController::new(&cfg, 5, sem);
         // Initial limit 5 is below min 10, should be clamped to 10.
         assert_eq!(ctrl.current_limit(), 10);
     }
 
     #[test]
     fn adaptive_controller_decreases_on_high_latency() {
+        let cfg = test_config(10, 200, 500);
         let sem = Arc::new(Semaphore::new(100));
-        let ctrl = AdaptiveConcurrencyController::new(100, 10, 200, 500, sem);
+        let ctrl = AdaptiveConcurrencyController::new(&cfg, 100, sem);
 
         // Feed many high-latency samples to push EMA above target * 1.2 (600ms).
         for _ in 0..50 {
@@ -671,8 +702,9 @@ mod tests {
 
     #[test]
     fn adaptive_controller_increases_on_low_latency() {
+        let cfg = test_config(10, 200, 500);
         let sem = Arc::new(Semaphore::new(50));
-        let ctrl = AdaptiveConcurrencyController::new(50, 10, 200, 500, sem);
+        let ctrl = AdaptiveConcurrencyController::new(&cfg, 50, sem);
 
         // Feed many low-latency samples to push EMA below target * 0.5 (250ms).
         for _ in 0..50 {
@@ -687,16 +719,18 @@ mod tests {
     #[test]
     fn adaptive_controller_respects_bounds() {
         // Test min bound.
+        let cfg = test_config(10, 200, 100);
         let sem = Arc::new(Semaphore::new(12));
-        let ctrl = AdaptiveConcurrencyController::new(12, 10, 200, 100, sem);
+        let ctrl = AdaptiveConcurrencyController::new(&cfg, 12, sem);
         for _ in 0..200 {
             ctrl.record_latency(Duration::from_millis(500));
         }
         assert!(ctrl.current_limit() >= 10);
 
         // Test max bound.
+        let cfg = test_config(10, 200, 500);
         let sem = Arc::new(Semaphore::new(195));
-        let ctrl = AdaptiveConcurrencyController::new(195, 10, 200, 500, sem);
+        let ctrl = AdaptiveConcurrencyController::new(&cfg, 195, sem);
         for _ in 0..200 {
             ctrl.record_latency(Duration::from_millis(10));
         }
@@ -705,8 +739,9 @@ mod tests {
 
     #[test]
     fn adaptive_controller_stable_in_middle_range() {
+        let cfg = test_config(10, 200, 500);
         let sem = Arc::new(Semaphore::new(100));
-        let ctrl = AdaptiveConcurrencyController::new(100, 10, 200, 500, sem);
+        let ctrl = AdaptiveConcurrencyController::new(&cfg, 100, sem);
 
         // Latency in the stable range (250ms < x < 600ms).
         for _ in 0..50 {

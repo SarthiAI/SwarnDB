@@ -10,11 +10,12 @@ service CollectionService {
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
 }
 
+// Server enforces max message size (default 4MB). Configure via SWARNDB_MAX_MESSAGE_SIZE.
 message CreateCollectionRequest {
-  string name = 1;
-  uint32 dimension = 2;
+  string name = 1;           // max 128 chars, alphanumeric + dash + underscore only
+  uint32 dimension = 2;      // 1-65536
   string distance_metric = 3;  // "cosine", "euclidean", "dot_product", "manhattan"
-  float default_threshold = 4;
+  float default_threshold = 4; // 0.0-1.0
   uint64 max_vectors = 5;
 }
 

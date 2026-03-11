@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 
@@ -60,7 +59,13 @@ impl IndexManager {
     }
 
     pub fn index_record(&mut self, id: VectorId, metadata: &Metadata) {
-        let id32 = id as u32;
+        let id32: u32 = match id.try_into() {
+            Ok(v) => v,
+            Err(_) => {
+                // VectorId exceeds u32 range; cannot index in RoaringBitmap.
+                return;
+            }
+        };
         for (field, value) in metadata {
             if !self.indexes.contains_key(field) {
                 self.indexes.insert(
@@ -76,10 +81,12 @@ impl IndexManager {
                 );
             }
 
-            match self.indexes.get_mut(field).unwrap() {
-                MetadataIndex::BTree(idx) => idx.insert(id, value),
-                MetadataIndex::Hash(idx) => idx.insert(id, value),
-                MetadataIndex::Bitmap(idx) => idx.insert(id, value),
+            if let Some(index) = self.indexes.get_mut(field) {
+                match index {
+                    MetadataIndex::BTree(idx) => idx.insert(id, value),
+                    MetadataIndex::Hash(idx) => idx.insert(id, value),
+                    MetadataIndex::Bitmap(idx) => idx.insert(id, value),
+                }
             }
 
             self.records
@@ -92,7 +99,10 @@ impl IndexManager {
     }
 
     pub fn remove_record(&mut self, id: VectorId) {
-        let id32 = id as u32;
+        let id32: u32 = match id.try_into() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
         for index in self.indexes.values_mut() {
             match index {
                 MetadataIndex::BTree(idx) => idx.remove(id),
@@ -245,11 +255,13 @@ impl IndexManager {
 
         for (id32, fields) in &self.records {
             if let Some(value) = fields.get(field) {
-                let id = *id32 as VectorId;
-                match self.indexes.get_mut(field).unwrap() {
-                    MetadataIndex::BTree(idx) => idx.insert(id, value),
-                    MetadataIndex::Hash(idx) => idx.insert(id, value),
-                    MetadataIndex::Bitmap(idx) => idx.insert(id, value),
+                let id = *id32 as VectorId; // safe: id32 was already validated on insert
+                if let Some(index) = self.indexes.get_mut(field) {
+                    match index {
+                        MetadataIndex::BTree(idx) => idx.insert(id, value),
+                        MetadataIndex::Hash(idx) => idx.insert(id, value),
+                        MetadataIndex::Bitmap(idx) => idx.insert(id, value),
+                    }
                 }
             }
         }

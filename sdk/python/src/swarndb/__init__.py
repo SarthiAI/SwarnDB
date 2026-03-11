@@ -9,7 +9,7 @@ from swarndb.exceptions import (
     CollectionError,
     CollectionExistsError,
     CollectionNotFoundError,
-    ConnectionError,
+    SwarnDBConnectionError,
     DimensionMismatchError,
     GraphError,
     MathError,
@@ -104,7 +104,7 @@ __all__ = [
     "OptimizeResult",
     # Exceptions
     "SwarnDBError",
-    "ConnectionError",
+    "SwarnDBConnectionError",
     "AuthenticationError",
     "CollectionError",
     "CollectionNotFoundError",

@@ -8,7 +8,9 @@ operations behind a single connection-managed interface.
 from __future__ import annotations
 
 import logging
+import random
 import time
+import warnings
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Tuple
 
 import grpc
@@ -18,7 +20,6 @@ from swarndb.exceptions import (
     AuthenticationError,
     CollectionExistsError,
     CollectionNotFoundError,
-    ConnectionError,
     DimensionMismatchError,
     GraphError,
     MathError,
@@ -48,25 +49,27 @@ _RETRYABLE_CODES = frozenset({
 })
 
 
-class _AuthInterceptor(grpc.UnaryUnaryClientInterceptor):
-    """Interceptor that injects an API key into every unary-unary call."""
+class _AuthInterceptor(
+    grpc.UnaryUnaryClientInterceptor,
+    grpc.UnaryStreamClientInterceptor,
+    grpc.StreamUnaryClientInterceptor,
+    grpc.StreamStreamClientInterceptor,
+):
+    """Interceptor that injects an API key into all RPC patterns."""
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
-    def intercept_unary_unary(
-        self,
-        continuation,
-        client_call_details,
-        request,
-    ):
+    def _inject_metadata(self, client_call_details):
         """Add X-API-Key metadata to the outgoing call."""
         metadata: list[tuple[str, str]] = []
         if client_call_details.metadata is not None:
-            metadata = list(client_call_details.metadata)
+            metadata = [
+                (k, v) for k, v in client_call_details.metadata
+                if k.lower() != "x-api-key"
+            ]
         metadata.append(("x-api-key", self._api_key))
-
-        new_details = _ClientCallDetails(
+        return _ClientCallDetails(
             method=client_call_details.method,
             timeout=client_call_details.timeout,
             metadata=metadata,
@@ -74,7 +77,18 @@ class _AuthInterceptor(grpc.UnaryUnaryClientInterceptor):
             wait_for_ready=client_call_details.wait_for_ready,
             compression=client_call_details.compression,
         )
-        return continuation(new_details, request)
+
+    def intercept_unary_unary(self, continuation, client_call_details, request):
+        return continuation(self._inject_metadata(client_call_details), request)
+
+    def intercept_unary_stream(self, continuation, client_call_details, request):
+        return continuation(self._inject_metadata(client_call_details), request)
+
+    def intercept_stream_unary(self, continuation, client_call_details, request_iterator):
+        return continuation(self._inject_metadata(client_call_details), request_iterator)
+
+    def intercept_stream_stream(self, continuation, client_call_details, request_iterator):
+        return continuation(self._inject_metadata(client_call_details), request_iterator)
 
 
 class _ClientCallDetails(
@@ -114,6 +128,9 @@ class SwarnDBClient:
             results = client.search.query("my_collection", [0.1] * 128, top_k=5)
     """
 
+    _DEFAULT_MAX_RETRIES_CAP = 50
+    _DEFAULT_TOTAL_RETRY_TIMEOUT = 300.0
+
     def __init__(
         self,
         host: str = "localhost",
@@ -124,22 +141,77 @@ class SwarnDBClient:
         max_retries: int = 3,
         retry_delay: float = 0.5,
         timeout: float = 30.0,
+        total_retry_timeout: float = _DEFAULT_TOTAL_RETRY_TIMEOUT,
+        max_retries_cap: int = _DEFAULT_MAX_RETRIES_CAP,
+        max_message_size: int = 256 * 1024 * 1024,
         options: Optional[Sequence[Tuple[str, Any]]] = None,
+        ca_cert_path: Optional[str] = None,
+        client_cert_path: Optional[str] = None,
+        client_key_path: Optional[str] = None,
     ) -> None:
         self._host = host
         self._port = port
         self._api_key = api_key
         self._secure = secure
+        self._max_retries_cap = max_retries_cap
+        if max_retries > self._max_retries_cap:
+            raise ValueError(
+                f"max_retries={max_retries} exceeds maximum allowed value "
+                f"of {self._max_retries_cap}"
+            )
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._timeout = timeout
+        self._total_retry_timeout = total_retry_timeout
+
+        # Warn when using insecure channel
+        if not secure:
+            warnings.warn(
+                "Using insecure gRPC channel (secure=False). "
+                "Use secure=True in production.",
+                stacklevel=2,
+            )
+
+        # Warn when API key is transmitted without TLS
+        if api_key and not secure:
+            warnings.warn(
+                "API key transmitted over insecure channel. "
+                "Use secure=True in production.",
+                stacklevel=2,
+            )
 
         target = f"{host}:{port}"
         channel_options = list(options) if options else []
 
+        # Add keepalive and message size options (Tasks 344, 348)
+        channel_options.extend([
+            ("grpc.keepalive_time_ms", 30000),
+            ("grpc.keepalive_timeout_ms", 10000),
+            ("grpc.max_send_message_length", max_message_size),
+            ("grpc.max_receive_message_length", max_message_size),
+        ])
+
         # Create channel
         if secure:
-            credentials = grpc.ssl_channel_credentials()
+            if ca_cert_path or client_cert_path:
+                root_certs = None
+                private_key = None
+                certificate_chain = None
+                if ca_cert_path:
+                    with open(ca_cert_path, "rb") as f:
+                        root_certs = f.read()
+                if client_cert_path and client_key_path:
+                    with open(client_key_path, "rb") as f:
+                        private_key = f.read()
+                    with open(client_cert_path, "rb") as f:
+                        certificate_chain = f.read()
+                credentials = grpc.ssl_channel_credentials(
+                    root_certificates=root_certs,
+                    private_key=private_key,
+                    certificate_chain=certificate_chain,
+                )
+            else:
+                credentials = grpc.ssl_channel_credentials()
             self._channel = grpc.secure_channel(target, credentials, options=channel_options)
         else:
             self._channel = grpc.insecure_channel(target, options=channel_options)
@@ -230,6 +302,7 @@ class SwarnDBClient:
         """
         call_timeout = timeout if timeout is not None else self._timeout
         last_error: Optional[grpc.RpcError] = None
+        retry_start = time.monotonic()
 
         for attempt in range(self._max_retries + 1):
             try:
@@ -243,7 +316,10 @@ class SwarnDBClient:
 
                 # Only retry on transient errors
                 if code in _RETRYABLE_CODES and attempt < self._max_retries:
-                    delay = self._retry_delay * (2 ** attempt)
+                    elapsed = time.monotonic() - retry_start
+                    if elapsed >= self._total_retry_timeout:
+                        raise self._translate_error(exc) from exc
+                    delay = self._retry_delay * (2 ** attempt) + random.uniform(0, self._retry_delay)
                     logger.debug(
                         "Retrying gRPC call (attempt %d/%d) after %s error, "
                         "backoff %.2fs",
@@ -262,10 +338,8 @@ class SwarnDBClient:
         assert last_error is not None
         raise self._translate_error(last_error) from last_error
 
-    def _metadata(self) -> Optional[Sequence[Tuple[str, str]]]:
-        """Return auth metadata if api_key is set."""
-        if self._api_key:
-            return (("x-api-key", self._api_key),)
+    def _metadata(self) -> None:
+        """Auth metadata is handled by the interceptor. Returns None."""
         return None
 
     @staticmethod
@@ -278,8 +352,9 @@ class SwarnDBClient:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the gRPC channel."""
+        """Close the gRPC channel and scrub credentials."""
         self._channel.close()
+        self._api_key = None
 
     def __enter__(self) -> SwarnDBClient:
         return self
@@ -288,7 +363,4 @@ class SwarnDBClient:
         self.close()
 
     def __repr__(self) -> str:
-        return (
-            f"SwarnDBClient(host={self._host!r}, port={self._port}, "
-            f"secure={self._secure})"
-        )
+        return f"SwarnDBClient(host={self._host!r}, port={self._port}, secure={self._secure})"

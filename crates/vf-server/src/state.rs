@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0
+// See LICENSE file in the project root for full license text
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,7 +31,7 @@ use vf_core::store::{InMemoryVectorStore, VectorRecord};
 use vf_core::types::{CollectionConfig, Metadata, VectorId};
 use vf_core::vector::VectorData;
 use vf_graph::VirtualGraph;
-use vf_index::hnsw::HnswIndex;
+use vf_index::hnsw::{HnswIndex, HnswParams};
 use vf_index::traits::VectorIndex;
 use vf_query::IndexManager;
 use vf_storage::collection::CollectionManager;
@@ -102,6 +101,11 @@ pub struct AppState {
     pub max_batch_lock_size: u32,
     pub max_wal_flush_interval: u32,
     pub max_ef_construction: u32,
+    pub compute_timeout_secs: u64,
+    pub max_k: u32,
+    pub max_bulk_insert_messages: u64,
+    pub max_bulk_insert_payload_bytes: u64,
+    pub max_ef: usize,
 }
 
 impl AppState {
@@ -117,6 +121,11 @@ impl AppState {
         max_batch_lock_size: u32,
         max_wal_flush_interval: u32,
         max_ef_construction: u32,
+        compute_timeout_secs: u64,
+        max_k: u32,
+        max_bulk_insert_messages: u64,
+        max_bulk_insert_payload_bytes: u64,
+        max_ef: usize,
     ) -> Result<Self, StorageError> {
         let collection_manager = CollectionManager::new(storage_path)?;
 
@@ -157,7 +166,9 @@ impl AppState {
 
             // Populate the in-memory store and HNSW index.
             let store = InMemoryVectorStore::new(dimension);
-            let index = HnswIndex::with_defaults(dimension, distance_metric);
+            let mut hnsw_params = HnswParams::default();
+            hnsw_params.max_ef = max_ef;
+            let index = HnswIndex::new(dimension, distance_metric, hnsw_params);
 
             for (id, data, metadata) in &vectors {
                 let record = VectorRecord::new(
@@ -193,8 +204,9 @@ impl AppState {
                 let vector_map: std::collections::HashMap<u64, Vec<f32>> = vectors.iter()
                     .map(|(id, data, _)| (*id, data.clone()))
                     .collect();
+                let graph_k = graph.config().graph_neighbors_k;
                 if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                    &mut graph, &index, &vector_ids, &vector_map, 10,
+                    &mut graph, &index, &vector_ids, &vector_map, graph_k,
                 ) {
                     tracing::warn!(collection = %name, "graph compute_batch failed: {}", e);
                 }
@@ -238,6 +250,11 @@ impl AppState {
             max_batch_lock_size,
             max_wal_flush_interval,
             max_ef_construction,
+            compute_timeout_secs,
+            max_k,
+            max_bulk_insert_messages,
+            max_bulk_insert_payload_bytes,
+            max_ef,
         })
     }
 
@@ -269,7 +286,9 @@ impl AppState {
 
             // Check not already optimizing.
             {
-                let status = coll.status.read().unwrap();
+                let status = coll.status.read().map_err(|_| {
+                    format!("collection '{}' status lock poisoned", collection_name)
+                })?;
                 if *status == CollectionStatus::Optimizing {
                     return Err(format!(
                         "collection '{}' is already being optimized",
@@ -280,7 +299,9 @@ impl AppState {
 
             // Set status to optimizing.
             {
-                let mut status = coll.status.write().unwrap();
+                let mut status = coll.status.write().map_err(|_| {
+                    format!("collection '{}' status lock poisoned", collection_name)
+                })?;
                 *status = CollectionStatus::Optimizing;
             }
 
@@ -304,9 +325,12 @@ impl AppState {
                     .collect();
 
                 // Create a fresh index and rebuild via build_parallel.
-                let new_index = HnswIndex::with_defaults(
+                let mut hnsw_params = HnswParams::default();
+                hnsw_params.max_ef = self.max_ef;
+                let new_index = HnswIndex::new(
                     coll.config.dimension,
                     coll.config.distance_metric,
+                    hnsw_params,
                 );
                 new_index.build_parallel(&refs).map_err(|e| {
                     format!("HNSW index rebuild failed: {}", e)
@@ -345,17 +369,35 @@ impl AppState {
                 // Reset graph and rebuild.
                 let threshold = coll.config.default_similarity_threshold.unwrap_or(0.7);
                 let mut new_graph = VirtualGraph::with_threshold(
-                    if threshold > 0.0 { threshold } else { 0.7 },
+                    threshold,
                     coll.config.distance_metric,
                 );
-                if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                    &mut new_graph, &coll.index, &vector_ids, &vector_map, 10,
+                let graph_k = new_graph.config().graph_neighbors_k;
+                match vf_graph::RelationshipComputer::compute_batch(
+                    &mut new_graph, &coll.index, &vector_ids, &vector_map, graph_k,
                 ) {
-                    tracing::warn!(
-                        collection = %collection_name,
-                        "graph rebuild partially failed: {}",
-                        e
-                    );
+                    Ok(edge_count) => {
+                        if edge_count == 0 && !vector_ids.is_empty() {
+                            tracing::warn!(
+                                collection = %collection_name,
+                                vectors = vector_ids.len(),
+                                "graph rebuild produced 0 edges — threshold may be too high"
+                            );
+                        } else {
+                            tracing::info!(
+                                collection = %collection_name,
+                                edges = edge_count,
+                                "graph rebuild complete"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            collection = %collection_name,
+                            "graph rebuild partially failed: {}",
+                            e
+                        );
+                    }
                 }
                 coll.graph = new_graph;
                 coll.deferred_graph.store(false, Ordering::Release);
@@ -372,8 +414,9 @@ impl AppState {
         {
             let collections = self.collections.read();
             if let Some(coll) = collections.get(collection_name) {
-                let mut status = coll.status.write().unwrap();
-                *status = CollectionStatus::Ready;
+                if let Ok(mut status) = coll.status.write() {
+                    *status = CollectionStatus::Ready;
+                }
             }
         }
 
