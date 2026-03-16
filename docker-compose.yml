@@ -1,21 +1,29 @@
-version: "3.8"
-
 services:
   swarndb:
     build: .
     container_name: swarndb
     ports:
-      - "50051:50051"
-      - "8080:8080"
+      - "${SWARNDB_GRPC_PORT:-50051}:50051"
+      - "${SWARNDB_REST_PORT:-8080}:8080"
+    env_file:
+      - path: .env
+        required: false
     environment:
-      SWARNDB_HOST: "0.0.0.0"
-      SWARNDB_GRPC_PORT: "50051"
-      SWARNDB_REST_PORT: "8080"
-      SWARNDB_DATA_DIR: "/data"
-      SWARNDB_LOG_LEVEL: "info"
-      SWARNDB_API_KEYS: ""
+      SWARNDB_HOST: "${SWARNDB_HOST:-0.0.0.0}"
+      SWARNDB_GRPC_PORT: "${SWARNDB_GRPC_PORT:-50051}"
+      SWARNDB_REST_PORT: "${SWARNDB_REST_PORT:-8080}"
+      SWARNDB_DATA_DIR: "${SWARNDB_DATA_DIR:-/data}"
+      SWARNDB_LOG_LEVEL: "${SWARNDB_LOG_LEVEL:-info}"
+      SWARNDB_API_KEYS: "${SWARNDB_API_KEYS:-}"
+      SWARNDB_MAX_CONNECTIONS: "${SWARNDB_MAX_CONNECTIONS:-500}"
+      SWARNDB_REQUEST_TIMEOUT_MS: "${SWARNDB_REQUEST_TIMEOUT_MS:-30000}"
     volumes:
       - swarndb_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 10s
@@ -23,11 +31,16 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     deploy:
       resources:
         limits:
-          memory: 512M
-          cpus: "1.0"
+          memory: 2G
+          cpus: "2.0"
 
 volumes:
   swarndb_data:

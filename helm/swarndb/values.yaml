@@ -65,8 +65,25 @@ affinity: {}
 # Pod annotations
 podAnnotations: {}
 
+# Network policy
+networkPolicy:
+  enabled: false
+
 # Service account
 serviceAccount:
-  create: false
+  create: true
   name: ""
   annotations: {}
+  automountServiceAccountToken: false
+
+# Ingress
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: swarndb.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []

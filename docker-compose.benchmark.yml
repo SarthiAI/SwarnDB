@@ -1,0 +1,12 @@
+services:
+  swarndb:
+    environment:
+      SWARNDB_LOG_LEVEL: "debug"
+      SWARNDB_API_KEYS: ""
+      SWARNDB_MAX_CONNECTIONS: "2000"
+      SWARNDB_REQUEST_TIMEOUT_MS: "120000"
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "4.0"

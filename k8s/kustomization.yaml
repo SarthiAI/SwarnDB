@@ -5,11 +5,16 @@ namespace: swarndb
 
 resources:
   - namespace.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml
   - configmap.yaml
   - secret.yaml
+  - networkpolicy.yaml
   - pvc.yaml
   - deployment.yaml
   - service.yaml
+  - ingress.yaml
   - hpa.yaml
 
 commonLabels:

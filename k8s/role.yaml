@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: swarndb
+  namespace: swarndb
+  labels:
+    app.kubernetes.io/name: swarndb
+    app.kubernetes.io/part-of: swarndb
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "pods"]
+    verbs: ["get", "list", "watch"]

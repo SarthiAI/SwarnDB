@@ -14,7 +14,14 @@ RUN cargo build --release --bin vf-server \
     && strip target/release/vf-server
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:bookworm-20240311-slim
+
+LABEL org.opencontainers.image.title="SwarnDB"
+LABEL org.opencontainers.image.description="High-performance vector database with virtual graph relationships"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.vendor="SwarnDB"
+LABEL org.opencontainers.image.source="https://github.com/swarndb/swarndb"
+LABEL org.opencontainers.image.licenses="Elastic-2.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 wget \
@@ -35,6 +42,11 @@ ENV SWARNDB_LOG_LEVEL=info
 
 EXPOSE 50051 8080
 VOLUME /data
+
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["wget", "--spider", "-q", "http://localhost:8080/health"]
 
 USER swarndb
 

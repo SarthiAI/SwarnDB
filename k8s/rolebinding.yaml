@@ -1,0 +1,16 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: swarndb
+  namespace: swarndb
+  labels:
+    app.kubernetes.io/name: swarndb
+    app.kubernetes.io/part-of: swarndb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: swarndb
+subjects:
+  - kind: ServiceAccount
+    name: swarndb
+    namespace: swarndb
