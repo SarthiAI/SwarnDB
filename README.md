@@ -4,9 +4,9 @@
     <strong>The vector database that thinks in graphs.</strong>
   </p>
   <p align="center">
-    <a href="https://github.com/SarthiAI/swarndb/actions"><img src="https://img.shields.io/github/actions/workflow/status/SarthiAI/swarndb/ci.yml?branch=main&label=build&style=flat-square" alt="Build Status"></a>
+    <a href="https://github.com/SarthiAI/SwarnDB/actions"><img src="https://img.shields.io/github/actions/workflow/status/SarthiAI/SwarnDB/ci.yml?branch=main&label=build&style=flat-square" alt="Build Status"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-ELv2-blue?style=flat-square" alt="License"></a>
-    <a href="https://github.com/SarthiAI/swarndb/releases"><img src="https://img.shields.io/badge/version-1.0-brightgreen?style=flat-square" alt="Version"></a>
+    <a href="https://github.com/SarthiAI/SwarnDB/releases"><img src="https://img.shields.io/badge/version-1.0-brightgreen?style=flat-square" alt="Version"></a>
     <a href="https://ghcr.io/sarthiai/swarndb"><img src="https://img.shields.io/badge/docker-ghcr.io%2Fsarthiai%2Fswarndb-blue?style=flat-square&logo=docker" alt="Docker Image"></a>
   </p>
 </p>
@@ -302,7 +302,7 @@ For complete API documentation, see [API Reference](docs/api-reference.md).
 
 ## Issues and Feedback
 
-Found a bug or have a feature request? Open an issue on [GitHub Issues](https://github.com/SarthiAI/swarndb/issues).
+Found a bug or have a feature request? Open an issue on [GitHub Issues](https://github.com/SarthiAI/SwarnDB/issues).
 
 ---
 
