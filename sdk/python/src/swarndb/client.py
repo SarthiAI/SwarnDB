@@ -111,7 +111,7 @@ class SwarnDBClient:
         with SwarnDBClient("localhost", 50051) as client:
             client.collections.create("my_collection", dimension=128)
             client.vectors.insert("my_collection", "v1", [0.1] * 128)
-            results = client.search.query("my_collection", [0.1] * 128, top_k=5)
+            results = client.search.query("my_collection", [0.1] * 128, k=5)
     """
 
     def __init__(

@@ -305,9 +305,9 @@ class SearchAPI:
 
     Usage::
 
-        results = client.search.query("my_collection", query_vector, k=10)
+        results = client.search.query("my_collection", vector, k=10)
         results = client.search.query(
-            "my_collection", query_vector, k=5,
+            "my_collection", vector, k=5,
             filter=Filter.eq("category", "electronics"),
         )
         batch = client.search.batch(
