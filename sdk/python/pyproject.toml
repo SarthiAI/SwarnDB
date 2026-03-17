@@ -4,16 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "swarndb"
-version = "0.1.0"
-description = "Python SDK for SwarnDB - a high-performance vector database with virtual graph relationships"
-license = {text = "BSL-1.1"}
+version = "1.0.0"
+description = "Official Python SDK for SwarnDB — the vector database that thinks in graphs. Combines HNSW + IVF-PQ indexing with virtual graph traversal and 15+ vector math operations."
+license = {text = "ELv2"}
 requires-python = ">=3.9"
 authors = [
     { name = "Chirotpal Das" },
 ]
-keywords = ["vector-database", "similarity-search", "embeddings", "grpc", "numpy", "hnsw"]
+keywords = ["vector-database", "similarity-search", "embeddings", "grpc", "numpy", "hnsw", "graph-database", "vector-search", "machine-learning", "ai", "swarndb"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -24,6 +24,7 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+readme = "README.md"
 dependencies = [
     "grpcio>=1.60.0",
     "protobuf>=4.25.0",
@@ -43,10 +44,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/swarndb/swarndb"
-Documentation = "https://docs.swarndb.io"
-Repository = "https://github.com/swarndb/swarndb"
-Issues = "https://github.com/swarndb/swarndb/issues"
+Homepage = "https://github.com/SarthiAI/SwarnDB"
+Documentation = "https://github.com/SarthiAI/SwarnDB#readme"
+Repository = "https://github.com/SarthiAI/SwarnDB"
+Issues = "https://github.com/SarthiAI/SwarnDB/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/swarndb"]

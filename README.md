@@ -1,13 +1,15 @@
 <p align="center">
+  <img src="assets/logo.png" alt="SwarnDB Logo" width="150">
+</p>
+
+<p align="center">
   <h1 align="center">SwarnDB</h1>
   <p align="center">
     <strong>The vector database that thinks in graphs.</strong>
   </p>
   <p align="center">
-    <a href="https://github.com/SarthiAI/SwarnDB/actions"><img src="https://img.shields.io/github/actions/workflow/status/SarthiAI/SwarnDB/ci.yml?branch=main&label=build&style=flat-square" alt="Build Status"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-ELv2-blue?style=flat-square" alt="License"></a>
     <a href="https://github.com/SarthiAI/SwarnDB/releases"><img src="https://img.shields.io/badge/version-1.0-brightgreen?style=flat-square" alt="Version"></a>
-    <a href="https://ghcr.io/sarthiai/swarndb"><img src="https://img.shields.io/badge/docker-ghcr.io%2Fsarthiai%2Fswarndb-blue?style=flat-square&logo=docker" alt="Docker Image"></a>
   </p>
 </p>
 
@@ -52,16 +54,18 @@ Benchmarked against 1M DBPedia vectors on a 32-core, 64 GB RAM cloud instance.
 
 ## Quick Start
 
-Pull the Docker image from GitHub Container Registry and start SwarnDB:
+Clone the repository and build the Docker image locally:
 
 ```bash
-docker pull ghcr.io/sarthiai/swarndb:latest
+git clone https://github.com/SarthiAI/SwarnDB.git
+cd SwarnDB
+docker build -t swarndb .
 docker run -d \
   --name swarndb \
   -p 8080:8080 \
   -p 50051:50051 \
   -v swarndb_data:/data \
-  ghcr.io/sarthiai/swarndb:latest
+  swarndb
 ```
 
 Verify it is running:
@@ -116,7 +120,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   swarndb:
-    image: ghcr.io/sarthiai/swarndb:latest
+    build: .
     container_name: swarndb
     ports:
       - "8080:8080"
