@@ -44,11 +44,15 @@ SwarnDB is a high-performance vector database written in Rust that combines HNSW
 
 ## Performance
 
-Benchmarked against 1M DBPedia vectors on a 32-core, 64 GB RAM cloud instance.
+| ef_search | QPS | Recall@10 | p50 (ms) | p95 (ms) | p99 (ms) |
+|-----------|------|-----------|----------|----------|----------|
+| 50 | 1,563 | 98.8% | 4.76 | 7.62 | 9.35 |
+| 100 | 1,271 | 99.0% | 5.74 | 10.93 | 14.06 |
+| 200 | 984 | 99.2% | 7.55 | 13.33 | 18.17 |
+| 400 | 666 | 99.5% | 11.41 | 19.29 | 23.56 |
+| 800 | 388 | 99.8% | 19.64 | 33.54 | 41.25 |
 
-| Queries per Second | Recall@10 | p50 Latency | p99 Latency |
-|:--:|:--:|:--:|:--:|
-| **1,630** | **99.8%** | **4.6ms** | **5.8ms** |
+*DBpedia 1M (1536-dim) on a 32-core, 64 GB RAM system.*
 
 ---
 
