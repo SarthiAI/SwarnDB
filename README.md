@@ -169,7 +169,7 @@ with SwarnDBClient(host="localhost", port=50051) as client:
     # Search
     results = client.search.query("articles", vector=[0.1, 0.2, ...], k=10)
     for r in results.results:
-        print(r.id, r.score)
+        print(r.id, r.score)  # distance score (lower = more similar)
 
     # Graph: set a similarity threshold, then traverse relationships
     client.graph.set_threshold("articles", threshold=0.85)
