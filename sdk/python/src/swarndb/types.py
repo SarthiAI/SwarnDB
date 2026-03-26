@@ -20,7 +20,7 @@ class GraphEdge:
 
 @dataclass(frozen=True)
 class ScoredResult:
-    """A search result with similarity score."""
+    """A search result with distance score (lower = more similar)."""
 
     id: int
     score: float

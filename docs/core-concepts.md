@@ -322,7 +322,7 @@ Search is the core operation: given a query vector, find the most similar vector
 
 Every search returns up to `k` results, each containing:
 - **Vector ID**: The identifier of the matched vector.
-- **Score**: The distance/similarity value (interpretation depends on the metric).
+- **Score**: The distance value (lower = more similar).
 - **Metadata**: The vector's metadata (if requested).
 - **Graph edges**: Related vectors from the virtual graph (if `include_graph` is enabled).
 

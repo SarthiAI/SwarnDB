@@ -861,12 +861,12 @@ All types are frozen dataclasses imported from `swarndb.types`.
 
 ### ScoredResult
 
-A single search result with similarity score and optional graph edges.
+A single search result with distance score and optional graph edges.
 
 | Field         | Type              | Description                          |
 |---------------|-------------------|--------------------------------------|
 | `id`          | `int`             | Vector ID                            |
-| `score`       | `float`           | Similarity/distance score            |
+| `score`       | `float`           | Distance score (lower = more similar) |
 | `metadata`    | `dict[str, Any]`  | Attached metadata (empty dict if not requested) |
 | `graph_edges` | `list[GraphEdge]` | Related vectors via virtual graph    |
 

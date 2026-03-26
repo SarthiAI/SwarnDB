@@ -633,7 +633,7 @@ Each result object:
 | Field       | Type   | Description                                         |
 |-------------|--------|-----------------------------------------------------|
 | id          | uint64 | Vector ID                                           |
-| score       | float  | Distance/similarity score (lower is more similar for cosine/euclidean) |
+| score       | float  | Distance score (lower = more similar) |
 | metadata    | object | Metadata (only if `include_metadata: true`)         |
 | graph_edges | array  | Related edges (only if `include_graph: true`)       |
 

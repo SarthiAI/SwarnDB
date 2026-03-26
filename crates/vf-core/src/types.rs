@@ -153,7 +153,7 @@ pub enum DataTypeConfig {
 pub struct ScoredResult {
     /// The vector ID
     pub id: VectorId,
-    /// The distance/similarity score
+    /// The distance score (lower = more similar)
     pub score: f32,
     /// Optional metadata (populated if requested)
     pub metadata: Option<Metadata>,
