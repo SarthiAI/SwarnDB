@@ -19,8 +19,8 @@ FROM debian:bookworm-20240311-slim
 LABEL org.opencontainers.image.title="SwarnDB"
 LABEL org.opencontainers.image.description="High-performance vector database with virtual graph relationships"
 LABEL org.opencontainers.image.version="1.0.0"
-LABEL org.opencontainers.image.vendor="SwarnDB"
-LABEL org.opencontainers.image.source="https://github.com/swarndb/swarndb"
+LABEL org.opencontainers.image.vendor="SarthiAI"
+LABEL org.opencontainers.image.source="https://github.com/SarthiAI/SwarnDB"
 LABEL org.opencontainers.image.licenses="Elastic-2.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

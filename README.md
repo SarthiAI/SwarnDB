@@ -10,6 +10,7 @@
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-ELv2-blue?style=flat-square" alt="License"></a>
     <a href="https://github.com/SarthiAI/SwarnDB/releases"><img src="https://img.shields.io/badge/version-1.0-brightgreen?style=flat-square" alt="Version"></a>
+    <a href="https://hub.docker.com/r/sarthiai/swarndb"><img src="https://img.shields.io/docker/pulls/sarthiai/swarndb?style=flat-square&label=Docker%20Pulls" alt="Docker Pulls"></a>
   </p>
 </p>
 
@@ -58,18 +59,10 @@ SwarnDB is a high-performance vector database written in Rust that combines HNSW
 
 ## Quick Start
 
-Clone the repository and build the Docker image locally:
+Pull and run from Docker Hub:
 
 ```bash
-git clone https://github.com/SarthiAI/SwarnDB.git
-cd SwarnDB
-docker build -t swarndb .
-docker run -d \
-  --name swarndb \
-  -p 8080:8080 \
-  -p 50051:50051 \
-  -v swarndb_data:/data \
-  swarndb
+docker run -d --name swarndb -p 8080:8080 -p 50051:50051 -v swarndb_data:/data sarthiai/swarndb
 ```
 
 Verify it is running:
@@ -124,7 +117,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   swarndb:
-    build: .
+    image: sarthiai/swarndb:latest
     container_name: swarndb
     ports:
       - "8080:8080"
@@ -144,6 +137,15 @@ Start it:
 
 ```bash
 docker compose up -d
+```
+
+### Building from Source
+
+```bash
+git clone https://github.com/SarthiAI/SwarnDB.git
+cd SwarnDB
+docker build -t swarndb .
+docker run -d --name swarndb -p 8080:8080 -p 50051:50051 -v swarndb_data:/data swarndb
 ```
 
 ---
