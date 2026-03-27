@@ -62,7 +62,7 @@ SwarnDB is a high-performance vector database written in Rust that combines HNSW
 Pull and run from Docker Hub:
 
 ```bash
-docker run -d --name swarndb -p 8080:8080 -p 50051:50051 -v swarndb_data:/data sarthiai/swarndb
+docker run -d -p 8080:8080 -p 50051:50051 sarthiai/swarndb
 ```
 
 Verify it is running:
@@ -70,6 +70,8 @@ Verify it is running:
 ```bash
 curl http://localhost:8080/health
 ```
+
+> See [Docker Guide](docs/docker.md) for persistence, configuration, and Docker Compose setup.
 
 ### Create Your First Collection and Search
 
@@ -106,46 +108,6 @@ curl -X POST http://localhost:8080/api/v1/collections/articles/search \
     "query": [0.1, 0.2, 0.3, 0.4],
     "k": 10
   }'
-```
-
----
-
-## Docker Compose
-
-Create a `docker-compose.yml`:
-
-```yaml
-services:
-  swarndb:
-    image: sarthiai/swarndb:latest
-    container_name: swarndb
-    ports:
-      - "8080:8080"
-      - "50051:50051"
-    volumes:
-      - swarndb_data:/data
-    environment:
-      - SWARNDB_LOG_LEVEL=info
-      - SWARNDB_DATA_DIR=/data
-    restart: unless-stopped
-
-volumes:
-  swarndb_data:
-```
-
-Start it:
-
-```bash
-docker compose up -d
-```
-
-### Building from Source
-
-```bash
-git clone https://github.com/SarthiAI/SwarnDB.git
-cd SwarnDB
-docker build -t swarndb .
-docker run -d --name swarndb -p 8080:8080 -p 50051:50051 -v swarndb_data:/data swarndb
 ```
 
 ---
@@ -305,6 +267,7 @@ For complete API documentation, see [API Reference](docs/api-reference.md).
 | [Python SDK](docs/python-sdk.md) | SDK installation, client usage, async support |
 | [Virtual Graph](docs/virtual-graph.md) | Graph layer concepts, traversal, thresholds |
 | [Vector Math](docs/vector-math.md) | All 15+ math operations with examples |
+| [Docker Guide](docs/docker.md) | Docker setup, persistence, Compose, and building from source |
 | [Configuration](docs/configuration.md) | Environment variables and tuning guide |
 | [Deployment](docs/deployment.md) | Docker, Kubernetes, and Helm deployment |
 
