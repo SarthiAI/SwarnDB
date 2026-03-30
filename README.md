@@ -73,6 +73,8 @@ curl http://localhost:8080/health
 
 > See [Docker Guide](docs/docker.md) for persistence, configuration, and Docker Compose setup.
 
+> **Platform Note:** The current Docker image is built for `linux/arm64` only (Apple Silicon, AWS Graviton,Raspberry Pi 4+). x86_64/amd64 multi-arch support is coming soon. On Windows or Intel-based systems, the image may run under emulation with significantly degraded performance.
+
 ### Create Your First Collection and Search
 
 **1. Create a collection:**
