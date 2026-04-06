@@ -15,6 +15,8 @@ pub mod disk_ann;
 pub mod tiered;
 pub mod restore;
 pub mod backup;
+pub mod atomic_write;
+pub mod file_lock;
 mod util;
 
 pub use error::{StorageError, StorageResult};

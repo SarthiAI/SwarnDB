@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{StorageError, StorageResult};
 use crate::format::{DataTypeFlag, WalOp};
 use crate::segment::{Segment, SegmentWriter};
-use crate::wal::WalWriter;
+use crate::wal::{WalWriter, WalMeta, load_wal_meta, save_wal_meta};
 use vf_core::store::{InMemoryVectorStore, VectorRecord};
 use vf_core::types::{CollectionConfig, DataTypeConfig, Metadata, VectorId};
 use vf_core::vector::VectorData;
@@ -49,7 +49,10 @@ impl Collection {
         fs::create_dir_all(&collection_dir).map_err(StorageError::Io)?;
 
         let wal_path = collection_dir.join("wal.log");
-        let wal = WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE)?;
+        let wal = WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE, 1)?;
+
+        // Persist initial WAL metadata.
+        save_wal_meta(&collection_dir, &WalMeta::new(1))?;
 
         let memtable = InMemoryVectorStore::new(config.dimension);
 
@@ -69,11 +72,13 @@ impl Collection {
     /// Re-opens the WAL for append, creates a fresh memtable, and scans for
     /// existing segment files (sorted by id ascending).
     pub fn open(collection_dir: &Path, config: CollectionConfig) -> StorageResult<Self> {
+        let meta = load_wal_meta(collection_dir)?;
+
         let wal_path = collection_dir.join("wal.log");
         let wal = if wal_path.exists() {
-            WalWriter::open(&wal_path, DEFAULT_WAL_MAX_SIZE)?
+            WalWriter::open(&wal_path, DEFAULT_WAL_MAX_SIZE, meta.next_lsn)?
         } else {
-            WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE)?
+            WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE, meta.next_lsn)?
         };
 
         let memtable = InMemoryVectorStore::new(config.dimension);
@@ -128,7 +133,7 @@ impl Collection {
         let payload = bincode::serialize(&(id, &data, &metadata))?;
         self.wal.append(WalOp::Insert, 0, &payload)?;
 
-        let record = VectorRecord::new(id, data, metadata);
+        let record = VectorRecord::new(id, Some(data), metadata);
         // Ignore AlreadyExists from memtable — WAL is the source of truth.
         let _ = self.memtable.insert(record);
 
@@ -155,7 +160,7 @@ impl Collection {
         // Try updating in memtable; if not found, insert as new record.
         if self.memtable.update(id, data.clone(), metadata.clone()).is_err() {
             if let Some(d) = data {
-                let record = VectorRecord::new(id, d, metadata);
+                let record = VectorRecord::new(id, Some(d), metadata);
                 let _ = self.memtable.insert(record);
             }
         }
@@ -187,7 +192,10 @@ impl Collection {
     pub fn get(&self, id: VectorId) -> StorageResult<Option<(Vec<f32>, Option<Metadata>)>> {
         // Check memtable first.
         if let Ok(record) = self.memtable.get(id) {
-            return Ok(Some((record.data.to_f32_vec(), record.metadata.clone())));
+            if let Some(ref data) = record.data {
+                return Ok(Some((data.to_f32_vec(), record.metadata.clone())));
+            }
+            return Ok(None);
         }
 
         // Search segments newest-first.
@@ -234,6 +242,9 @@ impl Collection {
             let archive_name = format!("wal_{}.log.old", self.next_segment_id);
             let archive_path = self.collection_dir.join(archive_name);
             self.wal.rotate(&archive_path)?;
+            // Persist LSN continuity after rotation.
+            let meta = WalMeta::new(self.wal.current_lsn());
+            save_wal_meta(&self.collection_dir, &meta)?;
         }
 
         self.next_segment_id += 1;
@@ -263,6 +274,16 @@ impl Collection {
         self.memtable.len()
     }
 
+    /// Returns the next LSN that the WAL will assign.
+    pub fn current_lsn(&self) -> u64 {
+        self.wal.current_lsn()
+    }
+
+    /// Returns the path to this collection's directory.
+    pub fn collection_dir(&self) -> &Path {
+        &self.collection_dir
+    }
+
     /// Load all vectors from segments and memtable for index rebuilding.
     ///
     /// Returns `(VectorId, Vec<f32>, Option<Metadata>)` tuples. Segments are
@@ -284,8 +305,12 @@ impl Collection {
         }
 
         // Memtable entries override segment data.
-        for (id, record) in self.memtable.iter_cloned() {
-            map.insert(id, (record.data.to_f32_vec(), record.metadata));
+        for id in self.memtable.ids() {
+            if let Ok(record) = self.memtable.get(id) {
+                if let Some(ref data) = record.data {
+                    map.insert(id, (data.to_f32_vec(), record.metadata.clone()));
+                }
+            }
         }
 
         let result: Vec<(VectorId, Vec<f32>, Option<Metadata>)> = map
@@ -414,6 +439,32 @@ impl CollectionManager {
     pub fn collection_count(&self) -> usize {
         self.collections.len()
     }
+}
+
+// ── Shutdown marker helpers ────────────────────────────────────────────────
+
+/// Write a clean shutdown marker file in the collection directory.
+pub fn write_shutdown_marker(collection_dir: &Path) -> StorageResult<()> {
+    let marker_path = collection_dir.join("shutdown_clean");
+    fs::write(&marker_path, b"").map_err(StorageError::Io)?;
+    // fsync parent for durability
+    if let Some(parent) = marker_path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Remove the shutdown marker (called on startup after recovery).
+pub fn remove_shutdown_marker(collection_dir: &Path) {
+    let marker_path = collection_dir.join("shutdown_clean");
+    let _ = fs::remove_file(&marker_path);
+}
+
+/// Check if a clean shutdown marker exists.
+pub fn has_shutdown_marker(collection_dir: &Path) -> bool {
+    collection_dir.join("shutdown_clean").exists()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

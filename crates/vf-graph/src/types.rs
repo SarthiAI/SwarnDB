@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use vf_core::types::{DistanceMetricType, SimilarityThreshold, VectorId};
 
+use crate::graph_delta::{GraphDeltaEntry, GraphDeltaOp, GraphDeltaWriter};
+
 static LOGICAL_CLOCK: AtomicU64 = AtomicU64::new(1);
 
 fn next_timestamp() -> u64 {
@@ -96,6 +98,7 @@ impl Default for GraphNode {
 pub struct VirtualGraph {
     nodes: HashMap<VectorId, GraphNode>,
     config: GraphConfig,
+    delta_writer: Option<std::sync::Arc<parking_lot::Mutex<GraphDeltaWriter>>>,
 }
 
 impl VirtualGraph {
@@ -103,6 +106,7 @@ impl VirtualGraph {
         Self {
             nodes: HashMap::new(),
             config,
+            delta_writer: None,
         }
     }
 
@@ -242,5 +246,57 @@ impl VirtualGraph {
 
     pub fn nodes(&self) -> &HashMap<VectorId, GraphNode> {
         &self.nodes
+    }
+
+    // ── Delta writer management ────────────────────────────────────
+
+    pub fn set_delta_writer(&mut self, writer: GraphDeltaWriter) {
+        self.delta_writer = Some(std::sync::Arc::new(parking_lot::Mutex::new(writer)));
+    }
+
+    pub fn take_delta_writer(&mut self) -> Option<GraphDeltaWriter> {
+        self.delta_writer
+            .take()
+            .and_then(|arc| std::sync::Arc::try_unwrap(arc).ok().map(|m| m.into_inner()))
+    }
+
+    fn emit_delta(&self, lsn: u64, op: GraphDeltaOp) {
+        if let Some(ref writer) = self.delta_writer {
+            let entry = GraphDeltaEntry { lsn, op };
+            if let Err(e) = writer.lock().append(&entry) {
+                log::warn!("failed to write graph delta: {e}");
+            }
+        }
+    }
+
+    // ── LSN-aware mutation methods ─────────────────────────────────
+
+    pub fn add_node_with_lsn(&mut self, id: VectorId, lsn: u64) {
+        self.add_node(id);
+        self.emit_delta(lsn, GraphDeltaOp::AddNode { id, threshold_override: None });
+    }
+
+    pub fn remove_node_with_lsn(&mut self, id: VectorId, lsn: u64) {
+        self.remove_node(id);
+        self.emit_delta(lsn, GraphDeltaOp::RemoveNode { id });
+    }
+
+    pub fn add_edge_with_lsn(&mut self, src: VectorId, tgt: VectorId, similarity: f32, lsn: u64) {
+        self.add_edge(src, tgt, similarity);
+        self.emit_delta(lsn, GraphDeltaOp::AddEdge {
+            src,
+            tgt,
+            similarity,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            refined: false,
+        });
+    }
+
+    pub fn set_threshold_with_lsn(&mut self, node_id: VectorId, threshold: f32, lsn: u64) {
+        self.set_vector_threshold(node_id, threshold);
+        self.emit_delta(lsn, GraphDeltaOp::SetThreshold { node_id, threshold });
     }
 }

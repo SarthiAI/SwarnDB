@@ -246,7 +246,7 @@ impl RecoveryManager {
         let (id, data, metadata): (VectorId, VectorData, Option<Metadata>) =
             bincode::deserialize(payload)?;
 
-        let record = VectorRecord::new(id, data, metadata);
+        let record = VectorRecord::new(id, Some(data), metadata);
 
         match memtable.insert(record.clone()) {
             Ok(()) => Ok(()),
@@ -282,7 +282,7 @@ impl RecoveryManager {
                 let Some(d) = data else {
                     return Ok(());
                 };
-                let record = VectorRecord::new(id, d, metadata);
+                let record = VectorRecord::new(id, Some(d), metadata);
                 memtable
                     .insert(record)
                     .map_err(|e| StorageError::Serialization(format!("insert-on-update failed: {}", e)))
@@ -317,4 +317,80 @@ impl RecoveryManager {
             ))),
         }
     }
+}
+
+// ── Snapshot-based recovery planning ───────────────────────────────────────
+
+/// Describes the recovery strategy for a collection's indexes.
+#[derive(Debug, Clone)]
+pub enum RecoveryStrategy {
+    /// Clean shutdown: load base snapshots directly, no WAL replay needed.
+    CleanShutdown,
+    /// Base exists: load base + replay delta + replay WAL tail.
+    IncrementalReplay {
+        hnsw_base_lsn: u64,
+        graph_base_lsn: u64,
+    },
+    /// No base snapshots: full rebuild from vectors (legacy path).
+    FullRebuild,
+}
+
+/// Recovery plan for a single collection.
+#[derive(Debug)]
+pub struct CollectionRecoveryPlan {
+    pub collection_name: String,
+    pub collection_dir: PathBuf,
+    pub strategy: RecoveryStrategy,
+    pub has_shutdown_clean: bool,
+    pub has_hnsw_base: bool,
+    pub has_graph_base: bool,
+    pub has_hnsw_delta: bool,
+    pub has_graph_delta: bool,
+}
+
+/// Plan recovery for a collection by inspecting available files.
+///
+/// This is a file-existence-based planner only. It does NOT validate file
+/// contents (magic bytes, CRC, etc.) because vf-storage cannot depend on
+/// vf-index or vf-graph. The caller (AppState in vf-server) is responsible
+/// for validating base snapshots and falling back to FullRebuild if they
+/// turn out to be corrupt.
+pub fn plan_recovery(collection_name: &str, collection_dir: &Path) -> CollectionRecoveryPlan {
+    let has_shutdown_clean = collection_dir.join("shutdown_clean").exists();
+    let has_hnsw_base = collection_dir.join("hnsw.base").exists();
+    let has_graph_base = collection_dir.join("graph.base").exists();
+    let has_hnsw_delta = collection_dir.join("hnsw.delta").exists();
+    let has_graph_delta = collection_dir.join("graph.delta").exists();
+
+    let strategy = if has_shutdown_clean && has_hnsw_base && has_graph_base {
+        RecoveryStrategy::CleanShutdown
+    } else if has_hnsw_base && has_graph_base {
+        RecoveryStrategy::IncrementalReplay {
+            hnsw_base_lsn: 0, // caller will read actual LSN from files
+            graph_base_lsn: 0,
+        }
+    } else {
+        RecoveryStrategy::FullRebuild
+    };
+
+    CollectionRecoveryPlan {
+        collection_name: collection_name.to_string(),
+        collection_dir: collection_dir.to_path_buf(),
+        strategy,
+        has_shutdown_clean,
+        has_hnsw_base,
+        has_graph_base,
+        has_hnsw_delta,
+        has_graph_delta,
+    }
+}
+
+/// Recovery statistics for snapshot-based recovery logging.
+#[derive(Debug, Default)]
+pub struct SnapshotRecoveryStats {
+    pub strategy_used: String,
+    pub hnsw_nodes_loaded: usize,
+    pub graph_nodes_loaded: usize,
+    pub delta_entries_replayed: usize,
+    pub recovery_time_ms: u64,
 }

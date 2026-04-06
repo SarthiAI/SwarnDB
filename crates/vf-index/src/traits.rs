@@ -61,4 +61,15 @@ pub trait VectorIndex: Send + Sync {
 
     /// Returns true if the vector ID exists in the index
     fn contains(&self, id: VectorId) -> bool;
+
+    /// Retrieve a single vector's f32 data by ID.
+    /// Returns owned Vec since the underlying storage may be behind a lock.
+    fn get_vector(&self, id: VectorId) -> Result<Vec<f32>, IndexError> {
+        Err(IndexError::NotFound(id))
+    }
+
+    /// Retrieve all vectors as (id, f32 data) pairs.
+    fn iter_vectors(&self) -> Result<Vec<(VectorId, Vec<f32>)>, IndexError> {
+        Err(IndexError::Internal("iter_vectors not supported by this index".into()))
+    }
 }

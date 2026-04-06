@@ -28,7 +28,8 @@ use vf_server::proto::swarndb::v1::search_service_server::SearchServiceServer;
 use vf_server::proto::swarndb::v1::vector_math_service_server::VectorMathServiceServer;
 use vf_server::proto::swarndb::v1::vector_service_server::VectorServiceServer;
 use vf_server::rest::rest_router;
-use vf_server::shutdown::{graceful_shutdown, wait_for_shutdown};
+use vf_server::shutdown::{graceful_shutdown, wait_for_shutdown, ShutdownSignal};
+use vf_server::snapshot::{start_snapshot_scheduler, SnapshotConfig};
 use vf_server::state::AppState;
 
 #[tokio::main]
@@ -46,10 +47,18 @@ async fn main() {
         "SwarnDB server starting"
     );
 
-    // 3. Initialize Prometheus metrics
+    // 3. Acquire data directory lock (prevents dual instances)
+    let _data_lock = vf_storage::file_lock::ProcessLock::acquire(
+        Path::new(&config.data_dir),
+    ).unwrap_or_else(|e| {
+        tracing::error!("failed to acquire data directory lock: {}", e);
+        std::process::exit(1);
+    });
+
+    // 4. Initialize Prometheus metrics
     let metrics_handle = setup_metrics();
 
-    // 4. Create application state
+    // 5. Create application state
     let state = AppState::new(
         Path::new(&config.data_dir),
         config.max_ef_search,
@@ -147,11 +156,28 @@ async fn main() {
     server_status.mark_initialized();
     tracing::info!("SwarnDB server fully initialized and ready");
 
-    // 7. Wait for shutdown signal
+    // 7. Start background snapshot scheduler
+    let shutdown_signal = ShutdownSignal::new();
+    let snapshot_shutdown_rx = shutdown_signal.subscribe();
+    let snapshot_config = SnapshotConfig::from_env(
+        config.snapshot_check_interval_secs,
+        config.snapshot_mutation_threshold,
+        config.snapshot_interval_secs,
+    );
+    let snapshot_state = std::sync::Arc::new(state.clone());
+    let snapshot_handle = tokio::spawn(async move {
+        start_snapshot_scheduler(snapshot_state, snapshot_shutdown_rx, snapshot_config).await;
+    });
+
+    // 8. Wait for shutdown signal
     wait_for_shutdown().await;
 
-    // 8. Graceful shutdown
+    // 9. Graceful shutdown
     tracing::info!("shutdown signal received, stopping servers...");
+
+    // Signal the snapshot scheduler to stop
+    shutdown_signal.trigger();
+    let _ = snapshot_handle.await;
 
     // Abort server tasks
     grpc_handle.abort();

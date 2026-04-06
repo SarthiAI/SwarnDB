@@ -22,7 +22,6 @@ use crate::validation::{
     validate_batch_lock_size, validate_bulk_insert_options, validate_ef_construction,
     validate_index_mode, validate_wal_flush_every,
 };
-use vf_core::store::VectorRecord;
 use vf_core::vector::VectorData;
 use vf_index::traits::VectorIndex;
 
@@ -73,24 +72,31 @@ impl VectorService for VectorServiceImpl {
             Status::not_found(format!("collection '{}' not found", req.collection))
         })?;
 
-        let vector_data = VectorData::F32(values.clone());
-
         let assigned_id = if req.id == 0 {
-            let id = coll
-                .store
-                .insert_auto_id(vector_data, core_metadata.clone())
-                .map_err(|e| Status::internal(format!("store insert failed: {}", e)))?;
-            id
-        } else {
-            let record = VectorRecord::new(req.id, vector_data, core_metadata.clone());
             coll.store
-                .insert(record)
+                .insert_metadata_auto_id(core_metadata.clone())
+                .map_err(|e| Status::internal(format!("store insert failed: {}", e)))?
+        } else {
+            coll.store
+                .insert_metadata(req.id, core_metadata.clone())
                 .map_err(|e| Status::internal(format!("store insert failed: {}", e)))?;
             req.id
         };
 
-        if let Err(e) = coll.index.add(assigned_id, &values) {
-            // Rollback: remove from store since index add failed
+        // Persist to storage layer first to obtain the WAL LSN.
+        let lsn = {
+            let mut cm = self.state.collection_manager.write();
+            if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
+                if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(values.clone()), core_metadata.clone()) {
+                    tracing::warn!(collection = %req.collection, id = assigned_id, "storage insert failed: {}", e);
+                }
+                storage_coll.current_lsn().saturating_sub(1)
+            } else {
+                0
+            }
+        };
+
+        if let Err(e) = coll.index.add_with_lsn(assigned_id, &values, lsn) {
             let _ = coll.store.delete(assigned_id);
             return Err(Status::internal(format!("index insert failed: {}", e)));
         }
@@ -99,22 +105,14 @@ impl VectorService for VectorServiceImpl {
             coll.index_manager.index_record(assigned_id, meta);
         }
 
-        // Compute virtual graph edges for the newly inserted vector
         if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
             &mut coll.graph, &coll.index, assigned_id, &values, 10,
         ) {
             tracing::warn!(collection = %req.collection, id = assigned_id, "graph compute failed: {}", e);
         }
 
-        // Persist to storage layer (best-effort)
-        {
-            let mut cm = self.state.collection_manager.write();
-            if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
-                if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(values), core_metadata) {
-                    tracing::warn!(collection = %req.collection, id = assigned_id, "storage insert failed: {}", e);
-                }
-            }
-        }
+        coll.dirty.store(true, Ordering::Release);
+        coll.mutation_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(Response::new(InsertResponse {
             id: assigned_id,
@@ -133,19 +131,23 @@ impl VectorService for VectorServiceImpl {
             Status::not_found(format!("collection '{}' not found", req.collection))
         })?;
 
-        let record = coll
+        let meta_record = coll
             .store
             .get(req.id)
             .map_err(|e| Status::not_found(format!("vector not found: {}", e)))?;
+        let vector_data = coll
+            .index
+            .get_vector(req.id)
+            .map_err(|e| Status::internal(format!("vector retrieval failed: {}", e)))?;
 
         let proto_vector = Vector {
-            values: record.data.to_f32_vec(),
+            values: vector_data,
         };
 
-        let proto_metadata = record.metadata.as_ref().map(core_to_proto_metadata);
+        let proto_metadata = meta_record.metadata.as_ref().map(core_to_proto_metadata);
 
         Ok(Response::new(GetVectorResponse {
-            id: record.id,
+            id: meta_record.id,
             vector: Some(proto_vector),
             metadata: proto_metadata,
         }))
@@ -179,35 +181,39 @@ impl VectorService for VectorServiceImpl {
             Status::not_found(format!("collection '{}' not found", req.collection))
         })?;
 
-        let vector_data = values.as_ref().map(|v| VectorData::F32(v.clone()));
-        coll.store
-            .update(req.id, vector_data.clone(), core_metadata.clone())
-            .map_err(|e| Status::not_found(format!("update failed: {}", e)))?;
+        // Persist to storage layer first to obtain the WAL LSN.
+        let lsn = {
+            let mut cm = self.state.collection_manager.write();
+            if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
+                let storage_data = values.clone().map(VectorData::F32);
+                if let Err(e) = storage_coll.update(req.id, storage_data, core_metadata.clone()) {
+                    tracing::warn!(collection = %req.collection, id = req.id, "storage update failed: {}", e);
+                }
+                storage_coll.current_lsn().saturating_sub(1)
+            } else {
+                0
+            }
+        };
 
-        // Only update vector index if new vector data was provided
+        // Update vector index with LSN if new vector data was provided.
         if let Some(ref vals) = values {
-            let _ = coll.index.remove(req.id);
+            let _ = coll.index.remove_with_lsn(req.id, lsn);
             coll.index
-                .add(req.id, vals)
+                .add_with_lsn(req.id, vals, lsn)
                 .map_err(|e| Status::internal(format!("index update failed: {}", e)))?;
         }
 
-        // Update metadata index if metadata was provided
+        coll.store
+            .update_metadata(req.id, core_metadata.clone())
+            .map_err(|e| Status::not_found(format!("update failed: {}", e)))?;
+
         if let Some(ref meta) = core_metadata {
             coll.index_manager.remove_record(req.id);
             coll.index_manager.index_record(req.id, meta);
         }
 
-        // Persist to storage layer (best-effort)
-        {
-            let mut cm = self.state.collection_manager.write();
-            if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
-                let storage_data = values.map(VectorData::F32);
-                if let Err(e) = storage_coll.update(req.id, storage_data, core_metadata) {
-                    tracing::warn!(collection = %req.collection, id = req.id, "storage update failed: {}", e);
-                }
-            }
-        }
+        coll.dirty.store(true, Ordering::Release);
+        coll.mutation_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(Response::new(UpdateResponse { success: true }))
     }
@@ -227,19 +233,25 @@ impl VectorService for VectorServiceImpl {
             .delete(req.id)
             .map_err(|e| Status::not_found(format!("delete failed: {}", e)))?;
 
-        let _ = coll.index.remove(req.id);
-        coll.index_manager.remove_record(req.id);
-        coll.graph.remove_node(req.id);
-
-        // Persist to storage layer (best-effort)
-        {
+        // Persist to storage layer first to obtain the WAL LSN.
+        let lsn = {
             let mut cm = self.state.collection_manager.write();
             if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
                 if let Err(e) = storage_coll.delete(req.id) {
                     tracing::warn!(collection = %req.collection, id = req.id, "storage delete failed: {}", e);
                 }
+                storage_coll.current_lsn().saturating_sub(1)
+            } else {
+                0
             }
-        }
+        };
+
+        let _ = coll.index.remove_with_lsn(req.id, lsn);
+        coll.index_manager.remove_record(req.id);
+        coll.graph.remove_node_with_lsn(req.id, lsn);
+
+        coll.dirty.store(true, Ordering::Release);
+        coll.mutation_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(Response::new(DeleteVectorResponse { success: true }))
     }
@@ -279,10 +291,8 @@ impl VectorService for VectorServiceImpl {
                 }
             };
 
-            let vector_data = VectorData::F32(values.clone());
-
             let assigned_id = if req.id == 0 {
-                match coll.store.insert_auto_id(vector_data, core_metadata.clone()) {
+                match coll.store.insert_metadata_auto_id(core_metadata.clone()) {
                     Ok(id) => id,
                     Err(e) => {
                         errors.push(format!("store insert failed: {}", e));
@@ -290,8 +300,7 @@ impl VectorService for VectorServiceImpl {
                     }
                 }
             } else {
-                let record = VectorRecord::new(req.id, vector_data, core_metadata.clone());
-                match coll.store.insert(record) {
+                match coll.store.insert_metadata(req.id, core_metadata.clone()) {
                     Ok(()) => req.id,
                     Err(e) => {
                         errors.push(format!("store insert failed for id {}: {}", req.id, e));
@@ -501,11 +510,10 @@ impl VectorService for VectorServiceImpl {
 
                     let values = proto_vec.values.clone();
                     let core_metadata = item.req.metadata.as_ref().map(proto_to_core_metadata);
-                    let vector_data = VectorData::F32(values.clone());
 
-                    // Insert into store
+                    // Insert metadata into store (vector data stored in index)
                     let assigned_id = if item.req.id == 0 {
-                        match coll.store.insert_auto_id(vector_data, core_metadata.clone()) {
+                        match coll.store.insert_metadata_auto_id(core_metadata.clone()) {
                             Ok(id) => id,
                             Err(e) => {
                                 errors.push(format!(
@@ -516,9 +524,7 @@ impl VectorService for VectorServiceImpl {
                             }
                         }
                     } else {
-                        let record =
-                            VectorRecord::new(item.req.id, vector_data, core_metadata.clone());
-                        match coll.store.insert(record) {
+                        match coll.store.insert_metadata(item.req.id, core_metadata.clone()) {
                             Ok(()) => item.req.id,
                             Err(e) => {
                                 errors.push(format!(

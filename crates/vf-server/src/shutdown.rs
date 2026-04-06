@@ -49,15 +49,15 @@ pub async fn wait_for_shutdown() {
 /// 1. Logs shutdown initiation
 /// 2. Iterates all loaded collections and flushes pending data
 ///    (WAL flush, segment sync)
-/// 3. Logs shutdown completion
-///
-/// Since `Collection` lives in `vf-storage`, the actual flush/sync
-/// calls are conceptual here and will be wired up once the storage
-/// layer exposes the necessary APIs.
+/// 3. Persists HNSW topology snapshots (via atomic_write)
+/// 4. Persists virtual graph base snapshots (via atomic_write)
+/// 5. Updates wal_meta.json with final LSN
+/// 6. Writes a `shutdown_clean` marker per collection
+/// 7. Logs shutdown completion
 pub async fn graceful_shutdown(state: AppState) {
     tracing::info!("graceful shutdown initiated, draining resources...");
 
-    // Flush all storage collections via CollectionManager.
+    // Phase 1: Flush all memtables via CollectionManager.
     {
         let mut cm = state.collection_manager.write();
         let names: Vec<String> = cm.list_collections().iter().map(|s| s.to_string()).collect();
@@ -85,6 +85,123 @@ pub async fn graceful_shutdown(state: AppState) {
                         tracing::error!(collection = %name, "failed to get collection for flush: {}", e);
                     }
                 }
+            }
+        }
+    }
+
+    // Phase 2: Persist HNSW topology, graph snapshots, WAL meta, and
+    // write clean shutdown marker for each collection.
+    {
+        let collections = state.collections.read();
+        let cm = state.collection_manager.read();
+
+        for (name, coll_state) in collections.iter() {
+            // Resolve collection directory and current LSN from CollectionManager.
+            let (collection_dir, current_lsn) = match cm.get_collection(name) {
+                Ok(storage_coll) => (
+                    storage_coll.collection_dir().to_path_buf(),
+                    storage_coll.current_lsn(),
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        collection = %name,
+                        "failed to get storage collection for snapshot: {}",
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            // 1. Snapshot and persist HNSW topology.
+            {
+                let snapshot = coll_state.index.snapshot_topology(current_lsn);
+                let hnsw_path = collection_dir.join("hnsw.base");
+                let res = vf_storage::atomic_write::atomic_write_with_callback(
+                    &hnsw_path,
+                    |file| {
+                        vf_index::hnsw_persistence::serialize_topology(&snapshot, file)
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("HNSW serialize error: {}", e),
+                                )
+                            })?;
+                        Ok(())
+                    },
+                );
+                match res {
+                    Ok(()) => {
+                        tracing::info!(collection = %name, "HNSW topology snapshot persisted");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            collection = %name,
+                            "failed to persist HNSW topology: {}",
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // 2. Serialize and persist virtual graph base snapshot.
+            {
+                let graph_path = collection_dir.join("graph.base");
+                let res = vf_storage::atomic_write::atomic_write_with_callback(
+                    &graph_path,
+                    |file| {
+                        vf_graph::serialize_base(&coll_state.graph, current_lsn, file)
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("graph serialize error: {}", e),
+                                )
+                            })?;
+                        Ok(())
+                    },
+                );
+                match res {
+                    Ok(()) => {
+                        tracing::info!(collection = %name, "virtual graph snapshot persisted");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            collection = %name,
+                            "failed to persist virtual graph: {}",
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // 3. Update wal_meta.json with the final LSN.
+            {
+                let meta = vf_storage::wal::WalMeta::new(current_lsn);
+                if let Err(e) = vf_storage::wal::save_wal_meta(&collection_dir, &meta) {
+                    tracing::error!(
+                        collection = %name,
+                        "failed to update wal_meta.json: {}",
+                        e
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    collection = %name,
+                    lsn = current_lsn,
+                    "wal_meta.json updated"
+                );
+            }
+
+            // 4. Write clean shutdown marker (LAST, after all snapshots).
+            if let Err(e) = vf_storage::collection::write_shutdown_marker(&collection_dir) {
+                tracing::error!(
+                    collection = %name,
+                    "failed to write shutdown marker: {}",
+                    e
+                );
+            } else {
+                tracing::info!(collection = %name, "clean shutdown marker written");
             }
         }
     }

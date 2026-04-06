@@ -345,12 +345,15 @@ impl SegmentWriter {
 
         let dimension = store.dimension() as u32;
 
-        // Collect records from the store (cloned, since DashMap doesn't allow borrowed iteration).
-        let cloned = store.iter_cloned();
-        let mut records: Vec<(VectorId, VectorData, Option<Metadata>)> = cloned
-            .into_iter()
-            .map(|(id, rec)| (id, rec.data, rec.metadata))
-            .collect();
+        // Collect records from the store, skipping metadata-only entries.
+        let mut records: Vec<(VectorId, VectorData, Option<Metadata>)> = Vec::new();
+        for id in store.ids() {
+            if let Ok(rec) = store.get(id) {
+                if let Some(data) = rec.data {
+                    records.push((id, data, rec.metadata));
+                }
+            }
+        }
 
         // Sort by id for deterministic output.
         records.sort_by_key(|&(id, _, _)| id);

@@ -18,6 +18,8 @@ use vf_core::types::{DistanceMetricType, ScoredResult, VectorId};
 
 use crate::arena::VectorArena;
 use crate::flat_adj::FlatAdjacencyList;
+use crate::hnsw_delta::{HnswDeltaEntry, HnswDeltaOp, HnswDeltaWriter};
+use crate::hnsw_persistence::{HnswTopologySnapshot, TopologyNode};
 use crate::hnsw_types::HnswNode;
 use crate::prefetch::{prefetch_neighbors, prefetch_vector};
 use crate::traits::{IndexError, VectorIndex};
@@ -79,6 +81,9 @@ pub struct HnswIndex {
     metric: DistanceMetricType,
     distance_fn: DistanceMetric,
     dimension: usize,
+    /// Optional delta writer for incremental persistence between base snapshots.
+    /// Kept outside the inner RwLock to avoid holding it during I/O.
+    delta_writer: Mutex<Option<HnswDeltaWriter>>,
 }
 
 const _: () = { fn _assert_send_sync<T: Send + Sync>() {} fn _check() { _assert_send_sync::<HnswIndex>(); } };
@@ -98,6 +103,7 @@ impl HnswIndex {
             metric,
             distance_fn: DistanceMetric::from_metric_type(metric),
             dimension,
+            delta_writer: Mutex::new(None),
         }
     }
 
@@ -297,6 +303,7 @@ impl HnswIndex {
             metric,
             distance_fn: DistanceMetric::from_metric_type(metric),
             dimension,
+            delta_writer: Mutex::new(None),
         })
     }
 
@@ -1267,6 +1274,209 @@ impl HnswIndex {
     pub fn build_with_arena(&self, vectors: &[(VectorId, &[f32])]) -> Result<(), IndexError> {
         self.bulk_add(vectors)
     }
+
+    /// Retrieve a vector by ID from the internal VectorArena.
+    /// Acquires a read lock on the HNSW inner state.
+    pub fn get_vector(&self, id: VectorId) -> Result<Vec<f32>, IndexError> {
+        let inner = self.inner.read();
+        let node = inner.nodes.get(&id).ok_or(IndexError::NotFound(id))?;
+        Ok(inner.vectors.get(node.vector_slot).to_vec())
+    }
+
+    /// Retrieve all vectors from the internal VectorArena.
+    /// Returns owned (id, Vec<f32>) pairs.
+    pub fn iter_vectors(&self) -> Vec<(VectorId, Vec<f32>)> {
+        let inner = self.inner.read();
+        inner.nodes.iter()
+            .map(|(&id, node)| (id, inner.vectors.get(node.vector_slot).to_vec()))
+            .collect()
+    }
+
+    // ── Topology snapshot / restore ────────────────────────────────────
+
+    /// Extract a topology snapshot under read lock.
+    /// Captures the complete graph structure without vector data.
+    pub fn snapshot_topology(&self, snapshot_lsn: u64) -> HnswTopologySnapshot {
+        let inner = self.inner.read();
+
+        let nodes: Vec<TopologyNode> = inner
+            .nodes
+            .iter()
+            .map(|(&id, node)| TopologyNode {
+                id,
+                level: node.max_level(),
+                vector_slot: node.vector_slot,
+                neighbors: node.neighbors.clone(),
+            })
+            .collect();
+
+        HnswTopologySnapshot {
+            snapshot_lsn,
+            timestamp: HnswTopologySnapshot::now_millis(),
+            dimension: self.dimension as u32,
+            metric: Self::metric_to_u8(self.metric),
+            m: self.params.m as u32,
+            m0: self.params.m0 as u32,
+            ef_construction: self.params.ef_construction as u32,
+            ef_search: self.params.ef_search as u32,
+            entry_point: inner.entry_point,
+            max_level: inner.max_level as u32,
+            nodes,
+        }
+    }
+
+    /// Reconstruct an HnswIndex from a topology snapshot and an externally-provided VectorArena.
+    pub fn restore_from_topology(
+        snapshot: HnswTopologySnapshot,
+        arena: VectorArena,
+    ) -> Result<Self, IndexError> {
+        let metric = Self::metric_from_u8(snapshot.metric)?;
+        let dimension = snapshot.dimension as usize;
+
+        let params = HnswParams {
+            m: snapshot.m as usize,
+            m0: snapshot.m0 as usize,
+            ef_construction: snapshot.ef_construction as usize,
+            ef_search: snapshot.ef_search as usize,
+            m_l: 1.0 / (snapshot.m as f64).ln(),
+            max_level_cap: 16,
+        };
+
+        let mut nodes = HashMap::with_capacity(snapshot.nodes.len());
+        for topo_node in snapshot.nodes {
+            let node = HnswNode {
+                vector_slot: topo_node.vector_slot,
+                neighbors: topo_node.neighbors,
+            };
+            nodes.insert(topo_node.id, node);
+        }
+
+        Ok(Self {
+            inner: RwLock::new(HnswInner {
+                nodes,
+                vectors: arena,
+                entry_point: snapshot.entry_point,
+                max_level: snapshot.max_level as usize,
+                rng: StdRng::from_entropy(),
+                flat_adj: None,
+            }),
+            params,
+            metric,
+            distance_fn: DistanceMetric::from_metric_type(metric),
+            dimension,
+            delta_writer: Mutex::new(None),
+        })
+    }
+
+    // ── Delta writer management ───────────────────────────────────────
+
+    /// Attach a delta writer for incremental persistence.
+    pub fn set_delta_writer(&self, writer: HnswDeltaWriter) {
+        *self.delta_writer.lock() = Some(writer);
+    }
+
+    /// Detach the delta writer (e.g., before taking a base snapshot).
+    pub fn take_delta_writer(&self) -> Option<HnswDeltaWriter> {
+        self.delta_writer.lock().take()
+    }
+
+    // ── LSN-aware mutation methods ──────────────────────────────────────
+
+    /// Insert a vector and emit a delta entry if a writer is attached.
+    pub fn add_with_lsn(&self, id: VectorId, vector: &[f32], lsn: u64) -> Result<(), IndexError> {
+        // Capture the entry point before the mutation to detect changes.
+        let ep_before = self.inner.read().entry_point;
+
+        // Perform the actual insertion via the existing add() path.
+        {
+            let mut inner = self.inner.write();
+            self.insert_node(&mut inner, id, vector)?;
+        }
+
+        // Emit delta entries after successful mutation.
+        let mut dw = self.delta_writer.lock();
+        if let Some(ref mut writer) = *dw {
+            let inner = self.inner.read();
+
+            // Emit AddNode with the new node's full topology.
+            if let Some(node) = inner.nodes.get(&id) {
+                let neighbors_per_layer: Vec<Vec<VectorId>> = node.neighbors.clone();
+                let entry = HnswDeltaEntry {
+                    lsn,
+                    op: HnswDeltaOp::AddNode {
+                        id,
+                        level: node.max_level() as u32,
+                        vector_slot: node.vector_slot as u64,
+                        neighbors_per_layer,
+                    },
+                };
+                if let Err(e) = writer.append(&entry) {
+                    log::warn!("delta write failed for AddNode id={}: {}", id, e);
+                }
+            }
+
+            // Emit SetEntryPoint if the entry point changed.
+            if inner.entry_point != ep_before {
+                if let Some(ep_id) = inner.entry_point {
+                    let entry = HnswDeltaEntry {
+                        lsn,
+                        op: HnswDeltaOp::SetEntryPoint {
+                            id: ep_id,
+                            level: inner.max_level as u32,
+                        },
+                    };
+                    if let Err(e) = writer.append(&entry) {
+                        log::warn!("delta write failed for SetEntryPoint: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a vector and emit a delta entry if a writer is attached.
+    pub fn remove_with_lsn(&self, id: VectorId, lsn: u64) -> Result<(), IndexError> {
+        // Capture the entry point before the mutation to detect changes.
+        let ep_before = self.inner.read().entry_point;
+
+        // Perform the actual removal via the existing delete path.
+        {
+            let mut inner = self.inner.write();
+            self.delete_node(&mut inner, id)?;
+        }
+
+        // Emit delta entries after successful mutation.
+        let mut dw = self.delta_writer.lock();
+        if let Some(ref mut writer) = *dw {
+            let entry = HnswDeltaEntry {
+                lsn,
+                op: HnswDeltaOp::RemoveNode { id },
+            };
+            if let Err(e) = writer.append(&entry) {
+                log::warn!("delta write failed for RemoveNode id={}: {}", id, e);
+            }
+
+            // Emit SetEntryPoint if the entry point changed after removal.
+            let inner = self.inner.read();
+            if inner.entry_point != ep_before {
+                if let Some(ep_id) = inner.entry_point {
+                    let ep_entry = HnswDeltaEntry {
+                        lsn,
+                        op: HnswDeltaOp::SetEntryPoint {
+                            id: ep_id,
+                            level: inner.max_level as u32,
+                        },
+                    };
+                    if let Err(e) = writer.append(&ep_entry) {
+                        log::warn!("delta write failed for SetEntryPoint: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl VectorIndex for HnswIndex {
@@ -1346,5 +1556,13 @@ impl VectorIndex for HnswIndex {
 
     fn contains(&self, id: VectorId) -> bool {
         self.inner.read().nodes.contains_key(&id)
+    }
+
+    fn get_vector(&self, id: VectorId) -> Result<Vec<f32>, IndexError> {
+        self.get_vector(id)
+    }
+
+    fn iter_vectors(&self) -> Result<Vec<(VectorId, Vec<f32>)>, IndexError> {
+        Ok(self.iter_vectors())
     }
 }

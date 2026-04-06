@@ -9,6 +9,7 @@ pub mod traversal;
 pub mod query;
 pub mod compute;
 pub mod persistence;
+pub mod graph_delta;
 pub mod refinement;
 pub mod propagation;
 
@@ -17,6 +18,12 @@ pub use error::GraphError;
 pub use traversal::{GraphTraversal, TraversalOrder, TraversalResult};
 pub use query::{RelationshipQueryEngine, RelationshipQuery, Direction};
 pub use compute::RelationshipComputer;
+#[allow(deprecated)]
 pub use persistence::GraphPersistence;
+pub use persistence::{serialize_base, deserialize_base, validate_graph_base};
+pub use graph_delta::{
+    GraphDeltaOp, GraphDeltaEntry, GraphDeltaWriter, GraphDeltaReader,
+    replay_delta, replay_delta_after_lsn,
+};
 pub use refinement::{GraphRefiner, RefinementConfig, RefinementStats};
 pub use propagation::ThresholdPropagator;

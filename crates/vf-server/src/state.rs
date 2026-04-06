@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,14 +28,19 @@ impl CollectionStatus {
         }
     }
 }
-use vf_core::store::{InMemoryVectorStore, VectorRecord};
+use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{CollectionConfig, Metadata, VectorId};
-use vf_core::vector::VectorData;
 use vf_graph::VirtualGraph;
+use vf_index::arena::VectorArena;
 use vf_index::hnsw::HnswIndex;
+use vf_index::hnsw_delta::HnswDeltaWriter;
+use vf_index::hnsw_persistence::deserialize_topology_mmap;
 use vf_index::traits::VectorIndex;
+use vf_graph::graph_delta::GraphDeltaWriter;
+use vf_graph::persistence::deserialize_base as deserialize_graph_base;
 use vf_query::IndexManager;
 use vf_storage::collection::CollectionManager;
+use vf_storage::recovery::{plan_recovery, RecoveryStrategy};
 use vf_storage::StorageError;
 
 /// Cached metadata store that avoids rebuilding the HashMap on every query.
@@ -91,6 +96,10 @@ pub struct CollectionState {
     pub deferred_graph: Arc<AtomicBool>,
     /// True if metadata indexing was skipped during bulk insert.
     pub deferred_metadata: Arc<AtomicBool>,
+    /// True if any mutation has occurred since last snapshot.
+    pub dirty: Arc<AtomicBool>,
+    /// Number of mutations since last snapshot.
+    pub mutation_count: Arc<AtomicU64>,
 }
 
 /// Global application state shared across all gRPC services.
@@ -140,8 +149,17 @@ impl AppState {
             let config = collection.config().clone();
             let dimension = config.dimension;
             let distance_metric = config.distance_metric;
+            let collection_dir = collection.collection_dir().to_path_buf();
 
-            // Load all vectors from segments + memtable.
+            // Plan recovery strategy based on available files.
+            let plan = plan_recovery(&name, &collection_dir);
+            tracing::info!(
+                collection = %name,
+                strategy = ?plan.strategy,
+                "recovery plan: {:?}", plan.strategy
+            );
+
+            // Load all vectors from segments + memtable (needed for all strategies).
             let vectors = match collection.load_all_vectors() {
                 Ok(v) => v,
                 Err(e) => {
@@ -152,53 +170,178 @@ impl AppState {
                     continue;
                 }
             };
-
             let vector_count = vectors.len();
 
-            // Populate the in-memory store and HNSW index.
+            // Populate the in-memory metadata store (needed for all strategies).
             let store = InMemoryVectorStore::new(dimension);
-            let index = HnswIndex::with_defaults(dimension, distance_metric);
+            for (id, _data, metadata) in &vectors {
+                if let Err(e) = store.insert_metadata(*id, metadata.clone()) {
+                    tracing::warn!(
+                        collection = %name,
+                        vector_id = id,
+                        "failed to insert metadata into store: {e}"
+                    );
+                }
+            }
 
-            for (id, data, metadata) in &vectors {
-                let record = VectorRecord::new(
-                    *id,
-                    VectorData::F32(data.clone()),
-                    metadata.clone(),
-                );
-                if let Err(e) = store.insert(record) {
-                    tracing::warn!(
-                        collection = %name,
-                        vector_id = id,
-                        "failed to insert vector into store: {e}"
-                    );
+            // Build VectorArena from loaded vectors using the topology snapshot's slot mapping.
+            // Vectors must be pushed in slot order so that each vector ends up at its
+            // original slot — otherwise the topology's vector_slot references break.
+            let build_arena_from_topology = |vecs: &[(VectorId, Vec<f32>, Option<Metadata>)],
+                                              snapshot: &vf_index::hnsw_persistence::HnswTopologySnapshot|
+                                              -> VectorArena {
+                let mut arena = VectorArena::new(dimension);
+                // Build id→data map for O(1) lookup.
+                let vec_map: HashMap<VectorId, &[f32]> = vecs.iter()
+                    .map(|(id, data, _)| (*id, data.as_slice()))
+                    .collect();
+                // Sort nodes by vector_slot ascending so arena.push() assigns correct slots.
+                let mut nodes_by_slot: Vec<_> = snapshot.nodes.iter()
+                    .map(|n| (n.vector_slot, n.id))
+                    .collect();
+                nodes_by_slot.sort_by_key(|(slot, _)| *slot);
+                // Push vectors in slot order.
+                for (_slot, id) in &nodes_by_slot {
+                    if let Some(data) = vec_map.get(id) {
+                        arena.push(data);
+                    } else {
+                        // Vector not found in segments — push zeros as placeholder.
+                        let zeros = vec![0.0f32; dimension];
+                        arena.push(&zeros);
+                    }
                 }
-                if let Err(e) = index.add(*id, data) {
-                    tracing::warn!(
-                        collection = %name,
-                        vector_id = id,
-                        "failed to add vector to HNSW index: {e}"
-                    );
+                arena
+            };
+
+            // Attempt recovery based on strategy, falling back to full rebuild on error.
+            let (index, graph) = match plan.strategy {
+                RecoveryStrategy::CleanShutdown => {
+                    let hnsw_path = collection_dir.join("hnsw.base");
+                    let graph_path = collection_dir.join("graph.base");
+
+                    // Try loading HNSW topology snapshot.
+                    let hnsw_result = (|| -> Result<HnswIndex, String> {
+                        let snapshot = deserialize_topology_mmap(&hnsw_path)
+                            .map_err(|e| format!("hnsw base load failed: {e}"))?;
+                        let arena = build_arena_from_topology(&vectors, &snapshot);
+                        HnswIndex::restore_from_topology(snapshot, arena)
+                            .map_err(|e| format!("hnsw restore failed: {e}"))
+                    })();
+
+                    // Try loading graph base snapshot.
+                    let graph_result = (|| -> Result<VirtualGraph, String> {
+                        let mut file = std::fs::File::open(&graph_path)
+                            .map_err(|e| format!("graph base open failed: {e}"))?;
+                        let (_lsn, graph) = deserialize_graph_base(&mut file)
+                            .map_err(|e| format!("graph base load failed: {e}"))?;
+                        Ok(graph)
+                    })();
+
+                    match (hnsw_result, graph_result) {
+                        (Ok(idx), Ok(g)) => {
+                            vf_storage::collection::remove_shutdown_marker(&collection_dir);
+                            tracing::info!(
+                                collection = %name,
+                                vectors = vector_count,
+                                "recovered from clean shutdown"
+                            );
+                            (idx, g)
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::warn!(
+                                collection = %name,
+                                "snapshot load failed ({e}), falling back to full rebuild"
+                            );
+                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config)
+                        }
+                    }
                 }
+
+                RecoveryStrategy::IncrementalReplay { .. } => {
+                    let hnsw_path = collection_dir.join("hnsw.base");
+                    let graph_path = collection_dir.join("graph.base");
+                    let hnsw_delta_path = collection_dir.join("hnsw.delta");
+                    let graph_delta_path = collection_dir.join("graph.delta");
+
+                    let replay_result = (|| -> Result<(HnswIndex, VirtualGraph), String> {
+                        // Load HNSW base and replay delta.
+                        let mut snapshot = deserialize_topology_mmap(&hnsw_path)
+                            .map_err(|e| format!("hnsw base load failed: {e}"))?;
+                        let base_lsn = snapshot.snapshot_lsn;
+
+                        if hnsw_delta_path.exists() {
+                            let replayed = vf_index::hnsw_delta::replay_delta_after_lsn(
+                                &mut snapshot, &hnsw_delta_path, base_lsn,
+                            ).map_err(|e| format!("hnsw delta replay failed: {e}"))?;
+                            tracing::info!(
+                                collection = %name,
+                                "replayed hnsw delta, last LSN: {replayed}"
+                            );
+                        }
+
+                        let arena = build_arena_from_topology(&vectors, &snapshot);
+                        let idx = HnswIndex::restore_from_topology(snapshot, arena)
+                            .map_err(|e| format!("hnsw restore failed: {e}"))?;
+
+                        // Load graph base and replay delta.
+                        let mut file = std::fs::File::open(&graph_path)
+                            .map_err(|e| format!("graph base open failed: {e}"))?;
+                        let (graph_base_lsn, mut graph) = deserialize_graph_base(&mut file)
+                            .map_err(|e| format!("graph base load failed: {e}"))?;
+
+                        if graph_delta_path.exists() {
+                            let replayed = vf_graph::graph_delta::replay_delta_after_lsn(
+                                &mut graph, &graph_delta_path, graph_base_lsn,
+                            ).map_err(|e| format!("graph delta replay failed: {e}"))?;
+                            tracing::info!(
+                                collection = %name,
+                                "replayed graph delta, entries: {replayed}"
+                            );
+                        }
+
+                        Ok((idx, graph))
+                    })();
+
+                    match replay_result {
+                        Ok((idx, g)) => {
+                            tracing::info!(
+                                collection = %name,
+                                vectors = vector_count,
+                                "recovered via incremental replay"
+                            );
+                            (idx, g)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                collection = %name,
+                                "incremental replay failed ({e}), falling back to full rebuild"
+                            );
+                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config)
+                        }
+                    }
+                }
+
+                RecoveryStrategy::FullRebuild => {
+                    tracing::info!(collection = %name, "full rebuild from vectors");
+                    Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config)
+                }
+            };
+
+            // Initialize delta writers for incremental persistence.
+            let hnsw_delta_path = collection_dir.join("hnsw.delta");
+            match HnswDeltaWriter::create(&hnsw_delta_path) {
+                Ok(writer) => index.set_delta_writer(writer),
+                Err(e) => tracing::warn!(collection = %name, "failed to create hnsw delta writer: {e}"),
+            }
+
+            let graph_delta_path = collection_dir.join("graph.delta");
+            let mut graph = graph;
+            match GraphDeltaWriter::create(&graph_delta_path) {
+                Ok(writer) => graph.set_delta_writer(writer),
+                Err(e) => tracing::warn!(collection = %name, "failed to create graph delta writer: {e}"),
             }
 
             let index_manager = IndexManager::with_defaults();
-            let mut graph = match config.default_similarity_threshold {
-                Some(t) if t > 0.0 => VirtualGraph::with_threshold(t, config.distance_metric),
-                _ => VirtualGraph::with_threshold(0.7, config.distance_metric),
-            };
-
-            // Populate virtual graph from recovered vectors
-            {
-                let vector_ids: Vec<u64> = vectors.iter().map(|(id, _, _)| *id).collect();
-                let vector_map: std::collections::HashMap<u64, Vec<f32>> = vectors.iter()
-                    .map(|(id, data, _)| (*id, data.clone()))
-                    .collect();
-                if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                    &mut graph, &index, &vector_ids, &vector_map, 10,
-                ) {
-                    tracing::warn!(collection = %name, "graph compute_batch failed: {}", e);
-                }
-            }
 
             let collection_state = CollectionState {
                 config,
@@ -211,6 +354,8 @@ impl AppState {
                 deferred_index: Arc::new(AtomicBool::new(false)),
                 deferred_graph: Arc::new(AtomicBool::new(false)),
                 deferred_metadata: Arc::new(AtomicBool::new(false)),
+                dirty: Arc::new(AtomicBool::new(false)),
+                mutation_count: Arc::new(AtomicU64::new(0)),
             };
 
             collections.insert(name.clone(), collection_state);
@@ -239,6 +384,43 @@ impl AppState {
             max_wal_flush_interval,
             max_ef_construction,
         })
+    }
+
+    /// Full rebuild path: load vectors into HNSW index one by one and recompute graph.
+    fn full_rebuild(
+        name: &str,
+        dimension: usize,
+        distance_metric: vf_core::types::DistanceMetricType,
+        vectors: &[(VectorId, Vec<f32>, Option<Metadata>)],
+        config: &CollectionConfig,
+    ) -> (HnswIndex, VirtualGraph) {
+        let index = HnswIndex::with_defaults(dimension, distance_metric);
+        for (id, data, _metadata) in vectors {
+            if let Err(e) = index.add(*id, data) {
+                tracing::warn!(
+                    collection = %name,
+                    vector_id = id,
+                    "failed to add vector to HNSW index: {e}"
+                );
+            }
+        }
+
+        let mut graph = match config.default_similarity_threshold {
+            Some(t) if t > 0.0 => VirtualGraph::with_threshold(t, config.distance_metric),
+            _ => VirtualGraph::with_threshold(0.7, config.distance_metric),
+        };
+
+        let vector_ids: Vec<u64> = vectors.iter().map(|(id, _, _)| *id).collect();
+        let vector_map: HashMap<u64, Vec<f32>> = vectors.iter()
+            .map(|(id, data, _)| (*id, data.clone()))
+            .collect();
+        if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
+            &mut graph, &index, &vector_ids, &vector_map, 10,
+        ) {
+            tracing::warn!(collection = %name, "graph compute_batch failed: {}", e);
+        }
+
+        (index, graph)
     }
 
     /// Rebuild deferred operations for a collection after bulk insert.
@@ -297,7 +479,7 @@ impl AppState {
 
             // 1. Rebuild HNSW index if deferred.
             if need_index {
-                let vector_data = coll.store.iter_vector_data();
+                let vector_data = coll.index.iter_vectors();
                 let refs: Vec<(VectorId, &[f32])> = vector_data
                     .iter()
                     .map(|(id, v)| (*id, v.as_slice()))
@@ -338,7 +520,7 @@ impl AppState {
 
             // 3. Recompute virtual graph edges if deferred.
             if need_graph {
-                let vector_data = coll.store.iter_vector_data();
+                let vector_data = coll.index.iter_vectors();
                 let vector_ids: Vec<u64> = vector_data.iter().map(|(id, _)| *id).collect();
                 let vector_map: HashMap<u64, Vec<f32>> = vector_data.into_iter().collect();
 

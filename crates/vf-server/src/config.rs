@@ -80,6 +80,18 @@ pub struct ServerConfig {
     /// Maximum allowed ef_construction override for bulk insert operations.
     #[serde(default = "default_max_ef_construction")]
     pub max_ef_construction: u32,
+
+    /// How often the snapshot scheduler checks for triggers (seconds).
+    #[serde(default = "default_snapshot_check_interval_secs")]
+    pub snapshot_check_interval_secs: u64,
+
+    /// Snapshot after this many mutations.
+    #[serde(default = "default_snapshot_mutation_threshold")]
+    pub snapshot_mutation_threshold: u64,
+
+    /// Maximum time between snapshots (seconds).
+    #[serde(default = "default_snapshot_interval_secs")]
+    pub snapshot_interval_secs: u64,
 }
 
 fn default_host() -> String {
@@ -146,6 +158,18 @@ fn default_max_ef_construction() -> u32 {
     2000
 }
 
+fn default_snapshot_check_interval_secs() -> u64 {
+    30
+}
+
+fn default_snapshot_mutation_threshold() -> u64 {
+    50_000
+}
+
+fn default_snapshot_interval_secs() -> u64 {
+    900
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -166,6 +190,9 @@ impl Default for ServerConfig {
             max_batch_lock_size: default_max_batch_lock_size(),
             max_wal_flush_interval: default_max_wal_flush_interval(),
             max_ef_construction: default_max_ef_construction(),
+            snapshot_check_interval_secs: default_snapshot_check_interval_secs(),
+            snapshot_mutation_threshold: default_snapshot_mutation_threshold(),
+            snapshot_interval_secs: default_snapshot_interval_secs(),
         }
     }
 }
@@ -346,6 +373,30 @@ impl ServerConfig {
                 tracing::warn!("Invalid SWARNDB_MAX_EF_CONSTRUCTION value: {}", val);
             }
         }
+
+        if let Ok(val) = env::var("SWARNDB_SNAPSHOT_CHECK_INTERVAL_SECS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.snapshot_check_interval_secs = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_SNAPSHOT_CHECK_INTERVAL_SECS value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_SNAPSHOT_MUTATION_THRESHOLD") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.snapshot_mutation_threshold = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_SNAPSHOT_MUTATION_THRESHOLD value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_SNAPSHOT_INTERVAL_SECS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.snapshot_interval_secs = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_SNAPSHOT_INTERVAL_SECS value: {}", val);
+            }
+        }
     }
 
     /// Returns the gRPC socket address string (e.g., "0.0.0.0:50051").
@@ -395,6 +446,9 @@ mod tests {
         assert_eq!(config.max_batch_lock_size, 10_000);
         assert_eq!(config.max_wal_flush_interval, 100_000);
         assert_eq!(config.max_ef_construction, 2000);
+        assert_eq!(config.snapshot_check_interval_secs, 30);
+        assert_eq!(config.snapshot_mutation_threshold, 50_000);
+        assert_eq!(config.snapshot_interval_secs, 900);
     }
 
     #[test]

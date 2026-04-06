@@ -71,11 +71,6 @@ pub struct QuantizedHnswIndex {
     quantization: QuantizationType,
     /// Quantized codes for each vector (compact storage).
     quantized_codes: RwLock<HashMap<VectorId, Vec<u8>>>,
-    /// Duplicates HNSW's internal vectors for re-ranking. HnswIndex wraps
-    /// nodes behind RwLock and does not expose a "get vector by id" method,
-    /// so we keep a separate copy here. Future optimization: expose vector
-    /// retrieval from HnswIndex to avoid this duplication.
-    full_vectors: RwLock<HashMap<VectorId, Vec<f32>>>,
     /// Re-ranking factor: search for rerank_k candidates, re-rank to get k.
     rerank_factor: usize,
     /// Distance metric type (needed for choosing SQ/PQ distance functions).
@@ -110,7 +105,6 @@ impl QuantizedHnswIndex {
             hnsw: HnswIndex::new(dimension, metric, params),
             quantization,
             quantized_codes: RwLock::new(HashMap::new()),
-            full_vectors: RwLock::new(HashMap::new()),
             rerank_factor,
             metric,
             dimension,
@@ -131,9 +125,6 @@ impl QuantizedHnswIndex {
         let code = self.quantize_vector(vector)?;
         self.quantized_codes.write().insert(id, code);
 
-        // Store the full vector for re-ranking.
-        self.full_vectors.write().insert(id, vector.to_vec());
-
         Ok(())
     }
 
@@ -141,7 +132,6 @@ impl QuantizedHnswIndex {
     pub fn remove(&self, id: VectorId) -> Result<(), IndexError> {
         self.hnsw.remove(id)?;
         self.quantized_codes.write().remove(&id);
-        self.full_vectors.write().remove(&id);
         Ok(())
     }
 
@@ -171,18 +161,16 @@ impl QuantizedHnswIndex {
             return Ok(Vec::new());
         }
 
-        // Re-rank candidates using full-precision vectors.
-        let full_vecs = self.full_vectors.read();
-
+        // Re-rank candidates using full-precision vectors from the HNSW arena.
         let mut reranked: Vec<ScoredResult> = candidates
             .into_iter()
             .map(|candidate| {
-                if let Some(full_vec) = full_vecs.get(&candidate.id) {
-                    let exact_dist = self.distance_fn.compute(query, full_vec);
-                    ScoredResult::new(candidate.id, exact_dist)
-                } else {
-                    // Fallback: keep the HNSW score if full vector is missing.
-                    candidate
+                match self.hnsw.get_vector(candidate.id) {
+                    Ok(full_vec) => {
+                        let exact_dist = self.distance_fn.compute(query, &full_vec);
+                        ScoredResult::new(candidate.id, exact_dist)
+                    }
+                    Err(_) => candidate,
                 }
             })
             .collect();
@@ -317,7 +305,6 @@ impl QuantizedHnswIndex {
     /// at each layer). Actual RSS will be higher.
     pub fn memory_usage(&self) -> QuantizedMemoryStats {
         let codes = self.quantized_codes.read();
-        let vecs = self.full_vectors.read();
         let num_vectors = codes.len();
 
         // Quantized codes memory: sum of all code Vec<u8> allocations.
@@ -326,15 +313,10 @@ impl QuantizedHnswIndex {
             .map(|c| c.capacity() * mem::size_of::<u8>())
             .sum();
 
-        // Full vectors memory: sum of all Vec<f32> allocations.
-        let full_vectors_bytes: usize = vecs
-            .values()
-            .map(|v| v.capacity() * mem::size_of::<f32>())
-            .sum();
+        // Full vectors are stored in the HNSW arena (no separate copy).
+        let full_vectors_bytes: usize = 0;
 
         // HNSW graph overhead estimate: nodes + adjacency lists.
-        // Each node stores a Vec<f32> (vector) + Vec<Vec<VectorId>> (neighbors).
-        // We approximate the graph overhead as the vector storage portion.
         let hnsw_graph_bytes = num_vectors * self.dimension * mem::size_of::<f32>();
 
         let avg_quantized = if num_vectors > 0 {
@@ -343,14 +325,8 @@ impl QuantizedHnswIndex {
             0.0
         };
 
-        let avg_full = if num_vectors > 0 {
-            full_vectors_bytes as f64 / num_vectors as f64
-        } else {
-            0.0
-        };
-
         let compression_ratio = if quantized_codes_bytes > 0 {
-            full_vectors_bytes as f64 / quantized_codes_bytes as f64
+            hnsw_graph_bytes as f64 / quantized_codes_bytes as f64
         } else {
             0.0
         };
@@ -361,7 +337,7 @@ impl QuantizedHnswIndex {
             hnsw_graph_bytes,
             num_vectors,
             avg_quantized_bytes_per_vector: avg_quantized,
-            avg_full_bytes_per_vector: avg_full,
+            avg_full_bytes_per_vector: 0.0,
             compression_ratio,
         }
     }

@@ -85,6 +85,11 @@ pub enum StorageError {
     /// Resizing a memory-mapped file failed.
     #[error("mmap resize failed: {0}")]
     MmapResizeFailed(String),
+
+    // ── Locking ────────────────────────────────────────────────────────
+    /// Another process holds an exclusive lock on the data directory.
+    #[error("lock held: {0}")]
+    LockHeld(String),
 }
 
 impl From<bincode::Error> for StorageError {

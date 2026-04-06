@@ -17,6 +17,7 @@ pub mod logging;
 pub mod metrics;
 pub mod rest;
 pub mod shutdown;
+pub mod snapshot;
 pub mod state;
 pub mod validation;
 

@@ -17,6 +17,9 @@ rand = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 log = { workspace = true }
+lz4_flex = { workspace = true }
+crc32fast = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

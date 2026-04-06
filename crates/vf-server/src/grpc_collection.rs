@@ -111,6 +111,8 @@ impl CollectionService for CollectionServiceImpl {
             deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mutation_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let mut collections = self.state.collections.write();

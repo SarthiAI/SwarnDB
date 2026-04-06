@@ -21,4 +21,13 @@ pub enum GraphError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("invalid snapshot format: {0}")]
+    InvalidFormat(String),
+
+    #[error("snapshot corrupted: {0}")]
+    Corrupted(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }

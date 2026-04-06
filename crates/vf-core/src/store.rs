@@ -33,13 +33,13 @@ pub enum StoreError {
 #[derive(Clone, Debug)]
 pub struct VectorRecord {
     pub id: VectorId,
-    pub data: VectorData,
+    pub data: Option<VectorData>,  // None when vectors stored in index only
     pub metadata: Option<Metadata>,
     pub version: u64,
 }
 
 impl VectorRecord {
-    pub fn new(id: VectorId, data: VectorData, metadata: Option<Metadata>) -> Self {
+    pub fn new(id: VectorId, data: Option<VectorData>, metadata: Option<Metadata>) -> Self {
         Self {
             id,
             data,
@@ -113,13 +113,15 @@ impl InMemoryVectorStore {
     /// Insert a vector with an explicit ID.
     /// Returns error if ID already exists or dimension doesn't match.
     pub fn insert(&self, record: VectorRecord) -> Result<(), StoreError> {
-        // Validate dimension
-        let dim = record.data.dimension();
-        if dim != self.dimension {
-            return Err(StoreError::DimensionMismatch {
-                expected: self.dimension,
-                actual: dim,
-            });
+        // Validate dimension only when data is present
+        if let Some(ref data) = record.data {
+            let dim = data.dimension();
+            if dim != self.dimension {
+                return Err(StoreError::DimensionMismatch {
+                    expected: self.dimension,
+                    actual: dim,
+                });
+            }
         }
 
         // Atomic check-and-insert via entry API to avoid TOCTOU race
@@ -153,15 +155,17 @@ impl InMemoryVectorStore {
     /// Returns the assigned VectorId.
     pub fn insert_auto_id(
         &self,
-        data: VectorData,
+        data: Option<VectorData>,
         metadata: Option<Metadata>,
     ) -> Result<VectorId, StoreError> {
-        let dim = data.dimension();
-        if dim != self.dimension {
-            return Err(StoreError::DimensionMismatch {
-                expected: self.dimension,
-                actual: dim,
-            });
+        if let Some(ref data_inner) = data {
+            let dim = data_inner.dimension();
+            if dim != self.dimension {
+                return Err(StoreError::DimensionMismatch {
+                    expected: self.dimension,
+                    actual: dim,
+                });
+            }
         }
 
         let id = self.next_id();
@@ -198,7 +202,7 @@ impl InMemoryVectorStore {
 
         let mut entry = self.vectors.get_mut(&id).ok_or(StoreError::NotFound(id))?;
         if let Some(d) = data {
-            entry.data = d;
+            entry.data = Some(d);
         }
         if metadata.is_some() {
             entry.metadata = metadata;
@@ -206,6 +210,53 @@ impl InMemoryVectorStore {
         entry.version += 1;
         self.generation.fetch_add(1, Ordering::Release);
         Ok(())
+    }
+
+    /// Update only metadata for a vector. The store no longer manages vector data.
+    /// Increments the version.
+    pub fn update_metadata(
+        &self,
+        id: VectorId,
+        metadata: Option<Metadata>,
+    ) -> Result<(), StoreError> {
+        let mut entry = self.vectors.get_mut(&id).ok_or(StoreError::NotFound(id))?;
+        if metadata.is_some() {
+            entry.metadata = metadata;
+        }
+        entry.version += 1;
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Insert a metadata-only record with an explicit ID.
+    /// Vector data is stored separately in the index.
+    pub fn insert_metadata(&self, id: VectorId, metadata: Option<Metadata>) -> Result<(), StoreError> {
+        let record = VectorRecord { id, data: None, metadata, version: 1 };
+        match self.vectors.entry(id) {
+            Entry::Occupied(_) => return Err(StoreError::AlreadyExists(id)),
+            Entry::Vacant(v) => { v.insert(record); }
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+        // CAS loop to update next_id if needed
+        let new_next = id.saturating_add(1);
+        let mut current = self.next_id.load(Ordering::Relaxed);
+        while new_next > current {
+            match self.next_id.compare_exchange_weak(current, new_next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert a metadata-only record with auto-generated ID.
+    /// Vector data is stored separately in the index.
+    pub fn insert_metadata_auto_id(&self, metadata: Option<Metadata>) -> Result<VectorId, StoreError> {
+        let id = self.next_id();
+        let record = VectorRecord { id, data: None, metadata, version: 1 };
+        self.vectors.insert(id, record);
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(id)
     }
 
     /// Delete a vector by ID. Returns the removed record.
@@ -223,30 +274,6 @@ impl InMemoryVectorStore {
     /// Check if a vector exists
     pub fn contains(&self, id: VectorId) -> bool {
         self.vectors.contains_key(&id)
-    }
-
-    /// Collect all vector records as (id, record) pairs.
-    ///
-    /// Returns owned copies since DashMap references cannot escape the iterator.
-    /// NOTE: This clones both vector data AND metadata. Prefer `iter_vector_data`
-    /// or `iter_metadata` when only one component is needed.
-    pub fn iter_cloned(&self) -> Vec<(VectorId, VectorRecord)> {
-        self.vectors
-            .iter()
-            .map(|r| (*r.key(), r.value().clone()))
-            .collect()
-    }
-
-    /// Lightweight iteration returning only (id, f32 vector data) pairs.
-    ///
-    /// Avoids cloning metadata, making this ~30-50% faster than `iter_cloned`
-    /// for search-oriented workloads that only need vector data for distance
-    /// computation and ranking.
-    pub fn iter_vector_data(&self) -> Vec<(VectorId, Vec<f32>)> {
-        self.vectors
-            .iter()
-            .map(|r| (*r.key(), r.value().data.to_f32_vec()))
-            .collect()
     }
 
     /// Iteration returning only (id, metadata) pairs, skipping entries with no metadata.
@@ -268,8 +295,7 @@ impl InMemoryVectorStore {
     /// Fetch metadata for a single vector by ID.
     ///
     /// Returns `None` if the vector does not exist or has no metadata.
-    /// Use this for lazy post-search metadata retrieval instead of
-    /// pre-cloning all metadata via `iter_cloned`.
+    /// Use this for lazy post-search metadata retrieval.
     pub fn get_metadata_by_id(&self, id: VectorId) -> Option<Metadata> {
         self.vectors
             .get(&id)
@@ -286,12 +312,6 @@ impl InMemoryVectorStore {
         self.vectors.clear();
         self.next_id.store(1, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::Release);
-    }
-
-    /// Get the f32 data for a vector (converting if needed)
-    pub fn get_f32_data(&self, id: VectorId) -> Result<Vec<f32>, StoreError> {
-        let record = self.get(id)?;
-        Ok(record.data.to_f32_vec())
     }
 
     /// Bulk insert multiple vectors. Stops on first error.
@@ -332,7 +352,7 @@ mod tests {
     #[test]
     fn test_insert_and_get() {
         let store = InMemoryVectorStore::new(3);
-        let record = VectorRecord::new(0, VectorData::F32(vec![1.0, 2.0, 3.0]), None);
+        let record = VectorRecord::new(0, Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None);
         store.insert(record).unwrap();
 
         assert_eq!(store.len(), 1);
@@ -344,8 +364,8 @@ mod tests {
     #[test]
     fn test_insert_auto_id() {
         let store = InMemoryVectorStore::new(3);
-        let id1 = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
-        let id2 = store.insert_auto_id(VectorData::F32(vec![4.0, 5.0, 6.0]), None).unwrap();
+        let id1 = store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None).unwrap();
+        let id2 = store.insert_auto_id(Some(VectorData::F32(vec![4.0, 5.0, 6.0])), None).unwrap();
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
         assert_eq!(store.len(), 2);
@@ -355,7 +375,7 @@ mod tests {
     fn test_insert_with_metadata() {
         let store = InMemoryVectorStore::new(3);
         let meta = make_metadata();
-        let id = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), Some(meta)).unwrap();
+        let id = store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), Some(meta)).unwrap();
         let record = store.get(id).unwrap();
         let meta = record.metadata.as_ref().unwrap();
         assert_eq!(meta.get("category").unwrap().as_str(), Some("test"));
@@ -364,7 +384,7 @@ mod tests {
     #[test]
     fn test_insert_dimension_mismatch() {
         let store = InMemoryVectorStore::new(3);
-        let result = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0]), None);
+        let result = store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0])), None);
         assert!(result.is_err());
         match result.unwrap_err() {
             StoreError::DimensionMismatch { expected: 3, actual: 2 } => {}
@@ -375,7 +395,7 @@ mod tests {
     #[test]
     fn test_insert_duplicate() {
         let store = InMemoryVectorStore::new(3);
-        let record = VectorRecord::new(0, VectorData::F32(vec![1.0, 2.0, 3.0]), None);
+        let record = VectorRecord::new(0, Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None);
         store.insert(record.clone()).unwrap();
         let result = store.insert(record);
         assert!(matches!(result, Err(StoreError::AlreadyExists(0))));
@@ -384,11 +404,11 @@ mod tests {
     #[test]
     fn test_update() {
         let store = InMemoryVectorStore::new(3);
-        let id = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
+        let id = store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None).unwrap();
 
         store.update(id, Some(VectorData::F32(vec![4.0, 5.0, 6.0])), None).unwrap();
         let record = store.get(id).unwrap();
-        assert_eq!(record.data.to_f32_vec(), vec![4.0, 5.0, 6.0]);
+        assert_eq!(record.data.unwrap().to_f32_vec(), vec![4.0, 5.0, 6.0]);
         assert_eq!(record.version, 2);
     }
 
@@ -402,7 +422,7 @@ mod tests {
     #[test]
     fn test_delete() {
         let store = InMemoryVectorStore::new(3);
-        let id = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
+        let id = store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None).unwrap();
         assert_eq!(store.len(), 1);
 
         let removed = store.delete(id).unwrap();
@@ -422,15 +442,15 @@ mod tests {
     fn test_contains() {
         let store = InMemoryVectorStore::new(3);
         assert!(!store.contains(1));
-        let id = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
+        let id = store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None).unwrap();
         assert!(store.contains(id));
     }
 
     #[test]
     fn test_clear() {
         let store = InMemoryVectorStore::new(3);
-        store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
-        store.insert_auto_id(VectorData::F32(vec![4.0, 5.0, 6.0]), None).unwrap();
+        store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None).unwrap();
+        store.insert_auto_id(Some(VectorData::F32(vec![4.0, 5.0, 6.0])), None).unwrap();
         assert_eq!(store.len(), 2);
 
         store.clear();
@@ -441,28 +461,20 @@ mod tests {
     #[test]
     fn test_ids() {
         let store = InMemoryVectorStore::new(3);
-        store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
-        store.insert_auto_id(VectorData::F32(vec![4.0, 5.0, 6.0]), None).unwrap();
+        store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None).unwrap();
+        store.insert_auto_id(Some(VectorData::F32(vec![4.0, 5.0, 6.0])), None).unwrap();
         let mut ids = store.ids();
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]
-    fn test_get_f32_data() {
-        let store = InMemoryVectorStore::new(3);
-        let id = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
-        let data = store.get_f32_data(id).unwrap();
-        assert_eq!(data, vec![1.0, 2.0, 3.0]);
-    }
-
-    #[test]
     fn test_batch_insert() {
         let store = InMemoryVectorStore::new(3);
         let records = vec![
-            VectorRecord::new(0, VectorData::F32(vec![1.0, 2.0, 3.0]), None),
-            VectorRecord::new(1, VectorData::F32(vec![4.0, 5.0, 6.0]), None),
-            VectorRecord::new(2, VectorData::F32(vec![7.0, 8.0, 9.0]), None),
+            VectorRecord::new(0, Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None),
+            VectorRecord::new(1, Some(VectorData::F32(vec![4.0, 5.0, 6.0])), None),
+            VectorRecord::new(2, Some(VectorData::F32(vec![7.0, 8.0, 9.0])), None),
         ];
         let count = store.insert_batch(records).unwrap();
         assert_eq!(count, 3);
@@ -470,19 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_cloned() {
-        let store = InMemoryVectorStore::new(3);
-        store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
-        store.insert_auto_id(VectorData::F32(vec![4.0, 5.0, 6.0]), None).unwrap();
-
-        let count = store.iter_cloned().len();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
     fn test_version_tracking() {
         let store = InMemoryVectorStore::new(3);
-        let id = store.insert_auto_id(VectorData::F32(vec![1.0, 2.0, 3.0]), None).unwrap();
+        let id = store.insert_auto_id(Some(VectorData::F32(vec![1.0, 2.0, 3.0])), None).unwrap();
         assert_eq!(store.get(id).unwrap().version, 1);
 
         store.update(id, Some(VectorData::F32(vec![4.0, 5.0, 6.0])), None).unwrap();

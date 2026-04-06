@@ -13,7 +13,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use vf_core::store::{InMemoryVectorStore, VectorRecord};
+use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{
     CollectionConfig, DataTypeConfig, DistanceMetricType, Metadata, MetadataValue, VectorId,
 };
@@ -400,7 +400,7 @@ async fn create_collection(
         }
     }
 
-    let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new(), status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)), deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) };
+    let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new(), status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)), deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), mutation_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) };
 
     let mut collections = state.collections.write();
     collections.insert(req.name.clone(), collection_state);
@@ -486,20 +486,29 @@ async fn insert_vector(
         return Err(err(StatusCode::BAD_REQUEST, format!("vector dimension mismatch: expected {}, got {}", coll.config.dimension, req.values.len())));
     }
 
-    let vector_data = VectorData::F32(req.values.clone());
-
     let assigned_id = if req.id == 0 {
-        coll.store.insert_auto_id(vector_data, core_metadata.clone())
+        coll.store.insert_metadata_auto_id(core_metadata.clone())
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("store insert failed: {}", e)))?
     } else {
-        let record = VectorRecord::new(req.id, vector_data, core_metadata.clone());
-        coll.store.insert(record)
+        coll.store.insert_metadata(req.id, core_metadata.clone())
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("store insert failed: {}", e)))?;
         req.id
     };
 
-    if let Err(e) = coll.index.add(assigned_id, &req.values) {
-        // Rollback: remove from store since index add failed
+    // Persist to storage layer first to obtain the WAL LSN.
+    let lsn = {
+        let mut cm = state.collection_manager.write();
+        if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
+            if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(req.values.clone()), core_metadata.clone()) {
+                tracing::warn!(collection = %collection, id = assigned_id, "storage insert failed: {}", e);
+            }
+            storage_coll.current_lsn().saturating_sub(1)
+        } else {
+            0
+        }
+    };
+
+    if let Err(e) = coll.index.add_with_lsn(assigned_id, &req.values, lsn) {
         let _ = coll.store.delete(assigned_id);
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("index insert failed: {}", e)));
     }
@@ -508,22 +517,14 @@ async fn insert_vector(
         coll.index_manager.index_record(assigned_id, meta);
     }
 
-    // Compute virtual graph edges for the newly inserted vector
     if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
         &mut coll.graph, &coll.index, assigned_id, &req.values, 10,
     ) {
         tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
     }
 
-    // Persist to storage layer (best-effort)
-    {
-        let mut cm = state.collection_manager.write();
-        if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
-            if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(req.values), core_metadata) {
-                tracing::warn!(collection = %collection, id = assigned_id, "storage insert failed: {}", e);
-            }
-        }
-    }
+    coll.dirty.store(true, Ordering::Release);
+    coll.mutation_count.fetch_add(1, Ordering::Relaxed);
 
     Ok(Json(InsertVectorRes { id: assigned_id, success: true }))
 }
@@ -536,14 +537,16 @@ async fn get_vector(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let record = coll.store.get(id)
+    let meta_record = coll.store.get(id)
         .map_err(|e| err(StatusCode::NOT_FOUND, format!("vector not found: {}", e)))?;
+    let vector_data = coll.index.get_vector(id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("vector retrieval failed: {}", e)))?;
 
-    let metadata_json = record.metadata.as_ref().map(metadata_to_json);
+    let metadata_json = meta_record.metadata.as_ref().map(metadata_to_json);
 
     Ok(Json(GetVectorRes {
-        id: record.id,
-        values: record.data.to_f32_vec(),
+        id: meta_record.id,
+        values: vector_data,
         metadata: metadata_json,
     }))
 }
@@ -577,33 +580,36 @@ async fn update_vector(
         }
     }
 
-    let vector_data = req.values.as_ref().map(|v| VectorData::F32(v.clone()));
-    coll.store.update(id, vector_data.clone(), core_metadata.clone())
+    coll.store.update_metadata(id, core_metadata.clone())
         .map_err(|e| err(StatusCode::NOT_FOUND, format!("update failed: {}", e)))?;
 
-    // Only update vector index if new vector data was provided
+    // Persist to storage layer first to obtain the WAL LSN.
+    let lsn = {
+        let mut cm = state.collection_manager.write();
+        if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
+            let storage_data = req.values.clone().map(VectorData::F32);
+            if let Err(e) = storage_coll.update(id, storage_data, core_metadata.clone()) {
+                tracing::warn!(collection = %collection, id = id, "storage update failed: {}", e);
+            }
+            storage_coll.current_lsn().saturating_sub(1)
+        } else {
+            0
+        }
+    };
+
     if let Some(ref values) = req.values {
-        let _ = coll.index.remove(id);
-        coll.index.add(id, values)
+        let _ = coll.index.remove_with_lsn(id, lsn);
+        coll.index.add_with_lsn(id, values, lsn)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("index update failed: {}", e)))?;
     }
 
-    // Update metadata index if metadata was provided
     if let Some(ref meta) = core_metadata {
         coll.index_manager.remove_record(id);
         coll.index_manager.index_record(id, meta);
     }
 
-    // Persist to storage layer (best-effort)
-    {
-        let mut cm = state.collection_manager.write();
-        if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
-            let storage_data = req.values.map(VectorData::F32);
-            if let Err(e) = storage_coll.update(id, storage_data, core_metadata) {
-                tracing::warn!(collection = %collection, id = id, "storage update failed: {}", e);
-            }
-        }
-    }
+    coll.dirty.store(true, Ordering::Release);
+    coll.mutation_count.fetch_add(1, Ordering::Relaxed);
 
     Ok(Json(UpdateVectorRes { success: true }))
 }
@@ -619,19 +625,25 @@ async fn delete_vector(
     coll.store.delete(id)
         .map_err(|e| err(StatusCode::NOT_FOUND, format!("delete failed: {}", e)))?;
 
-    let _ = coll.index.remove(id);
-    coll.index_manager.remove_record(id);
-    coll.graph.remove_node(id);
-
-    // Persist to storage layer (best-effort)
-    {
+    // Persist to storage layer first to obtain the WAL LSN.
+    let lsn = {
         let mut cm = state.collection_manager.write();
         if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
             if let Err(e) = storage_coll.delete(id) {
                 tracing::warn!(collection = %collection, id = id, "storage delete failed: {}", e);
             }
+            storage_coll.current_lsn().saturating_sub(1)
+        } else {
+            0
         }
-    }
+    };
+
+    let _ = coll.index.remove_with_lsn(id, lsn);
+    coll.index_manager.remove_record(id);
+    coll.graph.remove_node_with_lsn(id, lsn);
+
+    coll.dirty.store(true, Ordering::Release);
+    coll.mutation_count.fetch_add(1, Ordering::Relaxed);
 
     Ok(Json(DeleteVectorRes { success: true }))
 }
@@ -757,10 +769,8 @@ async fn bulk_insert(
                     continue;
                 }
 
-                let vector_data = VectorData::F32(pv.values.clone());
-
                 let assigned_id = if pv.id == 0 {
-                    match coll.store.insert_auto_id(vector_data, pv.metadata.clone()) {
+                    match coll.store.insert_metadata_auto_id(pv.metadata.clone()) {
                         Ok(id) => id,
                         Err(e) => {
                             errors.push(format!("item {}: store insert failed: {}", pv.index, e));
@@ -768,8 +778,7 @@ async fn bulk_insert(
                         }
                     }
                 } else {
-                    let record = VectorRecord::new(pv.id, vector_data, pv.metadata.clone());
-                    match coll.store.insert(record) {
+                    match coll.store.insert_metadata(pv.id, pv.metadata.clone()) {
                         Ok(()) => pv.id,
                         Err(e) => {
                             errors.push(format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e));
@@ -1346,13 +1355,13 @@ fn parse_strategy(s: &str) -> FilterStrategy {
 
 // ── Vector Math helpers ─────────────────────────────────────────────────
 
-fn get_vectors_from_collection(store: &InMemoryVectorStore, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
+fn get_vectors_from_collection(index: &vf_index::hnsw::HnswIndex, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
     if ids.is_empty() {
-        store.iter_vector_data()
+        index.iter_vectors()
     } else {
-        ids.iter().filter_map(|&id| {
-            store.get(id).ok().map(|record| (id, record.data.to_f32_vec()))
-        }).collect()
+        ids.iter()
+            .filter_map(|&id| index.get_vector(id).ok().map(|data| (id, data)))
+            .collect()
     }
 }
 
@@ -1540,7 +1549,7 @@ async fn detect_ghosts(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.store, &[]);
+    let owned_vectors = get_vectors_from_collection(&coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
@@ -1589,7 +1598,7 @@ async fn cone_search(
         return Err(err(StatusCode::BAD_REQUEST, "direction vector is required"));
     }
 
-    let owned_vectors = get_vectors_from_collection(&coll.store, &[]);
+    let owned_vectors = get_vectors_from_collection(&coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
@@ -1617,7 +1626,7 @@ async fn compute_centroid(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.store, &req.vector_ids);
+    let owned_vectors = get_vectors_from_collection(&coll.index, &req.vector_ids);
     let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
 
     if vec_slices.is_empty() {
@@ -1684,8 +1693,8 @@ async fn detect_drift(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_w1 = get_vectors_from_collection(&coll.store, &req.window1_ids);
-    let owned_w2 = get_vectors_from_collection(&coll.store, &req.window2_ids);
+    let owned_w1 = get_vectors_from_collection(&coll.index, &req.window1_ids);
+    let owned_w2 = get_vectors_from_collection(&coll.index, &req.window2_ids);
 
     let w1_slices: Vec<&[f32]> = owned_w1.iter().map(|(_, v)| v.as_slice()).collect();
     let w2_slices: Vec<&[f32]> = owned_w2.iter().map(|(_, v)| v.as_slice()).collect();
@@ -1721,7 +1730,7 @@ async fn cluster(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.store, &[]);
+    let owned_vectors = get_vectors_from_collection(&coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
@@ -1761,7 +1770,7 @@ async fn reduce_dimensions(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.store, &req.vector_ids);
+    let owned_vectors = get_vectors_from_collection(&coll.index, &req.vector_ids);
     let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
 
     let n_components = if req.n_components == 0 { 2 } else { req.n_components as usize };
@@ -1833,7 +1842,7 @@ async fn diversity_sample(
         return Err(err(StatusCode::BAD_REQUEST, "query vector is required"));
     }
 
-    let owned_candidates = get_vectors_from_collection(&coll.store, &req.candidate_ids);
+    let owned_candidates = get_vectors_from_collection(&coll.index, &req.candidate_ids);
     let candidates: Vec<(VectorId, &[f32])> = owned_candidates
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
