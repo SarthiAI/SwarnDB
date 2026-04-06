@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use tonic::{Request, Response, Status};
 
-use vf_core::types::{Metadata, MetadataValue, VectorId};
+use vf_core::types::{Metadata, MetadataValue, SearchQuantizationParams, VectorId};
 use vf_graph::RelationshipQueryEngine;
 use vf_query::{BatchExecutor, FilterExpression, FilterStrategy, QueryExecutor};
 
@@ -69,8 +69,10 @@ impl SearchService for SearchServiceImpl {
 
         let metadata_store = collection.metadata_cache.get_or_rebuild(&collection.store);
 
-        let results = QueryExecutor::search(
-            &collection.index as &dyn vf_index::traits::VectorIndex,
+        let quantization_params = req.quantization.as_ref().map(parse_quantization_params);
+
+        let results = QueryExecutor::search_quantized(
+            collection.index.as_vector_index(),
             &query_vector,
             req.k as usize,
             filter.as_ref(),
@@ -78,6 +80,7 @@ impl SearchService for SearchServiceImpl {
             Some(&collection.index_manager),
             &metadata_store,
             ef_search,
+            quantization_params.as_ref(),
         )
         .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
@@ -238,8 +241,10 @@ impl SearchServiceImpl {
                 metrics::record_ef_search(ef, collection_name);
             }
 
-            let batch_results = BatchExecutor::search_batch_uniform(
-                &collection.index as &dyn vf_index::traits::VectorIndex,
+            let first_quantization = queries[0].quantization.as_ref().map(parse_quantization_params);
+
+            let batch_results = BatchExecutor::search_batch_uniform_quantized(
+                collection.index.as_vector_index(),
                 &query_vectors,
                 first_k as usize,
                 first_filter.as_ref(),
@@ -247,6 +252,7 @@ impl SearchServiceImpl {
                 Some(&collection.index_manager),
                 &metadata_store,
                 first_ef_search,
+                first_quantization.as_ref(),
             );
 
             let include_graph = queries[0].include_graph;
@@ -286,8 +292,10 @@ impl SearchServiceImpl {
                     metrics::record_ef_search(ef, &q.collection);
                 }
 
-                let results = QueryExecutor::search(
-                    &collection.index as &dyn vf_index::traits::VectorIndex,
+                let quantization_params = q.quantization.as_ref().map(parse_quantization_params);
+
+                let results = QueryExecutor::search_quantized(
+                    collection.index.as_vector_index(),
                     &query_vector,
                     q.k as usize,
                     filter.as_ref(),
@@ -295,6 +303,7 @@ impl SearchServiceImpl {
                     Some(&collection.index_manager),
                     &metadata_store,
                     ef_search,
+                    quantization_params.as_ref(),
                 )
                 .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
@@ -353,8 +362,10 @@ impl SearchServiceImpl {
                 metrics::record_ef_search(ef, &q.collection);
             }
 
-            let results = QueryExecutor::search(
-                &collection.index as &dyn vf_index::traits::VectorIndex,
+            let quantization_params = q.quantization.as_ref().map(parse_quantization_params);
+
+            let results = QueryExecutor::search_quantized(
+                collection.index.as_vector_index(),
                 &query_vector,
                 q.k as usize,
                 filter.as_ref(),
@@ -362,6 +373,7 @@ impl SearchServiceImpl {
                 Some(&collection.index_manager),
                 &metadata_store,
                 ef_search,
+                quantization_params.as_ref(),
             )
             .map_err(|e| Status::internal(format!("search error: {}", e)))?;
 
@@ -387,6 +399,14 @@ fn parse_strategy(s: &str) -> FilterStrategy {
         "pre_filter" => FilterStrategy::PreFilter,
         "post_filter" => FilterStrategy::PostFilter { oversample_factor: 3 },
         _ => FilterStrategy::Auto,
+    }
+}
+
+fn parse_quantization_params(proto: &proto::SearchQuantizationParams) -> SearchQuantizationParams {
+    SearchQuantizationParams {
+        rescore: proto.rescore,
+        oversampling: if proto.oversampling > 0.0 { proto.oversampling } else { 3.0 },
+        ignore: proto.ignore,
     }
 }
 

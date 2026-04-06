@@ -8,7 +8,7 @@ use std::time::Instant;
 use tonic::{Request, Response, Status};
 
 use vf_core::types::{DistanceMetricType, VectorId};
-use vf_index::hnsw::HnswIndex;
+use vf_index::traits::PersistableIndex;
 use vf_query::vector_math::*;
 
 use crate::convert::parse_distance_metric;
@@ -36,9 +36,9 @@ fn proto_to_vec(v: &proto::Vector) -> Vec<f32> {
     v.values.clone()
 }
 
-fn get_vectors_from_index(index: &HnswIndex, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
+fn get_vectors_from_index(index: &dyn PersistableIndex, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
     if ids.is_empty() {
-        index.iter_vectors()
+        index.iter_vectors_owned()
     } else {
         ids.iter()
             .filter_map(|&id| index.get_vector(id).ok().map(|data| (id, data)))
@@ -70,7 +70,7 @@ impl VectorMathService for VectorMathServiceImpl {
             .get(&req.collection)
             .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
 
-        let owned_vectors = get_vectors_from_index(&collection.index, &[]);
+        let owned_vectors = get_vectors_from_index(&*collection.index, &[]);
         let vectors: Vec<(VectorId, &[f32])> = owned_vectors
             .iter()
             .map(|(id, v)| (*id, v.as_slice()))
@@ -128,7 +128,7 @@ impl VectorMathService for VectorMathServiceImpl {
             .map(proto_to_vec)
             .ok_or_else(|| Status::invalid_argument("direction vector is required"))?;
 
-        let owned_vectors = get_vectors_from_index(&collection.index, &[]);
+        let owned_vectors = get_vectors_from_index(&*collection.index, &[]);
         let vectors: Vec<(VectorId, &[f32])> = owned_vectors
             .iter()
             .map(|(id, v)| (*id, v.as_slice()))
@@ -163,7 +163,7 @@ impl VectorMathService for VectorMathServiceImpl {
             .get(&req.collection)
             .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
 
-        let owned_vectors = get_vectors_from_index(&collection.index, &req.vector_ids);
+        let owned_vectors = get_vectors_from_index(&*collection.index, &req.vector_ids);
         let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
 
         if vec_slices.is_empty() {
@@ -245,8 +245,8 @@ impl VectorMathService for VectorMathServiceImpl {
             .get(&req.collection)
             .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
 
-        let owned_w1 = get_vectors_from_index(&collection.index, &req.window1_ids);
-        let owned_w2 = get_vectors_from_index(&collection.index, &req.window2_ids);
+        let owned_w1 = get_vectors_from_index(&*collection.index, &req.window1_ids);
+        let owned_w2 = get_vectors_from_index(&*collection.index, &req.window2_ids);
 
         let w1_slices: Vec<&[f32]> = owned_w1.iter().map(|(_, v)| v.as_slice()).collect();
         let w2_slices: Vec<&[f32]> = owned_w2.iter().map(|(_, v)| v.as_slice()).collect();
@@ -288,7 +288,7 @@ impl VectorMathService for VectorMathServiceImpl {
             .get(&req.collection)
             .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
 
-        let owned_vectors = get_vectors_from_index(&collection.index, &[]);
+        let owned_vectors = get_vectors_from_index(&*collection.index, &[]);
         let vectors: Vec<(VectorId, &[f32])> = owned_vectors
             .iter()
             .map(|(id, v)| (*id, v.as_slice()))
@@ -336,7 +336,7 @@ impl VectorMathService for VectorMathServiceImpl {
             .get(&req.collection)
             .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
 
-        let owned_vectors = get_vectors_from_index(&collection.index, &req.vector_ids);
+        let owned_vectors = get_vectors_from_index(&*collection.index, &req.vector_ids);
         let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
 
         let n_components = if req.n_components == 0 { 2 } else { req.n_components as usize };
@@ -441,7 +441,7 @@ impl VectorMathService for VectorMathServiceImpl {
             .map(proto_to_vec)
             .ok_or_else(|| Status::invalid_argument("query vector is required"))?;
 
-        let owned_candidates = get_vectors_from_index(&collection.index, &req.candidate_ids);
+        let owned_candidates = get_vectors_from_index(&*collection.index, &req.candidate_ids);
         let candidates: Vec<(VectorId, &[f32])> = owned_candidates
             .iter()
             .map(|(id, v)| (*id, v.as_slice()))

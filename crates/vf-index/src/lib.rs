@@ -12,5 +12,7 @@ pub mod hnsw;
 pub mod hnsw_delta;
 pub mod hnsw_persistence;
 pub mod prefetch;
+pub mod quantized_arena;
 pub mod quantized_hnsw;
 pub mod ivf_hnsw_pq;
+pub mod mmap_store;

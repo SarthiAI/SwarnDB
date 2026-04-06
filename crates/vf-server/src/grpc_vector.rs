@@ -24,7 +24,6 @@ use crate::validation::{
     validate_index_mode, validate_wal_flush_every,
 };
 use vf_core::vector::VectorData;
-use vf_index::traits::VectorIndex;
 
 pub struct VectorServiceImpl {
     state: AppState,
@@ -107,7 +106,7 @@ impl VectorService for VectorServiceImpl {
         }
 
         if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-            &mut coll.graph, &coll.index, assigned_id, &values, 10,
+            &mut coll.graph, coll.index.as_vector_index(), assigned_id, &values, 10,
         ) {
             tracing::warn!(collection = %req.collection, id = assigned_id, "graph compute failed: {}", e);
         }
@@ -323,7 +322,7 @@ impl VectorService for VectorServiceImpl {
 
             // Compute virtual graph edges for the newly inserted vector
             if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-                &mut coll.graph, &coll.index, assigned_id, &values, 10,
+                &mut coll.graph, coll.index.as_vector_index(), assigned_id, &values, 10,
             ) {
                 tracing::warn!(collection = %req.collection, id = assigned_id, "graph compute failed: {}", e);
             }
@@ -352,7 +351,7 @@ impl VectorService for VectorServiceImpl {
             let mut collections = self.state.collections.write();
             if let Some(coll) = collections.get_mut(coll_name) {
                 if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                    &mut coll.graph, &coll.index, ids, vectors_map, 10,
+                    &mut coll.graph, coll.index.as_vector_index(), ids, vectors_map, 10,
                 ) {
                     tracing::warn!(collection = %coll_name, "graph compute_batch after bulk_insert failed: {}", e);
                 }
@@ -560,7 +559,7 @@ impl VectorService for VectorServiceImpl {
                     if !defer_graph {
                         if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
                             &mut coll.graph,
-                            &coll.index,
+                            coll.index.as_vector_index(),
                             assigned_id,
                             &values,
                             10,
@@ -706,7 +705,7 @@ impl VectorService for VectorServiceImpl {
                 let mut collections = self.state.collections.write();
                 if let Some(coll) = collections.get_mut(coll_name) {
                     if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                        &mut coll.graph, &coll.index, ids, vectors_map, 10,
+                        &mut coll.graph, coll.index.as_vector_index(), ids, vectors_map, 10,
                     ) {
                         tracing::warn!(
                             collection = %coll_name,

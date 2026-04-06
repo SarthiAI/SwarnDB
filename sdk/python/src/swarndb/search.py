@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from swarndb._proto import common_pb2, search_pb2
 from swarndb.exceptions import SearchError, SwarnDBError
-from swarndb.types import GraphEdge, ScoredResult, SearchResult, BatchSearchResult
+from swarndb.types import GraphEdge, ScoredResult, SearchResult, BatchSearchResult, SearchQuantizationParams
 from swarndb.vectors import _from_proto_metadata
 
 if TYPE_CHECKING:
@@ -331,6 +331,7 @@ class SearchAPI:
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
         ef_search: Optional[int] = None,
+        quantization: Optional[SearchQuantizationParams] = None,
     ) -> SearchResult:
         """Search for nearest neighbors.
 
@@ -345,6 +346,7 @@ class SearchAPI:
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
             ef_search: Optional HNSW ef_search override for this query.
+            quantization: Optional per-query quantization parameters.
 
         Returns:
             SearchResult with ``.results`` list and ``.search_time_us``.
@@ -373,6 +375,10 @@ class SearchAPI:
             request.ef_search = ef_search
         if filter is not None:
             request.filter.CopyFrom(filter._to_proto())
+        if quantization is not None:
+            request.quantization.rescore = quantization.rescore
+            request.quantization.oversampling = quantization.oversampling
+            request.quantization.ignore = quantization.ignore
 
         response = self._client._call(
             self._client._search_stub.Search,
@@ -399,6 +405,7 @@ class SearchAPI:
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
         ef_search: Optional[int] = None,
+        quantization: Optional[SearchQuantizationParams] = None,
     ) -> BatchSearchResult:
         """Batch search multiple queries against a collection.
 
@@ -413,6 +420,7 @@ class SearchAPI:
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
             ef_search: Optional HNSW ef_search override applied to all queries.
+            quantization: Optional per-query quantization parameters applied to all queries.
 
         Returns:
             BatchSearchResult with ``.results`` (list of SearchResult)
@@ -446,6 +454,10 @@ class SearchAPI:
                 req.ef_search = ef_search
             if proto_filter is not None:
                 req.filter.CopyFrom(proto_filter)
+            if quantization is not None:
+                req.quantization.rescore = quantization.rescore
+                req.quantization.oversampling = quantization.oversampling
+                req.quantization.ignore = quantization.ignore
             search_requests.append(req)
 
         batch_request = search_pb2.BatchSearchRequest(queries=search_requests)

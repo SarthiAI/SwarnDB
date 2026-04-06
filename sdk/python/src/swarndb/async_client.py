@@ -65,7 +65,10 @@ from swarndb.types import (
     GraphEdge,
     OptimizeResult,
     PCAResult,
+    QuantizationConfig,
+    ScalarQuantizationConfig,
     ScoredResult,
+    SearchQuantizationParams,
     SearchResult,
     TraversalNode,
     VectorRecord,
@@ -350,6 +353,7 @@ class AsyncCollectionAPI:
         distance_metric: str = "cosine",
         default_threshold: float = 0.0,
         max_vectors: int = 0,
+        quantization: Optional[QuantizationConfig] = None,
     ) -> CollectionInfo:
         """Create a new collection.
 
@@ -359,6 +363,7 @@ class AsyncCollectionAPI:
             distance_metric: Distance function (e.g. "cosine", "euclidean").
             default_threshold: Default similarity threshold for searches.
             max_vectors: Maximum number of vectors (0 = unlimited).
+            quantization: Optional quantization configuration (e.g. SQ8).
 
         Returns:
             CollectionInfo with the created collection's metadata.
@@ -373,15 +378,25 @@ class AsyncCollectionAPI:
             default_threshold=default_threshold,
             max_vectors=max_vectors,
         )
+        if quantization is not None:
+            if quantization.scalar is not None or quantization.type == "scalar":
+                sq = quantization.scalar or ScalarQuantizationConfig()
+                proto_sq = collection_pb2.ScalarQuantization(
+                    quantile=sq.quantile,
+                    always_ram=sq.always_ram,
+                )
+                request.quantization.scalar.CopyFrom(proto_sq)
         await self._client._call(
             self._client._collection_stub.CreateCollection, request
         )
+        quantization_type = quantization.type if quantization is not None else None
         return CollectionInfo(
             name=name,
             dimension=dimension,
             distance_metric=distance_metric,
             vector_count=0,
             default_threshold=default_threshold,
+            quantization_type=quantization_type,
         )
 
     async def get(self, name: str) -> CollectionInfo:
@@ -400,12 +415,14 @@ class AsyncCollectionAPI:
         response = await self._client._call(
             self._client._collection_stub.GetCollection, request
         )
+        qt = getattr(response, 'quantization_type', '') or None
         return CollectionInfo(
             name=response.name,
             dimension=response.dimension,
             distance_metric=response.distance_metric,
             vector_count=response.vector_count,
             default_threshold=response.default_threshold,
+            quantization_type=qt,
         )
 
     async def delete(self, name: str) -> bool:
@@ -443,6 +460,7 @@ class AsyncCollectionAPI:
                 distance_metric=c.distance_metric,
                 vector_count=c.vector_count,
                 default_threshold=c.default_threshold,
+                quantization_type=getattr(c, 'quantization_type', '') or None,
             )
             for c in response.collections
         ]
@@ -838,6 +856,7 @@ class AsyncSearchAPI:
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
         ef_search: Optional[int] = None,
+        quantization: Optional[SearchQuantizationParams] = None,
     ) -> SearchResult:
         """Search for nearest neighbors.
 
@@ -852,6 +871,7 @@ class AsyncSearchAPI:
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
             ef_search: Optional HNSW ef_search override for this query.
+            quantization: Optional per-query quantization parameters.
 
         Returns:
             SearchResult with ``.results`` list and ``.search_time_us``.
@@ -880,6 +900,10 @@ class AsyncSearchAPI:
             request.ef_search = ef_search
         if filter is not None:
             request.filter.CopyFrom(filter._to_proto())
+        if quantization is not None:
+            request.quantization.rescore = quantization.rescore
+            request.quantization.oversampling = quantization.oversampling
+            request.quantization.ignore = quantization.ignore
 
         response = await self._client._call(
             self._client._search_stub.Search,
@@ -906,6 +930,7 @@ class AsyncSearchAPI:
         graph_threshold: float = 0.0,
         max_graph_edges: int = 10,
         ef_search: Optional[int] = None,
+        quantization: Optional[SearchQuantizationParams] = None,
     ) -> BatchSearchResult:
         """Batch search multiple queries against a collection.
 
@@ -920,6 +945,7 @@ class AsyncSearchAPI:
             graph_threshold: Minimum similarity for graph edges.
             max_graph_edges: Maximum number of graph edges per result.
             ef_search: Optional HNSW ef_search override applied to all queries.
+            quantization: Optional per-query quantization parameters applied to all queries.
 
         Returns:
             BatchSearchResult with ``.results`` (list of SearchResult)
@@ -953,6 +979,10 @@ class AsyncSearchAPI:
                 req.ef_search = ef_search
             if proto_filter is not None:
                 req.filter.CopyFrom(proto_filter)
+            if quantization is not None:
+                req.quantization.rescore = quantization.rescore
+                req.quantization.oversampling = quantization.oversampling
+                req.quantization.ignore = quantization.ignore
             search_requests.append(req)
 
         batch_request = search_pb2.BatchSearchRequest(queries=search_requests)

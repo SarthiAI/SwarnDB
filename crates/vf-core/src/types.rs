@@ -105,6 +105,8 @@ pub struct CollectionConfig {
     pub max_vectors: usize,
     /// Data type for vector storage
     pub data_type: DataTypeConfig,
+    /// Optional quantization configuration for memory-efficient search
+    pub quantization_config: Option<QuantizationConfig>,
 }
 
 impl Default for CollectionConfig {
@@ -116,6 +118,7 @@ impl Default for CollectionConfig {
             default_similarity_threshold: None,
             max_vectors: 0,
             data_type: DataTypeConfig::F32,
+            quantization_config: None,
         }
     }
 }
@@ -146,6 +149,53 @@ pub enum DataTypeConfig {
     F32,
     F16,
     U8,
+}
+
+/// Configuration for scalar (SQ8) quantization.
+/// Maps each f32 dimension to u8 [0, 255] using per-dimension min/max calibration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScalarQuantizationConfig {
+    /// Quantile for range calibration (0.0-1.0). Clips outliers beyond this quantile.
+    pub quantile: f32,
+    /// Whether to keep quantized vectors in RAM (recommended true for performance).
+    pub always_ram: bool,
+}
+
+impl Default for ScalarQuantizationConfig {
+    fn default() -> Self {
+        Self {
+            quantile: 0.99,
+            always_ram: true,
+        }
+    }
+}
+
+/// Quantization method configuration for a collection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum QuantizationConfig {
+    /// Scalar quantization: f32 → u8 per dimension (4x compression).
+    Scalar(ScalarQuantizationConfig),
+}
+
+/// Per-query quantization parameters for search requests.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchQuantizationParams {
+    /// If true, rescore top candidates with exact f32 vectors from disk.
+    pub rescore: bool,
+    /// Over-retrieval factor. Retrieve oversampling * k candidates before rescoring.
+    pub oversampling: f32,
+    /// If true, bypass quantization entirely for this query (use full f32).
+    pub ignore: bool,
+}
+
+impl Default for SearchQuantizationParams {
+    fn default() -> Self {
+        Self {
+            rescore: true,
+            oversampling: 3.0,
+            ignore: false,
+        }
+    }
 }
 
 /// A scored search result

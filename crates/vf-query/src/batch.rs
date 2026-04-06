@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use rayon::prelude::*;
-use vf_core::types::{Metadata, ScoredResult, VectorId};
+use vf_core::types::{Metadata, ScoredResult, SearchQuantizationParams, VectorId};
 use vf_index::traits::VectorIndex;
 
 use crate::filter::{FilterExpression, QueryError};
@@ -74,6 +74,36 @@ impl BatchExecutor {
                     index_manager,
                     metadata_store,
                     ef_search,
+                )
+            })
+            .collect()
+    }
+
+    /// Uniform batch search with optional per-query quantization parameters.
+    pub fn search_batch_uniform_quantized(
+        index: &dyn VectorIndex,
+        query_vectors: &[Vec<f32>],
+        k: usize,
+        filter: Option<&FilterExpression>,
+        strategy: &FilterStrategy,
+        index_manager: Option<&IndexManager>,
+        metadata_store: &HashMap<VectorId, Metadata>,
+        ef_search: Option<usize>,
+        quantization: Option<&SearchQuantizationParams>,
+    ) -> Vec<Result<Vec<ScoredResult>, QueryError>> {
+        query_vectors
+            .par_iter()
+            .map(|query| {
+                QueryExecutor::search_quantized(
+                    index,
+                    query,
+                    k,
+                    filter,
+                    strategy,
+                    index_manager,
+                    metadata_store,
+                    ef_search,
+                    quantization,
                 )
             })
             .collect()

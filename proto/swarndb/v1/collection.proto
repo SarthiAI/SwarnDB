@@ -10,12 +10,24 @@ service CollectionService {
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
 }
 
+message ScalarQuantization {
+  float quantile = 1;      // 0.0-1.0, default 0.99
+  bool always_ram = 2;     // default true
+}
+
+message QuantizationConfig {
+  oneof method {
+    ScalarQuantization scalar = 1;
+  }
+}
+
 message CreateCollectionRequest {
   string name = 1;
   uint32 dimension = 2;
   string distance_metric = 3;  // "cosine", "euclidean", "dot_product", "manhattan"
   float default_threshold = 4;
   uint64 max_vectors = 5;
+  QuantizationConfig quantization = 6;
 }
 
 message CreateCollectionResponse {
@@ -42,6 +54,7 @@ message GetCollectionResponse {
   uint64 vector_count = 4;
   float default_threshold = 5;
   string status = 6;  // "ready", "pending_optimization", "optimizing"
+  string quantization_type = 7;  // "none" or "scalar"
 }
 
 message ListCollectionsRequest {}

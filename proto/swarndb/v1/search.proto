@@ -36,6 +36,12 @@ message FieldFilter {
   repeated MetadataValue values = 4;  // for "in" and "between" ops
 }
 
+message SearchQuantizationParams {
+  bool rescore = 1;          // default true — rescore with exact f32 from disk
+  float oversampling = 2;    // default 3.0 — over-retrieval factor
+  bool ignore = 3;           // default false — bypass quantization for this query
+}
+
 message SearchRequest {
   string collection = 1;
   Vector query = 2;
@@ -47,6 +53,7 @@ message SearchRequest {
   float graph_threshold = 8;
   uint32 max_graph_edges = 9;
   optional uint32 ef_search = 10;
+  SearchQuantizationParams quantization = 11;
 }
 
 message SearchResponse {

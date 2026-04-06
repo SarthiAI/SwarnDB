@@ -29,13 +29,14 @@ impl CollectionStatus {
     }
 }
 use vf_core::store::InMemoryVectorStore;
-use vf_core::types::{CollectionConfig, Metadata, VectorId};
+use vf_core::types::{CollectionConfig, Metadata, QuantizationConfig, VectorId};
 use vf_graph::VirtualGraph;
 use vf_index::arena::VectorArena;
 use vf_index::hnsw::HnswIndex;
 use vf_index::hnsw_delta::HnswDeltaWriter;
 use vf_index::hnsw_persistence::deserialize_topology_mmap;
-use vf_index::traits::VectorIndex;
+use vf_index::quantized_hnsw::QuantizedHnswIndex;
+use vf_index::traits::{PersistableIndex, VectorIndex};
 use vf_graph::graph_delta::GraphDeltaWriter;
 use vf_graph::persistence::deserialize_base as deserialize_graph_base;
 use vf_query::IndexManager;
@@ -85,7 +86,7 @@ pub struct OptimizeResult {
 pub struct CollectionState {
     pub config: CollectionConfig,
     pub store: InMemoryVectorStore,
-    pub index: HnswIndex,
+    pub index: Box<dyn PersistableIndex>,
     pub index_manager: IndexManager,
     pub graph: VirtualGraph,
     pub metadata_cache: MetadataCache,
@@ -222,12 +223,27 @@ impl AppState {
                     let graph_path = collection_dir.join("graph.base");
 
                     // Try loading HNSW topology snapshot.
-                    let hnsw_result = (|| -> Result<HnswIndex, String> {
+                    let hnsw_result = (|| -> Result<Box<dyn PersistableIndex>, String> {
                         let snapshot = deserialize_topology_mmap(&hnsw_path)
                             .map_err(|e| format!("hnsw base load failed: {e}"))?;
                         let arena = build_arena_from_topology(&vectors, &snapshot);
-                        HnswIndex::restore_from_topology(snapshot, arena)
-                            .map_err(|e| format!("hnsw restore failed: {e}"))
+                        let hnsw_idx = HnswIndex::restore_from_topology(snapshot, arena)
+                            .map_err(|e| format!("hnsw restore failed: {e}"))?;
+
+                        // Wrap in QuantizedHnswIndex if quantization is configured.
+                        match &config.quantization_config {
+                            Some(QuantizationConfig::Scalar(sq_config)) => {
+                                let q_index = QuantizedHnswIndex::from_existing_hnsw(
+                                    hnsw_idx,
+                                    distance_metric,
+                                    sq_config.clone(),
+                                );
+                                q_index.set_data_dir(collection_dir.clone());
+                                q_index.train_quantizer(&collection_dir);
+                                Ok(Box::new(q_index))
+                            }
+                            None => Ok(Box::new(hnsw_idx)),
+                        }
                     })();
 
                     // Try loading graph base snapshot.
@@ -254,7 +270,7 @@ impl AppState {
                                 collection = %name,
                                 "snapshot load failed ({e}), falling back to full rebuild"
                             );
-                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config)
+                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
                         }
                     }
                 }
@@ -265,7 +281,7 @@ impl AppState {
                     let hnsw_delta_path = collection_dir.join("hnsw.delta");
                     let graph_delta_path = collection_dir.join("graph.delta");
 
-                    let replay_result = (|| -> Result<(HnswIndex, VirtualGraph), String> {
+                    let replay_result = (|| -> Result<(Box<dyn PersistableIndex>, VirtualGraph), String> {
                         // Load HNSW base and replay delta.
                         let mut snapshot = deserialize_topology_mmap(&hnsw_path)
                             .map_err(|e| format!("hnsw base load failed: {e}"))?;
@@ -282,8 +298,23 @@ impl AppState {
                         }
 
                         let arena = build_arena_from_topology(&vectors, &snapshot);
-                        let idx = HnswIndex::restore_from_topology(snapshot, arena)
+                        let hnsw_idx = HnswIndex::restore_from_topology(snapshot, arena)
                             .map_err(|e| format!("hnsw restore failed: {e}"))?;
+
+                        // Wrap in QuantizedHnswIndex if quantization is configured.
+                        let idx: Box<dyn PersistableIndex> = match &config.quantization_config {
+                            Some(QuantizationConfig::Scalar(sq_config)) => {
+                                let q_index = QuantizedHnswIndex::from_existing_hnsw(
+                                    hnsw_idx,
+                                    distance_metric,
+                                    sq_config.clone(),
+                                );
+                                q_index.set_data_dir(collection_dir.clone());
+                                q_index.train_quantizer(&collection_dir);
+                                Box::new(q_index)
+                            }
+                            None => Box::new(hnsw_idx),
+                        };
 
                         // Load graph base and replay delta.
                         let mut file = std::fs::File::open(&graph_path)
@@ -318,14 +349,14 @@ impl AppState {
                                 collection = %name,
                                 "incremental replay failed ({e}), falling back to full rebuild"
                             );
-                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config)
+                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
                         }
                     }
                 }
 
                 RecoveryStrategy::FullRebuild => {
                     tracing::info!(collection = %name, "full rebuild from vectors");
-                    Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config)
+                    Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
                 }
             };
 
@@ -396,10 +427,11 @@ impl AppState {
         distance_metric: vf_core::types::DistanceMetricType,
         vectors: &[(VectorId, Vec<f32>, Option<Metadata>)],
         config: &CollectionConfig,
-    ) -> (HnswIndex, VirtualGraph) {
-        let index = HnswIndex::with_defaults(dimension, distance_metric);
+        data_dir: &Path,
+    ) -> (Box<dyn PersistableIndex>, VirtualGraph) {
+        let hnsw_index = HnswIndex::with_defaults(dimension, distance_metric);
         for (id, data, _metadata) in vectors {
-            if let Err(e) = index.add(*id, data) {
+            if let Err(e) = hnsw_index.add(*id, data) {
                 tracing::warn!(
                     collection = %name,
                     vector_id = id,
@@ -417,8 +449,24 @@ impl AppState {
         let vector_map: HashMap<u64, Vec<f32>> = vectors.iter()
             .map(|(id, data, _)| (*id, data.clone()))
             .collect();
+
+        // Wrap in QuantizedHnswIndex if quantization is configured.
+        let index: Box<dyn PersistableIndex> = match &config.quantization_config {
+            Some(QuantizationConfig::Scalar(sq_config)) => {
+                let q_index = QuantizedHnswIndex::from_existing_hnsw(
+                    hnsw_index,
+                    distance_metric,
+                    sq_config.clone(),
+                );
+                q_index.set_data_dir(data_dir.to_path_buf());
+                q_index.train_quantizer(data_dir);
+                Box::new(q_index)
+            }
+            None => Box::new(hnsw_index),
+        };
+
         if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-            &mut graph, &index, &vector_ids, &vector_map, 10,
+            &mut graph, &*index, &vector_ids, &vector_map, 10,
         ) {
             tracing::warn!(collection = %name, "graph compute_batch failed: {}", e);
         }
@@ -497,10 +545,12 @@ impl AppState {
             let need_index = coll.deferred_index.load(Ordering::Acquire);
             let need_metadata = coll.deferred_metadata.load(Ordering::Acquire);
             let need_graph = coll.deferred_graph.load(Ordering::Acquire);
+            let has_quantization = coll.config.quantization_config.is_some();
 
             // Nothing to do if no deferred ops, or only graph is deferred but rebuild_graph is false.
+            // Exception: quantized collections always need optimization to train the quantizer.
             let effective_graph = need_graph && rebuild_graph;
-            if !need_index && !need_metadata && !effective_graph {
+            if !need_index && !need_metadata && !effective_graph && !has_quantization {
                 return Ok(OptimizeResult {
                     status: "already_optimized".to_string(),
                     message: "nothing to optimize".to_string(),
@@ -539,21 +589,47 @@ impl AppState {
 
             // 1. Rebuild HNSW index if deferred.
             if need_index {
-                let vector_data = coll.index.iter_vectors();
+                let vector_data = coll.index.iter_vectors_owned();
                 let refs: Vec<(VectorId, &[f32])> = vector_data
                     .iter()
                     .map(|(id, v)| (*id, v.as_slice()))
                     .collect();
 
-                // Create a fresh index and rebuild via build_parallel.
-                let new_index = HnswIndex::with_defaults(
+                // Create a fresh HNSW index and rebuild via build_parallel.
+                let new_hnsw = HnswIndex::with_defaults(
                     coll.config.dimension,
                     coll.config.distance_metric,
                 );
-                new_index.build_parallel(&refs).map_err(|e| {
+                new_hnsw.build_parallel(&refs).map_err(|e| {
                     format!("HNSW index rebuild failed: {}", e)
                 })?;
-                new_index.compact();
+                new_hnsw.compact();
+
+                // Wrap in QuantizedHnswIndex if quantization is configured.
+                let new_index: Box<dyn PersistableIndex> = match &coll.config.quantization_config {
+                    Some(QuantizationConfig::Scalar(sq_config)) => {
+                        let q_index = QuantizedHnswIndex::from_existing_hnsw(
+                            new_hnsw,
+                            coll.config.distance_metric,
+                            sq_config.clone(),
+                        );
+                        // Get the real collection directory for mmap files.
+                        let data_dir = {
+                            let cm = self.collection_manager.read();
+                            cm.get_collection(collection_name)
+                                .map(|c| c.collection_dir().to_path_buf())
+                                .unwrap_or_else(|_| {
+                                    std::env::temp_dir()
+                                        .join(format!("swarndb_optimize_{}", collection_name))
+                                })
+                        };
+                        let _ = std::fs::create_dir_all(&data_dir);
+                        q_index.set_data_dir(data_dir.clone());
+                        q_index.train_quantizer(&data_dir);
+                        Box::new(q_index)
+                    }
+                    None => Box::new(new_hnsw),
+                };
                 coll.index = new_index;
                 coll.deferred_index.store(false, Ordering::Release);
                 tracing::info!(
@@ -578,9 +654,20 @@ impl AppState {
                 );
             }
 
+            // 2.5. Train quantizer if quantized collection hasn't been trained yet.
+            if !need_index {
+                if let Some(QuantizationConfig::Scalar(_)) = &coll.config.quantization_config {
+                    coll.index.post_optimize();
+                    tracing::info!(
+                        collection = %collection_name,
+                        "trained scalar quantizer"
+                    );
+                }
+            }
+
             // 3. Recompute virtual graph edges if deferred and rebuild_graph is requested.
             if need_graph && rebuild_graph {
-                let vector_data = coll.index.iter_vectors();
+                let vector_data = coll.index.iter_vectors_owned();
                 let vector_ids: Vec<u64> = vector_data.iter().map(|(id, _)| *id).collect();
                 let vector_map: HashMap<u64, Vec<f32>> = vector_data.into_iter().collect();
 
@@ -591,7 +678,7 @@ impl AppState {
                     coll.config.distance_metric,
                 );
                 if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                    &mut new_graph, &coll.index, &vector_ids, &vector_map, 10,
+                    &mut new_graph, coll.index.as_vector_index(), &vector_ids, &vector_map, 10,
                 ) {
                     tracing::warn!(
                         collection = %collection_name,

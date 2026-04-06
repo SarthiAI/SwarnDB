@@ -1,5 +1,5 @@
 # Stage 1: Builder
-FROM rust:1.85-slim AS builder
+FROM rust:1.86-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev protobuf-compiler cmake make g++ \

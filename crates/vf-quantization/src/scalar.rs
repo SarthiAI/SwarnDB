@@ -42,15 +42,12 @@ impl ScalarQuantizer {
         }
 
         // Validate dimensions
-        for (i, v) in vectors.iter().enumerate() {
+        for v in vectors.iter() {
             if v.len() != self.dimension {
                 return Err(QuantizationError::DimensionMismatch {
                     expected: self.dimension,
                     got: v.len(),
                 });
-            }
-            if i == 0 {
-                continue;
             }
         }
 
@@ -204,5 +201,91 @@ impl ScalarQuantizer {
     /// Returns a reference to the per-dimension ranges.
     pub fn ranges(&self) -> &[f32] {
         &self.ranges
+    }
+
+    /// Train the quantizer using percentile-based range calibration.
+    /// Instead of using absolute min/max (sensitive to outliers), clips to the
+    /// given quantile boundaries. For example, quantile=0.99 uses 0.5th and 99.5th percentiles.
+    pub fn train_with_quantile(
+        &mut self,
+        vectors: &[&[f32]],
+        quantile: f32,
+    ) -> Result<(), QuantizationError> {
+        if vectors.is_empty() {
+            return Err(QuantizationError::EmptyTrainingData);
+        }
+
+        // Validate dimensions
+        for v in vectors.iter() {
+            if v.len() != self.dimension {
+                return Err(QuantizationError::DimensionMismatch {
+                    expected: self.dimension,
+                    got: v.len(),
+                });
+            }
+        }
+
+        let n = vectors.len();
+        let low_idx = ((1.0 - quantile) / 2.0 * n as f32) as usize;
+        let high_idx = (n - 1).min(((1.0 + quantile) / 2.0 * n as f32) as usize);
+
+        let mut min_vals = vec![0.0f32; self.dimension];
+        let mut max_vals = vec![0.0f32; self.dimension];
+
+        // For each dimension, collect all values, sort, and pick percentile bounds
+        let mut dim_values = vec![0.0f32; n];
+        for d in 0..self.dimension {
+            for (i, v) in vectors.iter().enumerate() {
+                dim_values[i] = v[d];
+            }
+            dim_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            min_vals[d] = dim_values[low_idx];
+            max_vals[d] = dim_values[high_idx];
+        }
+
+        // Compute ranges, handle zero-range case
+        let mut ranges = vec![0.0f32; self.dimension];
+        for d in 0..self.dimension {
+            let range = max_vals[d] - min_vals[d];
+            ranges[d] = if range == 0.0 { 1.0 } else { range };
+        }
+
+        self.min_vals = min_vals;
+        self.max_vals = max_vals;
+        self.ranges = ranges;
+        self.trained = true;
+
+        Ok(())
+    }
+
+    /// Create a ScalarQuantizer from pre-trained parameters.
+    /// Used for restoring a trained quantizer from persisted state.
+    pub fn from_trained(dimension: usize, min_vals: Vec<f32>, max_vals: Vec<f32>) -> Self {
+        let ranges: Vec<f32> = min_vals
+            .iter()
+            .zip(max_vals.iter())
+            .map(|(min, max)| {
+                let r = max - min;
+                if r == 0.0 {
+                    1.0
+                } else {
+                    r
+                }
+            })
+            .collect();
+
+        Self {
+            dimension,
+            min_vals,
+            max_vals,
+            ranges,
+            trained: true,
+        }
+    }
+
+    /// Returns precomputed scales (ranges / 255.0) for SIMD distance functions.
+    pub fn scales(&self) -> Vec<f32> {
+        self.ranges.iter().map(|r| r / 255.0).collect()
     }
 }

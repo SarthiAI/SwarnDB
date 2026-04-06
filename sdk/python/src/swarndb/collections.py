@@ -7,11 +7,18 @@ get info, and check existence of collections.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from ._proto import collection_pb2, vector_pb2
 from .exceptions import CollectionNotFoundError
-from .types import CollectionInfo, CompactResult, OptimizeResult, PruneWALResult
+from .types import (
+    CollectionInfo,
+    CompactResult,
+    OptimizeResult,
+    PruneWALResult,
+    QuantizationConfig,
+    ScalarQuantizationConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +40,7 @@ class CollectionAPI:
         distance_metric: str = "cosine",
         default_threshold: float = 0.0,
         max_vectors: int = 0,
+        quantization: Optional[QuantizationConfig] = None,
     ) -> CollectionInfo:
         """Create a new collection.
 
@@ -42,6 +50,7 @@ class CollectionAPI:
             distance_metric: Distance function (e.g. "cosine", "euclidean").
             default_threshold: Default similarity threshold for searches.
             max_vectors: Maximum number of vectors (0 = unlimited).
+            quantization: Optional quantization configuration (e.g. SQ8).
 
         Returns:
             CollectionInfo with the created collection's metadata.
@@ -56,15 +65,25 @@ class CollectionAPI:
             default_threshold=default_threshold,
             max_vectors=max_vectors,
         )
+        if quantization is not None:
+            if quantization.scalar is not None or quantization.type == "scalar":
+                sq = quantization.scalar or ScalarQuantizationConfig()
+                proto_sq = collection_pb2.ScalarQuantization(
+                    quantile=sq.quantile,
+                    always_ram=sq.always_ram,
+                )
+                request.quantization.scalar.CopyFrom(proto_sq)
         self._client._call(
             self._client._collection_stub.CreateCollection, request
         )
+        quantization_type = quantization.type if quantization is not None else None
         return CollectionInfo(
             name=name,
             dimension=dimension,
             distance_metric=distance_metric,
             vector_count=0,
             default_threshold=default_threshold,
+            quantization_type=quantization_type,
         )
 
     def get(self, name: str) -> CollectionInfo:
@@ -83,12 +102,14 @@ class CollectionAPI:
         response = self._client._call(
             self._client._collection_stub.GetCollection, request
         )
+        qt = getattr(response, 'quantization_type', '') or None
         return CollectionInfo(
             name=response.name,
             dimension=response.dimension,
             distance_metric=response.distance_metric,
             vector_count=response.vector_count,
             default_threshold=response.default_threshold,
+            quantization_type=qt,
         )
 
     def delete(self, name: str) -> bool:
@@ -126,6 +147,7 @@ class CollectionAPI:
                 distance_metric=c.distance_metric,
                 vector_count=c.vector_count,
                 default_threshold=c.default_threshold,
+                quantization_type=getattr(c, 'quantization_type', '') or None,
             )
             for c in response.collections
         ]

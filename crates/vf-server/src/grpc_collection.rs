@@ -16,9 +16,12 @@ use crate::proto::swarndb::v1::{
 };
 use crate::state::{AppState, CollectionState, MetadataCache};
 use vf_core::store::InMemoryVectorStore;
-use vf_core::types::{CollectionConfig, DataTypeConfig};
+use vf_core::types::{
+    CollectionConfig, DataTypeConfig, QuantizationConfig, ScalarQuantizationConfig,
+};
 use vf_graph::VirtualGraph;
-use vf_index::hnsw::HnswIndex;
+use vf_index::hnsw::{HnswIndex, HnswParams};
+use vf_index::quantized_hnsw::QuantizedHnswIndex;
 use vf_query::IndexManager;
 
 pub struct CollectionServiceImpl {
@@ -62,6 +65,20 @@ impl CollectionService for CollectionServiceImpl {
             None
         };
 
+        let quantization_config = if let Some(quant) = &req.quantization {
+            match &quant.method {
+                Some(crate::proto::swarndb::v1::quantization_config::Method::Scalar(sq)) => {
+                    Some(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+                        quantile: if sq.quantile > 0.0 { sq.quantile } else { 0.99 },
+                        always_ram: sq.always_ram,
+                    }))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let config = CollectionConfig {
             name: req.name.clone(),
             dimension,
@@ -69,6 +86,7 @@ impl CollectionService for CollectionServiceImpl {
             default_similarity_threshold: threshold,
             max_vectors: req.max_vectors as usize,
             data_type: DataTypeConfig::F32,
+            quantization_config,
         };
 
         // Check for duplicate in-memory BEFORE persisting to storage
@@ -91,7 +109,28 @@ impl CollectionService for CollectionServiceImpl {
         }
 
         let store = InMemoryVectorStore::new(dimension);
-        let index = HnswIndex::with_defaults(dimension, distance_metric);
+        let index: Box<dyn vf_index::traits::PersistableIndex> = match &config.quantization_config {
+            Some(QuantizationConfig::Scalar(sq_config)) => {
+                let q_index = QuantizedHnswIndex::new(
+                    dimension,
+                    distance_metric,
+                    HnswParams::default(),
+                    sq_config.clone(),
+                );
+                // Set data_dir so post_optimize() can train the quantizer.
+                let collection_dir = {
+                    let cm = self.state.collection_manager.read();
+                    cm.get_collection(&req.name)
+                        .map(|c| c.collection_dir().to_path_buf())
+                        .ok()
+                };
+                if let Some(dir) = collection_dir {
+                    q_index.set_data_dir(dir);
+                }
+                Box::new(q_index)
+            }
+            None => Box::new(HnswIndex::with_defaults(dimension, distance_metric)),
+        };
         let index_manager = IndexManager::with_defaults();
         let graph = match threshold {
             Some(t) => VirtualGraph::with_threshold(t, distance_metric),
@@ -161,6 +200,10 @@ impl CollectionService for CollectionServiceImpl {
         })?;
 
         let status_str = coll.status.read().unwrap().as_str().to_string();
+        let quantization_type = match &coll.config.quantization_config {
+            Some(QuantizationConfig::Scalar(_)) => "scalar".to_string(),
+            None => "none".to_string(),
+        };
         Ok(Response::new(GetCollectionResponse {
             name: coll.config.name.clone(),
             dimension: coll.config.dimension as u32,
@@ -168,6 +211,7 @@ impl CollectionService for CollectionServiceImpl {
             vector_count: coll.store.len() as u64,
             default_threshold: coll.config.default_similarity_threshold.unwrap_or(0.0),
             status: status_str,
+            quantization_type,
         }))
     }
 
@@ -181,6 +225,10 @@ impl CollectionService for CollectionServiceImpl {
             .values()
             .map(|coll| {
                 let status_str = coll.status.read().unwrap().as_str().to_string();
+                let quantization_type = match &coll.config.quantization_config {
+                    Some(QuantizationConfig::Scalar(_)) => "scalar".to_string(),
+                    None => "none".to_string(),
+                };
                 GetCollectionResponse {
                     name: coll.config.name.clone(),
                     dimension: coll.config.dimension as u32,
@@ -188,6 +236,7 @@ impl CollectionService for CollectionServiceImpl {
                     vector_count: coll.store.len() as u64,
                     default_threshold: coll.config.default_similarity_threshold.unwrap_or(0.0),
                     status: status_str,
+                    quantization_type,
                 }
             })
             .collect();

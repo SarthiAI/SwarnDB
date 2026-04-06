@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 
 use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{
-    CollectionConfig, DataTypeConfig, DistanceMetricType, Metadata, MetadataValue, VectorId,
+    CollectionConfig, DataTypeConfig, DistanceMetricType, Metadata, MetadataValue,
+    SearchQuantizationParams, VectorId,
 };
 use vf_core::vector::VectorData;
 use vf_graph::{GraphTraversal, RelationshipQueryEngine, TraversalOrder};
-use vf_index::traits::VectorIndex;
 use vf_query::vector_math::*;
 use vf_query::{FilterExpression, FilterStrategy, IndexManager, QueryExecutor};
 
@@ -69,6 +69,13 @@ where
 fn default_threshold() -> f32 { 0.0 }
 
 #[derive(Deserialize)]
+pub struct QuantizationReq {
+    pub r#type: String,  // "scalar"
+    pub quantile: Option<f32>,
+    pub always_ram: Option<bool>,
+}
+
+#[derive(Deserialize)]
 pub struct CreateCollectionReq {
     pub name: String,
     pub dimension: u32,
@@ -78,6 +85,7 @@ pub struct CreateCollectionReq {
     pub default_threshold: f32,
     #[serde(default)]
     pub max_vectors: u64,
+    pub quantization: Option<QuantizationReq>,
 }
 
 fn default_distance() -> String { "cosine".to_string() }
@@ -96,6 +104,7 @@ pub struct CollectionInfo {
     pub vector_count: u64,
     pub default_threshold: f32,
     pub status: String,
+    pub quantization_type: String,
 }
 
 #[derive(Serialize)]
@@ -183,6 +192,16 @@ fn default_strategy() -> String { "auto".to_string() }
 fn default_max_graph_edges() -> u32 { 10 }
 
 #[derive(Deserialize)]
+pub struct SearchQuantizationReq {
+    #[serde(default)]
+    pub rescore: Option<bool>,
+    #[serde(default)]
+    pub oversampling: Option<f32>,
+    #[serde(default)]
+    pub ignore: Option<bool>,
+}
+
+#[derive(Deserialize)]
 pub struct SearchReq {
     pub query: Vec<f32>,
     pub k: u32,
@@ -200,6 +219,8 @@ pub struct SearchReq {
     pub max_graph_edges: u32,
     #[serde(default)]
     pub ef_search: Option<u32>,
+    #[serde(default)]
+    pub quantization: Option<SearchQuantizationReq>,
 }
 
 #[derive(Serialize)]
@@ -244,6 +265,8 @@ pub struct BatchSearchQuery {
     pub max_graph_edges: u32,
     #[serde(default)]
     pub ef_search: Option<u32>,
+    #[serde(default)]
+    pub quantization: Option<SearchQuantizationReq>,
 }
 
 #[derive(Serialize)]
@@ -369,6 +392,24 @@ async fn create_collection(
     let dimension = req.dimension as usize;
     let threshold = if req.default_threshold > 0.0 { Some(req.default_threshold) } else { None };
 
+    let quantization_config = match &req.quantization {
+        Some(qr) if qr.r#type == "scalar" => {
+            Some(vf_core::types::QuantizationConfig::Scalar(
+                vf_core::types::ScalarQuantizationConfig {
+                    quantile: qr.quantile.unwrap_or(0.99),
+                    always_ram: qr.always_ram.unwrap_or(true),
+                },
+            ))
+        }
+        Some(qr) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported quantization type: {}", qr.r#type),
+            ));
+        }
+        None => None,
+    };
+
     let config = CollectionConfig {
         name: req.name.clone(),
         dimension,
@@ -376,10 +417,32 @@ async fn create_collection(
         default_similarity_threshold: threshold,
         max_vectors: req.max_vectors as usize,
         data_type: DataTypeConfig::F32,
+        quantization_config,
     };
 
     let store = InMemoryVectorStore::new(dimension);
-    let index = vf_index::hnsw::HnswIndex::with_defaults(dimension, distance_metric);
+    let index: Box<dyn vf_index::traits::PersistableIndex> = match &config.quantization_config {
+        Some(vf_core::types::QuantizationConfig::Scalar(sq_config)) => {
+            let q_index = vf_index::quantized_hnsw::QuantizedHnswIndex::new(
+                dimension,
+                distance_metric,
+                vf_index::hnsw::HnswParams::default(),
+                sq_config.clone(),
+            );
+            // Set data_dir so post_optimize() can train the quantizer.
+            let collection_dir = {
+                let cm = state.collection_manager.read();
+                cm.get_collection(&req.name)
+                    .map(|c| c.collection_dir().to_path_buf())
+                    .ok()
+            };
+            if let Some(dir) = collection_dir {
+                q_index.set_data_dir(dir);
+            }
+            Box::new(q_index)
+        }
+        None => Box::new(vf_index::hnsw::HnswIndex::with_defaults(dimension, distance_metric)),
+    };
     let index_manager = IndexManager::with_defaults();
     let graph = match threshold {
         Some(t) => vf_graph::VirtualGraph::with_threshold(t, distance_metric),
@@ -416,6 +479,10 @@ async fn list_collections(
     let collections = state.collections.read();
     let list = collections.values().map(|c| {
         let status_str = c.status.read().unwrap().as_str().to_string();
+        let quantization_type = match &c.config.quantization_config {
+            Some(vf_core::types::QuantizationConfig::Scalar(_)) => "scalar".to_string(),
+            None => "none".to_string(),
+        };
         CollectionInfo {
             name: c.config.name.clone(),
             dimension: c.config.dimension as u32,
@@ -423,6 +490,7 @@ async fn list_collections(
             vector_count: c.store.len() as u64,
             default_threshold: c.config.default_similarity_threshold.unwrap_or(0.0),
             status: status_str,
+            quantization_type,
         }
     }).collect();
     Json(ListCollectionsRes { collections: list })
@@ -436,6 +504,10 @@ async fn get_collection(
     let c = collections.get(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", name)))?;
     let status_str = c.status.read().unwrap().as_str().to_string();
+    let quantization_type = match &c.config.quantization_config {
+        Some(vf_core::types::QuantizationConfig::Scalar(_)) => "scalar".to_string(),
+        None => "none".to_string(),
+    };
     Ok(Json(CollectionInfo {
         name: c.config.name.clone(),
         dimension: c.config.dimension as u32,
@@ -443,6 +515,7 @@ async fn get_collection(
         vector_count: c.store.len() as u64,
         default_threshold: c.config.default_similarity_threshold.unwrap_or(0.0),
         status: status_str,
+        quantization_type,
     }))
 }
 
@@ -520,7 +593,7 @@ async fn insert_vector(
     }
 
     if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-        &mut coll.graph, &coll.index, assigned_id, &req.values, 10,
+        &mut coll.graph, coll.index.as_vector_index(), assigned_id, &req.values, 10,
     ) {
         tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
     }
@@ -808,7 +881,7 @@ async fn bulk_insert(
                 // Graph: compute per-vector only if not deferred
                 if !defer_graph {
                     if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-                        &mut coll.graph, &coll.index, assigned_id, &pv.values, 10,
+                        &mut coll.graph, coll.index.as_vector_index(), assigned_id, &pv.values, 10,
                     ) {
                         tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
                     }
@@ -857,7 +930,7 @@ async fn bulk_insert(
         let mut collections = state.collections.write();
         if let Some(coll) = collections.get_mut(&collection) {
             if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                &mut coll.graph, &coll.index, &inserted_ids, &inserted_vectors, 10,
+                &mut coll.graph, coll.index.as_vector_index(), &inserted_ids, &inserted_vectors, 10,
             ) {
                 tracing::warn!(collection = %collection, "graph compute_batch after bulk_insert failed: {}", e);
             }
@@ -1034,8 +1107,14 @@ async fn search(
         String::new()
     };
 
-    let results = QueryExecutor::search(
-        &coll.index as &dyn VectorIndex,
+    let quantization_params = req.quantization.as_ref().map(|q| SearchQuantizationParams {
+        rescore: q.rescore.unwrap_or(true),
+        oversampling: q.oversampling.unwrap_or(3.0),
+        ignore: q.ignore.unwrap_or(false),
+    });
+
+    let results = QueryExecutor::search_quantized(
+        coll.index.as_vector_index(),
         &req.query,
         req.k as usize,
         filter.as_ref(),
@@ -1043,6 +1122,7 @@ async fn search(
         Some(&coll.index_manager),
         &metadata_store,
         ef_search,
+        quantization_params.as_ref(),
     ).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {}", e)))?;
 
     let max_edges = if req.max_graph_edges == 0 { 10u32 } else { req.max_graph_edges };
@@ -1129,8 +1209,14 @@ async fn batch_search(
             String::new()
         };
 
-        let results = QueryExecutor::search(
-            &coll.index as &dyn VectorIndex,
+        let quantization_params = q.quantization.as_ref().map(|qp| SearchQuantizationParams {
+            rescore: qp.rescore.unwrap_or(true),
+            oversampling: qp.oversampling.unwrap_or(3.0),
+            ignore: qp.ignore.unwrap_or(false),
+        });
+
+        let results = QueryExecutor::search_quantized(
+            coll.index.as_vector_index(),
             &q.query,
             q.k as usize,
             filter.as_ref(),
@@ -1138,6 +1224,7 @@ async fn batch_search(
             Some(&coll.index_manager),
             &metadata_store,
             ef_search,
+            quantization_params.as_ref(),
         ).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {}", e)))?;
 
         let max_edges = if q.max_graph_edges == 0 { 10u32 } else { q.max_graph_edges };
@@ -1426,9 +1513,9 @@ fn parse_strategy(s: &str) -> FilterStrategy {
 
 // ── Vector Math helpers ─────────────────────────────────────────────────
 
-fn get_vectors_from_collection(index: &vf_index::hnsw::HnswIndex, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
+fn get_vectors_from_collection(index: &dyn vf_index::traits::PersistableIndex, ids: &[u64]) -> Vec<(VectorId, Vec<f32>)> {
     if ids.is_empty() {
-        index.iter_vectors()
+        index.iter_vectors_owned()
     } else {
         ids.iter()
             .filter_map(|&id| index.get_vector(id).ok().map(|data| (id, data)))
@@ -1620,7 +1707,7 @@ async fn detect_ghosts(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.index, &[]);
+    let owned_vectors = get_vectors_from_collection(&*coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
@@ -1669,7 +1756,7 @@ async fn cone_search(
         return Err(err(StatusCode::BAD_REQUEST, "direction vector is required"));
     }
 
-    let owned_vectors = get_vectors_from_collection(&coll.index, &[]);
+    let owned_vectors = get_vectors_from_collection(&*coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
@@ -1697,7 +1784,7 @@ async fn compute_centroid(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.index, &req.vector_ids);
+    let owned_vectors = get_vectors_from_collection(&*coll.index, &req.vector_ids);
     let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
 
     if vec_slices.is_empty() {
@@ -1764,8 +1851,8 @@ async fn detect_drift(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_w1 = get_vectors_from_collection(&coll.index, &req.window1_ids);
-    let owned_w2 = get_vectors_from_collection(&coll.index, &req.window2_ids);
+    let owned_w1 = get_vectors_from_collection(&*coll.index, &req.window1_ids);
+    let owned_w2 = get_vectors_from_collection(&*coll.index, &req.window2_ids);
 
     let w1_slices: Vec<&[f32]> = owned_w1.iter().map(|(_, v)| v.as_slice()).collect();
     let w2_slices: Vec<&[f32]> = owned_w2.iter().map(|(_, v)| v.as_slice()).collect();
@@ -1801,7 +1888,7 @@ async fn cluster(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.index, &[]);
+    let owned_vectors = get_vectors_from_collection(&*coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))
@@ -1841,7 +1928,7 @@ async fn reduce_dimensions(
     let coll = collections.get(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
 
-    let owned_vectors = get_vectors_from_collection(&coll.index, &req.vector_ids);
+    let owned_vectors = get_vectors_from_collection(&*coll.index, &req.vector_ids);
     let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
 
     let n_components = if req.n_components == 0 { 2 } else { req.n_components as usize };
@@ -1913,7 +2000,7 @@ async fn diversity_sample(
         return Err(err(StatusCode::BAD_REQUEST, "query vector is required"));
     }
 
-    let owned_candidates = get_vectors_from_collection(&coll.index, &req.candidate_ids);
+    let owned_candidates = get_vectors_from_collection(&*coll.index, &req.candidate_ids);
     let candidates: Vec<(VectorId, &[f32])> = owned_candidates
         .iter()
         .map(|(id, v)| (*id, v.as_slice()))

@@ -22,7 +22,7 @@ use crate::hnsw_delta::{HnswDeltaEntry, HnswDeltaOp, HnswDeltaWriter};
 use crate::hnsw_persistence::{HnswTopologySnapshot, TopologyNode};
 use crate::hnsw_types::HnswNode;
 use crate::prefetch::{prefetch_neighbors, prefetch_vector};
-use crate::traits::{IndexError, VectorIndex};
+use crate::traits::{IndexError, PersistableIndex, VectorIndex};
 
 #[derive(Debug, Clone)]
 pub struct HnswParams {
@@ -1477,6 +1477,55 @@ impl HnswIndex {
 
         Ok(())
     }
+
+    // ── Read-only graph accessors (for QuantizedHnswIndex) ─────────────
+
+    /// Returns the current entry point of the graph.
+    pub fn entry_point(&self) -> Option<VectorId> {
+        let inner = self.inner.read();
+        inner.entry_point
+    }
+
+    /// Returns the maximum level in the graph.
+    pub fn max_level(&self) -> usize {
+        let inner = self.inner.read();
+        inner.max_level
+    }
+
+    /// Returns the level of a specific node, or None if not found.
+    pub fn node_level(&self, id: VectorId) -> Option<usize> {
+        let inner = self.inner.read();
+        inner.nodes.get(&id).map(|n| n.max_level())
+    }
+
+    /// Returns the neighbors of a node at a specific level.
+    pub fn neighbors(&self, id: VectorId, level: usize) -> Option<Vec<VectorId>> {
+        let inner = self.inner.read();
+        inner.nodes.get(&id).and_then(|n| {
+            n.neighbors.get(level).cloned()
+        })
+    }
+
+    /// Returns the VectorArena slot for a node, or None if not found.
+    pub fn node_vector_slot(&self, id: VectorId) -> Option<usize> {
+        let inner = self.inner.read();
+        inner.nodes.get(&id).map(|n| n.vector_slot)
+    }
+
+    /// Clears the VectorArena data (frees f32 vectors from RAM).
+    /// Graph topology (nodes, neighbors) is preserved.
+    /// After calling this, get_vector() will fail.
+    /// Only call this after quantization when u8 codes are ready.
+    pub fn clear_arena(&self) {
+        let mut inner = self.inner.write();
+        inner.vectors.clear();
+    }
+
+    /// Returns the number of nodes in the graph.
+    pub fn vector_count(&self) -> usize {
+        let inner = self.inner.read();
+        inner.nodes.len()
+    }
 }
 
 impl VectorIndex for HnswIndex {
@@ -1564,5 +1613,47 @@ impl VectorIndex for HnswIndex {
 
     fn iter_vectors(&self) -> Result<Vec<(VectorId, Vec<f32>)>, IndexError> {
         Ok(self.iter_vectors())
+    }
+}
+
+impl PersistableIndex for HnswIndex {
+    fn add_with_lsn(&self, id: VectorId, vector: &[f32], lsn: u64) -> Result<(), IndexError> {
+        self.add_with_lsn(id, vector, lsn)
+    }
+
+    fn remove_with_lsn(&self, id: VectorId, lsn: u64) -> Result<(), IndexError> {
+        self.remove_with_lsn(id, lsn)
+    }
+
+    fn snapshot_topology(&self, snapshot_lsn: u64) -> HnswTopologySnapshot {
+        self.snapshot_topology(snapshot_lsn)
+    }
+
+    fn compact(&self) {
+        self.compact()
+    }
+
+    fn is_compacted(&self) -> bool {
+        self.is_compacted()
+    }
+
+    fn build_parallel(&self, vectors: &[(VectorId, &[f32])]) -> Result<(), IndexError> {
+        self.build_parallel(vectors)
+    }
+
+    fn set_delta_writer(&self, writer: HnswDeltaWriter) {
+        self.set_delta_writer(writer)
+    }
+
+    fn take_delta_writer(&self) -> Option<HnswDeltaWriter> {
+        self.take_delta_writer()
+    }
+
+    fn iter_vectors_owned(&self) -> Vec<(VectorId, Vec<f32>)> {
+        self.iter_vectors()
+    }
+
+    fn as_vector_index(&self) -> &dyn VectorIndex {
+        self
     }
 }

@@ -46,8 +46,18 @@ class FieldFilter(_message.Message):
     values: _containers.RepeatedCompositeFieldContainer[_common_pb2.MetadataValue]
     def __init__(self, field: _Optional[str] = ..., op: _Optional[str] = ..., value: _Optional[_Union[_common_pb2.MetadataValue, _Mapping]] = ..., values: _Optional[_Iterable[_Union[_common_pb2.MetadataValue, _Mapping]]] = ...) -> None: ...
 
+class SearchQuantizationParams(_message.Message):
+    __slots__ = ("rescore", "oversampling", "ignore")
+    RESCORE_FIELD_NUMBER: _ClassVar[int]
+    OVERSAMPLING_FIELD_NUMBER: _ClassVar[int]
+    IGNORE_FIELD_NUMBER: _ClassVar[int]
+    rescore: bool
+    oversampling: float
+    ignore: bool
+    def __init__(self, rescore: bool = ..., oversampling: _Optional[float] = ..., ignore: bool = ...) -> None: ...
+
 class SearchRequest(_message.Message):
-    __slots__ = ("collection", "query", "k", "filter", "strategy", "include_metadata", "include_graph", "graph_threshold", "max_graph_edges", "ef_search")
+    __slots__ = ("collection", "query", "k", "filter", "strategy", "include_metadata", "include_graph", "graph_threshold", "max_graph_edges", "ef_search", "quantization")
     COLLECTION_FIELD_NUMBER: _ClassVar[int]
     QUERY_FIELD_NUMBER: _ClassVar[int]
     K_FIELD_NUMBER: _ClassVar[int]
@@ -58,6 +68,7 @@ class SearchRequest(_message.Message):
     GRAPH_THRESHOLD_FIELD_NUMBER: _ClassVar[int]
     MAX_GRAPH_EDGES_FIELD_NUMBER: _ClassVar[int]
     EF_SEARCH_FIELD_NUMBER: _ClassVar[int]
+    QUANTIZATION_FIELD_NUMBER: _ClassVar[int]
     collection: str
     query: _common_pb2.Vector
     k: int
@@ -68,7 +79,8 @@ class SearchRequest(_message.Message):
     graph_threshold: float
     max_graph_edges: int
     ef_search: int
-    def __init__(self, collection: _Optional[str] = ..., query: _Optional[_Union[_common_pb2.Vector, _Mapping]] = ..., k: _Optional[int] = ..., filter: _Optional[_Union[FilterExpression, _Mapping]] = ..., strategy: _Optional[str] = ..., include_metadata: bool = ..., include_graph: bool = ..., graph_threshold: _Optional[float] = ..., max_graph_edges: _Optional[int] = ..., ef_search: _Optional[int] = ...) -> None: ...
+    quantization: SearchQuantizationParams
+    def __init__(self, collection: _Optional[str] = ..., query: _Optional[_Union[_common_pb2.Vector, _Mapping]] = ..., k: _Optional[int] = ..., filter: _Optional[_Union[FilterExpression, _Mapping]] = ..., strategy: _Optional[str] = ..., include_metadata: bool = ..., include_graph: bool = ..., graph_threshold: _Optional[float] = ..., max_graph_edges: _Optional[int] = ..., ef_search: _Optional[int] = ..., quantization: _Optional[_Union[SearchQuantizationParams, _Mapping]] = ...) -> None: ...
 
 class SearchResponse(_message.Message):
     __slots__ = ("results", "search_time_us", "warning")

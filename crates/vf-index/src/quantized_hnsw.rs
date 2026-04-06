@@ -3,343 +3,144 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
-//! Quantized HNSW index — wraps [`HnswIndex`] with quantized vector storage
-//! for memory-efficient approximate nearest neighbor search with optional
-//! re-ranking using full-precision vectors.
+//! SQ8 Quantized HNSW index.
+//!
+//! Wraps [`HnswIndex`] with scalar-quantized u8 codes in RAM
+//! ([`QuantizedArena`]) for fast HNSW traversal via asymmetric distance
+//! (f32 query x u8 code), and original f32 vectors on disk
+//! ([`MmapVectorStore`]) for exact rescore.
 
-use std::collections::HashMap;
-use std::mem;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
 use vf_core::distance::DistanceMetric;
-use vf_core::types::{DistanceMetricType, ScoredResult, VectorId};
-use vf_quantization::product::ProductQuantizer;
-use vf_quantization::pq_distance::PqDistanceTable;
+use vf_core::types::{
+    DistanceMetricType, ScalarQuantizationConfig, ScoredResult, SearchQuantizationParams, VectorId,
+};
 use vf_quantization::scalar::ScalarQuantizer;
-use vf_quantization::sq_distance::{sq_cosine_distance, sq_dot_product_distance, sq_euclidean_distance};
+use vf_quantization::sq_simd::{
+    sq_asymmetric_cosine_simd, sq_asymmetric_dot_simd, sq_asymmetric_l2_simd,
+};
 
 use crate::hnsw::{HnswIndex, HnswParams};
-use crate::traits::{IndexError, VectorIndex};
+use crate::hnsw_delta::HnswDeltaWriter;
+use crate::hnsw_persistence::HnswTopologySnapshot;
+use crate::mmap_store::MmapVectorStore;
+use crate::quantized_arena::QuantizedArena;
+use crate::traits::{IndexError, PersistableIndex, VectorIndex};
 
-/// The type of quantization codec used for compact vector storage.
-pub enum QuantizationType {
-    /// Scalar (uniform) quantization: 1 byte per dimension.
-    Scalar(ScalarQuantizer),
-    /// Product quantization: M bytes per vector (M = num_subquantizers).
-    Product(ProductQuantizer),
-    /// No quantization — full f32 vectors only (wrapper pass-through).
-    None,
-}
+// ── Main struct ─────────────────────────────────────────────────────────
 
-/// Memory usage statistics for the quantized HNSW index.
-#[derive(Debug, Clone)]
-pub struct QuantizedMemoryStats {
-    /// Bytes used by quantized codes (compact storage).
-    pub quantized_codes_bytes: usize,
-    /// Bytes used by full-precision vectors (for re-ranking).
-    pub full_vectors_bytes: usize,
-    /// Bytes used by the HNSW graph structure (nodes + adjacency lists).
-    pub hnsw_graph_bytes: usize,
-    /// Total number of vectors stored.
-    pub num_vectors: usize,
-    /// Average bytes per vector for quantized codes.
-    pub avg_quantized_bytes_per_vector: f64,
-    /// Average bytes per vector for full-precision storage.
-    pub avg_full_bytes_per_vector: f64,
-    /// Compression ratio (full / quantized), higher is better.
-    pub compression_ratio: f64,
-}
-
-/// A quantized HNSW index that stores quantized codes alongside full vectors.
+/// HNSW index with SQ8 quantized codes for memory-efficient search.
 ///
-/// The HNSW graph is built and traversed using full-precision vectors (for
-/// accurate graph construction), while quantized codes provide compact storage
-/// for distance estimation. At search time, the index can:
-///
-/// 1. **Re-ranked search** (`search`): retrieve `rerank_factor * k` candidates
-///    via HNSW graph traversal, then re-rank them using full-precision distances
-///    to return the top `k` results.
-///
-/// 2. **Approximate search** (`search_approximate`): use quantized distances
-///    for the final ranking without re-ranking — faster but less accurate.
+/// After training, the graph topology lives in `hnsw`, quantized u8 codes
+/// live in `codes` (RAM), and original f32 vectors live in `mmap_store`
+/// (disk). Search traverses the HNSW graph using asymmetric SIMD distance
+/// (f32 query x u8 code), then optionally rescores the top candidates with
+/// exact f32 vectors from disk.
 pub struct QuantizedHnswIndex {
-    /// The base HNSW graph (stores full vectors for graph construction).
+    /// Inner HNSW graph (topology + arena before training).
     hnsw: HnswIndex,
-    /// Quantization codec.
-    quantization: QuantizationType,
-    /// Quantized codes for each vector (compact storage).
-    quantized_codes: RwLock<HashMap<VectorId, Vec<u8>>>,
-    /// Re-ranking factor: search for rerank_k candidates, re-rank to get k.
-    rerank_factor: usize,
-    /// Distance metric type (needed for choosing SQ/PQ distance functions).
+    /// Trained scalar quantizer (None until `train_quantizer` is called).
+    quantizer: RwLock<Option<ScalarQuantizer>>,
+    /// Contiguous u8 code storage (one slot per vector).
+    codes: RwLock<QuantizedArena>,
+    /// Maps VectorId -> slot index in `codes`.
+    code_slots: RwLock<HashMap<VectorId, usize>>,
+    /// Memory-mapped f32 vector store on disk (for exact rescore).
+    mmap_store: RwLock<Option<MmapVectorStore>>,
+    /// SQ8 configuration (quantile, always_ram).
+    config: ScalarQuantizationConfig,
+    /// Distance metric type.
     metric: DistanceMetricType,
-    /// Vector dimension.
-    dimension: usize,
-    /// Cached distance function — enum dispatch avoids vtable overhead.
+    /// Exact f32 distance function for rescoring.
     distance_fn: DistanceMetric,
+    /// Vector dimensionality.
+    dimension: usize,
+    /// Whether quantizer has been trained and codes are populated.
+    trained: AtomicBool,
+    /// Cached precomputed scales (ranges / 255.0) for SIMD distance.
+    cached_scales: RwLock<Vec<f32>>,
+    /// Cached per-dimension minimum values for SIMD distance.
+    cached_min_vals: RwLock<Vec<f32>>,
+    /// Collection data directory for mmap file creation during post_optimize.
+    data_dir: RwLock<Option<PathBuf>>,
 }
+
+// Compile-time Send+Sync assertion.
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _check() {
+        _assert_send_sync::<QuantizedHnswIndex>();
+    }
+};
+
+// ── Constructor ─────────────────────────────────────────────────────────
 
 impl QuantizedHnswIndex {
-    /// Create a new quantized HNSW index.
+    /// Create a new quantized HNSW index (untrained).
     ///
-    /// # Arguments
-    /// * `dimension` — vector dimensionality.
-    /// * `params` — HNSW graph parameters.
-    /// * `metric` — distance metric type.
-    /// * `quantization` — quantization codec (must be already trained).
-    /// * `rerank_factor` — search for `rerank_factor * k` candidates before
-    ///   re-ranking with full vectors. A value of 1 means no over-retrieval.
-    ///   Typical values: 2–5. Use 3 as a good default.
+    /// Vectors added before training go into the inner HnswIndex arena.
+    /// Call `train_quantizer` after bulk-loading to switch to quantized mode.
     pub fn new(
         dimension: usize,
-        params: HnswParams,
         metric: DistanceMetricType,
-        quantization: QuantizationType,
-        rerank_factor: usize,
+        params: HnswParams,
+        config: ScalarQuantizationConfig,
     ) -> Self {
-        let rerank_factor = rerank_factor.max(1);
-        let distance_fn = DistanceMetric::from_metric_type(metric);
         Self {
             hnsw: HnswIndex::new(dimension, metric, params),
-            quantization,
-            quantized_codes: RwLock::new(HashMap::new()),
-            rerank_factor,
+            quantizer: RwLock::new(None),
+            codes: RwLock::new(QuantizedArena::new(dimension)),
+            code_slots: RwLock::new(HashMap::new()),
+            mmap_store: RwLock::new(None),
+            config,
             metric,
+            distance_fn: DistanceMetric::from_metric_type(metric),
             dimension,
-            distance_fn,
+            trained: AtomicBool::new(false),
+            cached_scales: RwLock::new(Vec::new()),
+            cached_min_vals: RwLock::new(Vec::new()),
+            data_dir: RwLock::new(None),
         }
     }
 
-    /// Add a vector to the quantized HNSW index.
+    /// Create a QuantizedHnswIndex wrapping an existing HnswIndex.
     ///
-    /// This inserts the vector into the HNSW graph (for accurate construction),
-    /// stores the quantized code (for compact storage), and keeps the full
-    /// vector (for re-ranking).
-    pub fn add(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
-        // Insert into HNSW graph first (validates dimension, checks duplicates).
-        self.hnsw.add(id, vector)?;
-
-        // Compute and store the quantized code.
-        let code = self.quantize_vector(vector)?;
-        self.quantized_codes.write().insert(id, code);
-
-        Ok(())
-    }
-
-    /// Remove a vector from the quantized HNSW index.
-    pub fn remove(&self, id: VectorId) -> Result<(), IndexError> {
-        self.hnsw.remove(id)?;
-        self.quantized_codes.write().remove(&id);
-        Ok(())
-    }
-
-    /// Search with over-retrieval and re-ranking.
-    ///
-    /// Retrieves `rerank_factor * k` candidates from the HNSW graph (which
-    /// already uses full-precision vectors for traversal), then re-ranks them
-    /// using exact full-precision distances. The primary benefit of
-    /// over-retrieval is that HNSW's greedy traversal is approximate — it may
-    /// miss true nearest neighbors. By fetching more candidates and
-    /// re-computing exact distances, we confirm the graph's approximate
-    /// ordering and recover neighbors that the greedy search ranked slightly
-    /// too low.
-    pub fn search(&self, query: &[f32], k: usize, ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError> {
-        if query.len() != self.dimension {
-            return Err(IndexError::DimensionMismatch {
-                expected: self.dimension,
-                actual: query.len(),
-            });
+    /// Used during recovery: the HNSW graph (topology + vectors) has already
+    /// been restored; this constructor wraps it so that `train_quantizer()`
+    /// can be called to switch to quantized mode.
+    pub fn from_existing_hnsw(
+        hnsw: HnswIndex,
+        metric: DistanceMetricType,
+        config: ScalarQuantizationConfig,
+    ) -> Self {
+        let dimension = hnsw.dimension();
+        Self {
+            hnsw,
+            quantizer: RwLock::new(None),
+            codes: RwLock::new(QuantizedArena::new(dimension)),
+            code_slots: RwLock::new(HashMap::new()),
+            mmap_store: RwLock::new(None),
+            config,
+            metric,
+            distance_fn: DistanceMetric::from_metric_type(metric),
+            dimension,
+            trained: AtomicBool::new(false),
+            cached_scales: RwLock::new(Vec::new()),
+            cached_min_vals: RwLock::new(Vec::new()),
+            data_dir: RwLock::new(None),
         }
-
-        // Over-retrieve candidates from HNSW graph.
-        let expanded_k = k.saturating_mul(self.rerank_factor).max(k);
-        let candidates = self.hnsw.search(query, expanded_k, ef_search)?;
-
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Re-rank candidates using full-precision vectors from the HNSW arena.
-        let mut reranked: Vec<ScoredResult> = candidates
-            .into_iter()
-            .map(|candidate| {
-                match self.hnsw.get_vector(candidate.id) {
-                    Ok(full_vec) => {
-                        let exact_dist = self.distance_fn.compute(query, &full_vec);
-                        ScoredResult::new(candidate.id, exact_dist)
-                    }
-                    Err(_) => candidate,
-                }
-            })
-            .collect();
-
-        reranked.sort_by(|a, b| OrderedFloat(a.score).cmp(&OrderedFloat(b.score)));
-        reranked.truncate(k);
-
-        Ok(reranked)
     }
 
-    /// Fast approximate search using HNSW traversal + quantized re-scoring
-    /// (no full-precision re-ranking).
-    ///
-    /// Retrieves candidates from the HNSW graph and re-scores them using
-    /// quantized distance functions. Faster than `search()` but less accurate
-    /// because quantized distances are lossy approximations.
-    ///
-    /// **Note on Manhattan metric:** Neither SQ nor PQ natively support
-    /// Manhattan distance. SQ falls back to the raw HNSW score, and PQ falls
-    /// back to a Euclidean distance table. Results under Manhattan will be
-    /// approximate at best.
-    pub fn search_approximate(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef_search: Option<usize>,
-    ) -> Result<Vec<ScoredResult>, IndexError> {
-        if query.len() != self.dimension {
-            return Err(IndexError::DimensionMismatch {
-                expected: self.dimension,
-                actual: query.len(),
-            });
-        }
-
-        // Retrieve candidates from HNSW graph.
-        let candidates = self.hnsw.search(query, k, ef_search)?;
-
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Re-score using quantized distances.
-        let codes_map = self.quantized_codes.read();
-
-        let mut scored: Vec<ScoredResult> = match &self.quantization {
-            QuantizationType::Scalar(sq) => {
-                let query_code = sq.quantize(query).map_err(|e| {
-                    IndexError::Internal(format!("scalar quantize query failed: {}", e))
-                })?;
-                candidates
-                    .into_iter()
-                    .map(|c| {
-                        if let Some(code) = codes_map.get(&c.id) {
-                            let dist = match self.metric {
-                                DistanceMetricType::Euclidean => {
-                                    sq_euclidean_distance(&query_code, code, sq)
-                                }
-                                DistanceMetricType::DotProduct => {
-                                    sq_dot_product_distance(&query_code, code, sq)
-                                }
-                                DistanceMetricType::Cosine => {
-                                    sq_cosine_distance(&query_code, code, sq)
-                                }
-                                DistanceMetricType::Manhattan => {
-                                    // WARNING: SQ does not support Manhattan distance.
-                                    // Falling back to the HNSW score (full-precision Manhattan).
-                                    // This means no quantized re-scoring occurs for Manhattan+SQ.
-                                    c.score
-                                }
-                            };
-                            ScoredResult::new(c.id, dist)
-                        } else {
-                            c
-                        }
-                    })
-                    .collect()
-            }
-            QuantizationType::Product(pq) => {
-                let table = match self.metric {
-                    DistanceMetricType::Euclidean | DistanceMetricType::Cosine => {
-                        PqDistanceTable::build_euclidean(query, pq)
-                    }
-                    DistanceMetricType::DotProduct => {
-                        PqDistanceTable::build_dot_product(query, pq)
-                    }
-                    DistanceMetricType::Manhattan => {
-                        // WARNING: PQ does not support Manhattan distance natively.
-                        // Falling back to Euclidean distance table — results will
-                        // approximate Manhattan ordering but are not exact.
-                        PqDistanceTable::build_euclidean(query, pq)
-                    }
-                };
-                candidates
-                    .into_iter()
-                    .map(|c| {
-                        if let Some(code) = codes_map.get(&c.id) {
-                            let dist = table.distance(code);
-                            ScoredResult::new(c.id, dist)
-                        } else {
-                            c
-                        }
-                    })
-                    .collect()
-            }
-            QuantizationType::None => {
-                // No quantization — just return HNSW results as-is.
-                candidates
-            }
-        };
-
-        scored.sort_by(|a, b| OrderedFloat(a.score).cmp(&OrderedFloat(b.score)));
-        scored.truncate(k);
-
-        Ok(scored)
-    }
-
-    /// Returns the number of vectors in the index.
-    pub fn len(&self) -> usize {
-        self.hnsw.len()
-    }
-
-    /// Returns true if the index contains no vectors.
-    pub fn is_empty(&self) -> bool {
-        self.hnsw.len() == 0
-    }
-
-    /// Report memory usage statistics: quantized codes vs full vectors.
-    ///
-    /// **Note:** These are estimates. They account for the raw byte capacity of
-    /// `Vec<u8>` / `Vec<f32>` values but exclude HashMap overhead (bucket
-    /// arrays, load factor slack) and HNSW adjacency lists (neighbor vectors
-    /// at each layer). Actual RSS will be higher.
-    pub fn memory_usage(&self) -> QuantizedMemoryStats {
-        let codes = self.quantized_codes.read();
-        let num_vectors = codes.len();
-
-        // Quantized codes memory: sum of all code Vec<u8> allocations.
-        let quantized_codes_bytes: usize = codes
-            .values()
-            .map(|c| c.capacity() * mem::size_of::<u8>())
-            .sum();
-
-        // Full vectors are stored in the HNSW arena (no separate copy).
-        let full_vectors_bytes: usize = 0;
-
-        // HNSW graph overhead estimate: nodes + adjacency lists.
-        let hnsw_graph_bytes = num_vectors * self.dimension * mem::size_of::<f32>();
-
-        let avg_quantized = if num_vectors > 0 {
-            quantized_codes_bytes as f64 / num_vectors as f64
-        } else {
-            0.0
-        };
-
-        let compression_ratio = if quantized_codes_bytes > 0 {
-            hnsw_graph_bytes as f64 / quantized_codes_bytes as f64
-        } else {
-            0.0
-        };
-
-        QuantizedMemoryStats {
-            quantized_codes_bytes,
-            full_vectors_bytes,
-            hnsw_graph_bytes,
-            num_vectors,
-            avg_quantized_bytes_per_vector: avg_quantized,
-            avg_full_bytes_per_vector: 0.0,
-            compression_ratio,
-        }
+    /// Returns whether the quantizer has been trained.
+    pub fn is_trained(&self) -> bool {
+        self.trained.load(Ordering::Acquire)
     }
 
     /// Returns a reference to the underlying HNSW index.
@@ -347,39 +148,560 @@ impl QuantizedHnswIndex {
         &self.hnsw
     }
 
-    /// Returns the re-ranking factor.
-    pub fn rerank_factor(&self) -> usize {
-        self.rerank_factor
+    /// Store the collection data directory so `post_optimize()` can train
+    /// the quantizer without an explicit path argument.
+    pub fn set_data_dir(&self, dir: PathBuf) {
+        *self.data_dir.write() = Some(dir);
     }
 
-    /// Returns the vector dimension.
-    pub fn dimension(&self) -> usize {
+    // ── Training ────────────────────────────────────────────────────────
+
+    /// Train the scalar quantizer, build mmap store, populate quantized codes,
+    /// and free the f32 arena from RAM.
+    ///
+    /// Collects all vectors from the inner HNSW, writes them to an mmap file,
+    /// trains the quantizer with the configured quantile, quantizes every
+    /// vector into the QuantizedArena, caches SIMD parameters, and clears
+    /// the HNSW f32 arena.
+    pub fn train_quantizer(&self, data_dir: &Path) {
+        // 1. Collect all f32 vectors from the inner HNSW arena.
+        let vectors = self.hnsw.iter_vectors();
+        if vectors.is_empty() {
+            return;
+        }
+
+        // 2. Write f32 vectors to disk via MmapVectorStore.
+        let mmap_path = data_dir.join("vectors.mmap");
+        let mmap_store = MmapVectorStore::build(&mmap_path, &vectors, self.dimension)
+            .expect("failed to build mmap vector store");
+
+        // 3. Train ScalarQuantizer on the training data.
+        let mut quantizer = ScalarQuantizer::new(self.dimension);
+        let vec_refs: Vec<&[f32]> = vectors.iter().map(|(_, v)| v.as_slice()).collect();
+        quantizer
+            .train_with_quantile(&vec_refs, self.config.quantile)
+            .expect("failed to train scalar quantizer");
+
+        // 4. Cache scales and min_vals for SIMD distance kernels.
+        let scales = quantizer.scales();
+        let min_vals = quantizer.min_vals().to_vec();
+
+        // 5. Batch quantize all vectors into the QuantizedArena.
+        let mut codes = QuantizedArena::with_capacity(self.dimension, vectors.len());
+        let mut code_slots = HashMap::with_capacity(vectors.len());
+        for (id, vec) in &vectors {
+            let code = quantizer
+                .quantize(vec)
+                .expect("quantize failed for trained quantizer");
+            let slot = codes.push(&code);
+            code_slots.insert(*id, slot);
+        }
+
+        // 6. Store everything under write locks.
+        *self.quantizer.write() = Some(quantizer);
+        *self.codes.write() = codes;
+        *self.code_slots.write() = code_slots;
+        *self.mmap_store.write() = Some(mmap_store);
+        *self.cached_scales.write() = scales;
+        *self.cached_min_vals.write() = min_vals;
+
+        // 7. Free f32 vectors from RAM — graph topology is preserved.
+        self.hnsw.clear_arena();
+        self.trained.store(true, Ordering::Release);
+    }
+
+    // ── Asymmetric distance ─────────────────────────────────────────────
+
+    /// Compute asymmetric distance: f32 query vs u8 code.
+    /// Uses SIMD-accelerated kernels for L2, dot product, and cosine.
+    /// Falls back to scalar computation for Manhattan.
+    #[inline]
+    fn asymmetric_distance(
+        &self,
+        query: &[f32],
+        code: &[u8],
+        scales: &[f32],
+        min_vals: &[f32],
+    ) -> f32 {
+        match self.metric {
+            DistanceMetricType::Euclidean => {
+                sq_asymmetric_l2_simd(query, code, min_vals, scales)
+            }
+            DistanceMetricType::DotProduct => {
+                sq_asymmetric_dot_simd(query, code, min_vals, scales)
+            }
+            DistanceMetricType::Cosine => {
+                sq_asymmetric_cosine_simd(query, code, min_vals, scales)
+            }
+            DistanceMetricType::Manhattan => {
+                // No SIMD kernel for Manhattan; dequantize and compute inline.
+                let mut sum = 0.0f32;
+                for d in 0..query.len() {
+                    let dequant = code[d] as f32 * scales[d] + min_vals[d];
+                    sum += (query[d] - dequant).abs();
+                }
+                sum
+            }
+        }
+    }
+
+    // ── Quantized beam search ───────────────────────────────────────────
+
+    /// Custom HNSW beam search using asymmetric distance (f32 query x u8 code).
+    ///
+    /// Traverses the HNSW graph from the top layer down to layer 0 using
+    /// quantized distances. Returns up to `expanded_k` candidates sorted
+    /// by ascending quantized distance (closest first).
+    fn quantized_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        oversampling: f32,
+    ) -> Vec<ScoredResult> {
+        let entry = match self.hnsw.entry_point() {
+            Some(ep) => ep,
+            None => return Vec::new(),
+        };
+
+        let max_level = self.hnsw.max_level();
+        let codes = self.codes.read();
+        let code_slots = self.code_slots.read();
+        let scales = self.cached_scales.read();
+        let min_vals = self.cached_min_vals.read();
+
+        // Closure: compute quantized distance for a node.
+        let node_distance = |id: VectorId| -> f32 {
+            if let Some(&slot) = code_slots.get(&id) {
+                let code = codes.get(slot);
+                self.asymmetric_distance(query, code, &scales, &min_vals)
+            } else {
+                f32::MAX
+            }
+        };
+
+        // Phase 1: Greedy descent from top layer to layer 1.
+        let mut current_ep = entry;
+        let mut current_dist = node_distance(current_ep);
+
+        for level in (1..=max_level).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                if let Some(neighbors) = self.hnsw.neighbors(current_ep, level) {
+                    for &neighbor in &neighbors {
+                        let dist = node_distance(neighbor);
+                        if dist < current_dist {
+                            current_ep = neighbor;
+                            current_dist = dist;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Beam search at layer 0.
+        let expanded_k = ((k as f32 * oversampling) as usize).max(k).max(ef_search);
+
+        // candidates: min-heap (closest first for expansion)
+        let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, VectorId)>> =
+            BinaryHeap::new();
+        // results: max-heap (farthest first for eviction)
+        let mut results: BinaryHeap<(OrderedFloat<f32>, VectorId)> = BinaryHeap::new();
+        let mut visited: HashSet<VectorId> = HashSet::new();
+
+        visited.insert(current_ep);
+        let ep_dist = node_distance(current_ep);
+        candidates.push(Reverse((OrderedFloat(ep_dist), current_ep)));
+        results.push((OrderedFloat(ep_dist), current_ep));
+
+        while let Some(Reverse((c_dist, c_id))) = candidates.pop() {
+            // If closest candidate is farther than farthest result, stop.
+            if let Some(&(f_dist, _)) = results.peek() {
+                if c_dist > f_dist && results.len() >= expanded_k {
+                    break;
+                }
+            }
+
+            if let Some(neighbors) = self.hnsw.neighbors(c_id, 0) {
+                for &neighbor in &neighbors {
+                    if visited.insert(neighbor) {
+                        let dist = node_distance(neighbor);
+
+                        let should_add = results.len() < expanded_k || {
+                            if let Some(&(f_dist, _)) = results.peek() {
+                                OrderedFloat(dist) < f_dist
+                            } else {
+                                true
+                            }
+                        };
+
+                        if should_add {
+                            candidates.push(Reverse((OrderedFloat(dist), neighbor)));
+                            results.push((OrderedFloat(dist), neighbor));
+                            if results.len() > expanded_k {
+                                results.pop(); // evict farthest
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drain results into a vec sorted by ascending distance (closest first).
+        let mut result_vec: Vec<ScoredResult> = results
+            .into_vec()
+            .into_iter()
+            .map(|(dist, id)| ScoredResult::new(id, dist.into_inner()))
+            .collect();
+        result_vec.sort_by(|a, b| OrderedFloat(a.score).cmp(&OrderedFloat(b.score)));
+        result_vec
+    }
+
+    // ── Rescore with exact f32 ──────────────────────────────────────────
+
+    /// Re-rank candidates using exact f32 vectors from the mmap store.
+    fn rescore(
+        &self,
+        query: &[f32],
+        candidates: Vec<ScoredResult>,
+        k: usize,
+    ) -> Vec<ScoredResult> {
+        let mmap = self.mmap_store.read();
+        let store = match mmap.as_ref() {
+            Some(s) => s,
+            None => return candidates.into_iter().take(k).collect(),
+        };
+
+        let mut rescored: Vec<ScoredResult> = candidates
+            .iter()
+            .filter_map(|sr| {
+                store.get_vector(sr.id).map(|vec| {
+                    ScoredResult::new(sr.id, self.distance_fn.compute(query, vec))
+                })
+            })
+            .collect();
+
+        rescored.sort_by(|a, b| OrderedFloat(a.score).cmp(&OrderedFloat(b.score)));
+        rescored.truncate(k);
+        rescored
+    }
+
+    // ── Public search with explicit quantization params ──────────────────
+
+    /// Search with explicit quantization parameters (internal implementation).
+    ///
+    /// Called from the trait method and directly from the server layer when
+    /// the client provides per-query quantization overrides (rescore,
+    /// oversampling, ignore).
+    pub fn search_with_quantization_impl(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        params: &SearchQuantizationParams,
+    ) -> Result<Vec<ScoredResult>, IndexError> {
+        if !self.trained.load(Ordering::Acquire) || params.ignore {
+            return self.hnsw.search(query, k, ef_search);
+        }
+
+        let ef = ef_search.unwrap_or(50);
+        let candidates = self.quantized_search(query, k, ef, params.oversampling);
+
+        if params.rescore {
+            Ok(self.rescore(query, candidates, k))
+        } else {
+            Ok(candidates.into_iter().take(k).collect())
+        }
+    }
+}
+
+// ── VectorIndex implementation ──────────────────────────────────────────
+
+impl VectorIndex for QuantizedHnswIndex {
+    fn add(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
+        // Always insert into HNSW graph (topology + arena before training).
+        self.hnsw.add(id, vector)?;
+
+        if self.trained.load(Ordering::Acquire) {
+            // Quantize and store the code.
+            let quantizer = self.quantizer.read();
+            if let Some(q) = quantizer.as_ref() {
+                let code = q.quantize(vector).map_err(|e| {
+                    IndexError::Internal(format!("quantize failed: {}", e))
+                })?;
+                let slot = self.codes.write().push(&code);
+                self.code_slots.write().insert(id, slot);
+            }
+
+            // Append exact f32 vector to the mmap store.
+            let mut mmap = self.mmap_store.write();
+            if let Some(store) = mmap.as_mut() {
+                let _ = store.append_vector(id, vector);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove(&self, id: VectorId) -> Result<(), IndexError> {
+        self.hnsw.remove(id)?;
+
+        if self.trained.load(Ordering::Acquire) {
+            // Free the quantized code slot.
+            let mut code_slots = self.code_slots.write();
+            if let Some(slot) = code_slots.remove(&id) {
+                self.codes.write().free(slot);
+            }
+            // Lazy-remove from mmap store (reclaimed on rebuild).
+            let mut mmap = self.mmap_store.write();
+            if let Some(store) = mmap.as_mut() {
+                store.remove_vector(id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<ScoredResult>, IndexError> {
+        if !self.trained.load(Ordering::Acquire) {
+            return self.hnsw.search(query, k, ef_search);
+        }
+
+        let ef = ef_search.unwrap_or(50);
+        let params = SearchQuantizationParams::default();
+        let candidates = self.quantized_search(query, k, ef, params.oversampling);
+
+        if params.rescore {
+            Ok(self.rescore(query, candidates, k))
+        } else {
+            Ok(candidates.into_iter().take(k).collect())
+        }
+    }
+
+    fn search_with_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidates: &[VectorId],
+        _ef_search: Option<usize>,
+    ) -> Result<Vec<ScoredResult>, IndexError> {
+        if !self.trained.load(Ordering::Acquire) {
+            return self.hnsw.search_with_candidates(query, k, candidates, _ef_search);
+        }
+
+        // Score each candidate using quantized distance.
+        let codes = self.codes.read();
+        let code_slots = self.code_slots.read();
+        let scales = self.cached_scales.read();
+        let min_vals = self.cached_min_vals.read();
+
+        let mut scored: Vec<ScoredResult> = candidates
+            .iter()
+            .filter_map(|&id| {
+                code_slots.get(&id).map(|&slot| {
+                    let code = codes.get(slot);
+                    let score = self.asymmetric_distance(query, code, &scales, &min_vals);
+                    ScoredResult::new(id, score)
+                })
+            })
+            .collect();
+
+        scored.sort_by(|a, b| OrderedFloat(a.score).cmp(&OrderedFloat(b.score)));
+        scored.truncate(k);
+
+        // Rescore the top-k with exact f32 distances.
+        Ok(self.rescore(query, scored, k))
+    }
+
+    fn search_with_quantization(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        params: &SearchQuantizationParams,
+    ) -> Result<Vec<ScoredResult>, IndexError> {
+        self.search_with_quantization_impl(query, k, ef_search, params)
+    }
+
+    fn search_with_candidates_quantized(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidates: &[VectorId],
+        ef_search: Option<usize>,
+        params: &SearchQuantizationParams,
+    ) -> Result<Vec<ScoredResult>, IndexError> {
+        if !self.trained.load(Ordering::Acquire) || params.ignore {
+            return self.hnsw.search_with_candidates(query, k, candidates, ef_search);
+        }
+
+        // Score each candidate using quantized distance.
+        let codes = self.codes.read();
+        let code_slots = self.code_slots.read();
+        let scales = self.cached_scales.read();
+        let min_vals = self.cached_min_vals.read();
+
+        let mut scored: Vec<ScoredResult> = candidates
+            .iter()
+            .filter_map(|&id| {
+                code_slots.get(&id).map(|&slot| {
+                    let code = codes.get(slot);
+                    let score = self.asymmetric_distance(query, code, &scales, &min_vals);
+                    ScoredResult::new(id, score)
+                })
+            })
+            .collect();
+
+        scored.sort_by(|a, b| OrderedFloat(a.score).cmp(&OrderedFloat(b.score)));
+        scored.truncate(k);
+
+        if params.rescore {
+            Ok(self.rescore(query, scored, k))
+        } else {
+            Ok(scored)
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.hnsw.len()
+    }
+
+    fn dimension(&self) -> usize {
         self.dimension
     }
 
-    /// Returns true if the given vector ID exists in the index.
-    pub fn contains(&self, id: VectorId) -> bool {
+    fn contains(&self, id: VectorId) -> bool {
         self.hnsw.contains(id)
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────
-
-    /// Quantize a vector using the configured codec.
-    fn quantize_vector(&self, vector: &[f32]) -> Result<Vec<u8>, IndexError> {
-        match &self.quantization {
-            QuantizationType::Scalar(sq) => sq.quantize(vector).map_err(|e| {
-                IndexError::Internal(format!("scalar quantization failed: {}", e))
-            }),
-            QuantizationType::Product(pq) => pq.encode(vector).map_err(|e| {
-                IndexError::Internal(format!("product quantization failed: {}", e))
-            }),
-            QuantizationType::None => {
-                // No quantization: store raw f32 bytes as u8 for uniformity.
-                Ok(vector
-                    .iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect())
+    fn get_vector(&self, id: VectorId) -> Result<Vec<f32>, IndexError> {
+        // Prefer exact f32 from mmap store when available.
+        if self.trained.load(Ordering::Acquire) {
+            let mmap = self.mmap_store.read();
+            if let Some(store) = mmap.as_ref() {
+                if let Some(vec) = store.get_vector(id) {
+                    return Ok(vec.to_vec());
+                }
             }
         }
+        self.hnsw.get_vector(id)
+    }
+
+    fn iter_vectors(&self) -> Result<Vec<(VectorId, Vec<f32>)>, IndexError> {
+        if self.trained.load(Ordering::Acquire) {
+            let mmap = self.mmap_store.read();
+            if let Some(store) = mmap.as_ref() {
+                let code_slots = self.code_slots.read();
+                let vecs: Vec<(VectorId, Vec<f32>)> = code_slots
+                    .keys()
+                    .filter_map(|&id| store.get_vector(id).map(|v| (id, v.to_vec())))
+                    .collect();
+                return Ok(vecs);
+            }
+        }
+        Ok(self.hnsw.iter_vectors())
+    }
+}
+
+// ── PersistableIndex implementation ─────────────────────────────────────
+
+impl PersistableIndex for QuantizedHnswIndex {
+    fn add_with_lsn(
+        &self,
+        id: VectorId,
+        vector: &[f32],
+        lsn: u64,
+    ) -> Result<(), IndexError> {
+        self.hnsw.add_with_lsn(id, vector, lsn)?;
+
+        if self.trained.load(Ordering::Acquire) {
+            let quantizer = self.quantizer.read();
+            if let Some(q) = quantizer.as_ref() {
+                let code = q.quantize(vector).map_err(|e| {
+                    IndexError::Internal(format!("quantize failed: {}", e))
+                })?;
+                let slot = self.codes.write().push(&code);
+                self.code_slots.write().insert(id, slot);
+            }
+            let mut mmap = self.mmap_store.write();
+            if let Some(store) = mmap.as_mut() {
+                let _ = store.append_vector(id, vector);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_with_lsn(&self, id: VectorId, lsn: u64) -> Result<(), IndexError> {
+        self.hnsw.remove_with_lsn(id, lsn)?;
+
+        if self.trained.load(Ordering::Acquire) {
+            let mut code_slots = self.code_slots.write();
+            if let Some(slot) = code_slots.remove(&id) {
+                self.codes.write().free(slot);
+            }
+            let mut mmap = self.mmap_store.write();
+            if let Some(store) = mmap.as_mut() {
+                store.remove_vector(id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn snapshot_topology(&self, snapshot_lsn: u64) -> HnswTopologySnapshot {
+        self.hnsw.snapshot_topology(snapshot_lsn)
+    }
+
+    fn compact(&self) {
+        self.hnsw.compact();
+    }
+
+    fn is_compacted(&self) -> bool {
+        self.hnsw.is_compacted()
+    }
+
+    fn build_parallel(&self, vectors: &[(VectorId, &[f32])]) -> Result<(), IndexError> {
+        self.hnsw.build_parallel(vectors)
+    }
+
+    fn set_delta_writer(&self, writer: HnswDeltaWriter) {
+        self.hnsw.set_delta_writer(writer);
+    }
+
+    fn take_delta_writer(&self) -> Option<HnswDeltaWriter> {
+        self.hnsw.take_delta_writer()
+    }
+
+    fn iter_vectors_owned(&self) -> Vec<(VectorId, Vec<f32>)> {
+        if self.trained.load(Ordering::Acquire) {
+            let mmap = self.mmap_store.read();
+            if let Some(store) = mmap.as_ref() {
+                let code_slots = self.code_slots.read();
+                return code_slots
+                    .keys()
+                    .filter_map(|&id| store.get_vector(id).map(|v| (id, v.to_vec())))
+                    .collect();
+            }
+        }
+        self.hnsw.iter_vectors()
+    }
+
+    fn post_optimize(&self) {
+        let dir = self.data_dir.read();
+        if let Some(ref data_dir) = *dir {
+            self.train_quantizer(data_dir);
+        }
+    }
+
+    fn as_vector_index(&self) -> &dyn VectorIndex {
+        self
     }
 }

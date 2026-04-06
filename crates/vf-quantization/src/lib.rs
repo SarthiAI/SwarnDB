@@ -6,6 +6,7 @@
 pub mod error;
 pub mod scalar;
 pub mod sq_distance;
+pub mod sq_simd;
 pub mod kmeans;
 pub mod product;
 pub mod pq_distance;

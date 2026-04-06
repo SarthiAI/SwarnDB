@@ -29,6 +29,31 @@ class ScoredResult:
 
 
 @dataclass(frozen=True)
+class ScalarQuantizationConfig:
+    """Configuration for scalar (SQ8) quantization."""
+
+    quantile: float = 0.99
+    always_ram: bool = True
+
+
+@dataclass(frozen=True)
+class QuantizationConfig:
+    """Quantization configuration for a collection."""
+
+    type: str = "scalar"
+    scalar: Optional[ScalarQuantizationConfig] = None
+
+
+@dataclass(frozen=True)
+class SearchQuantizationParams:
+    """Per-query quantization parameters."""
+
+    rescore: bool = True
+    oversampling: float = 3.0
+    ignore: bool = False
+
+
+@dataclass(frozen=True)
 class CollectionInfo:
     """Metadata about a collection."""
 
@@ -37,6 +62,7 @@ class CollectionInfo:
     distance_metric: str
     vector_count: int
     default_threshold: float
+    quantization_type: Optional[str] = None
 
 
 @dataclass(frozen=True)
