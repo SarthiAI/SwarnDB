@@ -65,6 +65,7 @@ async fn main() {
         config.max_batch_lock_size,
         config.max_wal_flush_interval,
         config.max_ef_construction,
+        config.clone(),
     ).unwrap_or_else(|e| {
         tracing::error!("failed to initialize AppState: {}", e);
         std::process::exit(1);
@@ -169,15 +170,54 @@ async fn main() {
         start_snapshot_scheduler(snapshot_state, snapshot_shutdown_rx, snapshot_config).await;
     });
 
-    // 8. Wait for shutdown signal
+    // 8. Start background WAL pruner
+    let wal_prune_interval = config.wal_prune_interval_secs;
+    let wal_prune_handle = if wal_prune_interval > 0 {
+        let wal_prune_state = std::sync::Arc::new(state.clone());
+        let mut wal_prune_shutdown_rx = shutdown_signal.subscribe();
+        Some(tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(wal_prune_interval);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {},
+                    _ = wal_prune_shutdown_rx.changed() => {
+                        tracing::info!("WAL pruner shutting down");
+                        return;
+                    }
+                }
+                // Prune WAL for all collections.
+                let collection_names: Vec<String> = {
+                    let collections = wal_prune_state.collections.read();
+                    collections.keys().cloned().collect()
+                };
+                for name in collection_names {
+                    match wal_prune_state.prune_wal_for_collection(&name) {
+                        Ok((count, bytes)) => {
+                            if count > 0 {
+                                tracing::info!("WAL pruner: pruned {} files ({} bytes) for '{}'", count, bytes, name);
+                            }
+                        }
+                        Err(e) => tracing::warn!("WAL pruner failed for '{}': {}", name, e),
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // 9. Wait for shutdown signal
     wait_for_shutdown().await;
 
-    // 9. Graceful shutdown
+    // 10. Graceful shutdown
     tracing::info!("shutdown signal received, stopping servers...");
 
-    // Signal the snapshot scheduler to stop
+    // Signal background tasks to stop
     shutdown_signal.trigger();
     let _ = snapshot_handle.await;
+    if let Some(handle) = wal_prune_handle {
+        let _ = handle.await;
+    }
 
     // Abort server tasks
     grpc_handle.abort();

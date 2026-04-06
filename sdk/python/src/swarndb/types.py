@@ -164,6 +164,27 @@ class OptimizeResult:
 
 
 @dataclass(frozen=True)
+class PruneWALResult:
+    """Result of a WAL prune operation."""
+
+    status: str
+    files_deleted: int
+    bytes_freed: int
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class CompactResult:
+    """Result of a compaction operation."""
+
+    status: str
+    segments_merged: int
+    vectors_written: int
+    vectors_removed: int
+    duration_ms: int
+
+
+@dataclass(frozen=True)
 class BulkInsertResult:
     """Result of a bulk insert operation."""
 

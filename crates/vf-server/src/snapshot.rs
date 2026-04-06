@@ -207,25 +207,28 @@ fn snapshot_collection(
         .map_err(|e| format!("HNSW snapshot write failed: {}", e))?;
     }
 
-    // 2. Serialize virtual graph under a read lock.
+    // 2. Serialize virtual graph under a read lock (only if not deferred).
     {
         let collections = state.collections.read();
         let coll_state = collections
             .get(name)
             .ok_or_else(|| format!("collection '{}' not found", name))?;
 
-        let graph_path = collection_dir.join("graph.base");
+        let graph_deferred = coll_state.deferred_graph.load(Ordering::Acquire);
+        if !graph_deferred {
+            let graph_path = collection_dir.join("graph.base");
 
-        vf_storage::atomic_write::atomic_write_with_callback(&graph_path, |file| {
-            vf_graph::serialize_base(&coll_state.graph, current_lsn, file).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("graph serialize error: {}", e),
-                )
-            })?;
-            Ok(())
-        })
-        .map_err(|e| format!("graph snapshot write failed: {}", e))?;
+            vf_storage::atomic_write::atomic_write_with_callback(&graph_path, |file| {
+                vf_graph::serialize_base(&coll_state.graph, current_lsn, file).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("graph serialize error: {}", e),
+                    )
+                })?;
+                Ok(())
+            })
+            .map_err(|e| format!("graph snapshot write failed: {}", e))?;
+        }
     }
 
     // 3. Reset delta writers under a write lock.
@@ -307,7 +310,7 @@ fn snapshot_collection(
 /// the snapshot captures all state up to the current LSN.
 ///
 /// Returns the number of files deleted.
-fn prune_old_wal_files(collection_dir: &Path) -> usize {
+pub(crate) fn prune_old_wal_files(collection_dir: &Path) -> usize {
     let mut deleted = 0;
     if let Ok(entries) = std::fs::read_dir(collection_dir) {
         for entry in entries.flatten() {

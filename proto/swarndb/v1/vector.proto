@@ -11,6 +11,8 @@ service VectorService {
   rpc BulkInsert(stream InsertRequest) returns (BulkInsertResponse);
   rpc BulkInsertWithOptions(stream BulkInsertStreamMessage) returns (BulkInsertResponse);
   rpc Optimize(OptimizeRequest) returns (OptimizeResponse);
+  rpc PruneWAL(PruneWALRequest) returns (PruneWALResponse);
+  rpc Compact(CompactRequest) returns (CompactResponse);
 }
 
 message InsertRequest {
@@ -80,6 +82,7 @@ message BulkInsertStreamMessage {
 
 message OptimizeRequest {
   string collection = 1;
+  bool rebuild_graph = 2;  // If true, rebuild virtual graph. Default false = skip graph rebuild.
 }
 
 message OptimizeResponse {
@@ -87,4 +90,29 @@ message OptimizeResponse {
   string message = 2;
   uint64 duration_ms = 3;
   uint64 vectors_processed = 4;
+}
+
+message PruneWALRequest {
+  string collection = 1;
+}
+
+message PruneWALResponse {
+  string status = 1;
+  uint64 files_deleted = 2;
+  uint64 bytes_freed = 3;
+  uint64 duration_ms = 4;
+}
+
+message CompactRequest {
+  string collection = 1;
+  uint32 min_segments = 2;  // Minimum segments to trigger compaction. 0 = use default (4).
+  bool remove_deleted = 3;  // Remove deleted vectors during compaction. Default true.
+}
+
+message CompactResponse {
+  string status = 1;
+  uint64 segments_merged = 2;
+  uint64 vectors_written = 3;
+  uint64 vectors_removed = 4;
+  uint64 duration_ms = 5;
 }

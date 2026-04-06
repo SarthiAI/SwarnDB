@@ -90,6 +90,11 @@ pub enum StorageError {
     /// Another process holds an exclusive lock on the data directory.
     #[error("lock held: {0}")]
     LockHeld(String),
+
+    // ── Generic ────────────────────────────────────────────────────────
+    /// Catch-all for errors that don't fit other variants.
+    #[error("{0}")]
+    Other(String),
 }
 
 impl From<bincode::Error> for StorageError {

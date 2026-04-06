@@ -69,6 +69,16 @@ class VectorServiceStub(object):
                 request_serializer=swarndb_dot_v1_dot_vector__pb2.OptimizeRequest.SerializeToString,
                 response_deserializer=swarndb_dot_v1_dot_vector__pb2.OptimizeResponse.FromString,
                 _registered_method=True)
+        self.PruneWAL = channel.unary_unary(
+                '/swarndb.v1.VectorService/PruneWAL',
+                request_serializer=swarndb_dot_v1_dot_vector__pb2.PruneWALRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_vector__pb2.PruneWALResponse.FromString,
+                _registered_method=True)
+        self.Compact = channel.unary_unary(
+                '/swarndb.v1.VectorService/Compact',
+                request_serializer=swarndb_dot_v1_dot_vector__pb2.CompactRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_vector__pb2.CompactResponse.FromString,
+                _registered_method=True)
 
 
 class VectorServiceServicer(object):
@@ -116,6 +126,18 @@ class VectorServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PruneWAL(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Compact(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_VectorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -153,6 +175,16 @@ def add_VectorServiceServicer_to_server(servicer, server):
                     servicer.Optimize,
                     request_deserializer=swarndb_dot_v1_dot_vector__pb2.OptimizeRequest.FromString,
                     response_serializer=swarndb_dot_v1_dot_vector__pb2.OptimizeResponse.SerializeToString,
+            ),
+            'PruneWAL': grpc.unary_unary_rpc_method_handler(
+                    servicer.PruneWAL,
+                    request_deserializer=swarndb_dot_v1_dot_vector__pb2.PruneWALRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_vector__pb2.PruneWALResponse.SerializeToString,
+            ),
+            'Compact': grpc.unary_unary_rpc_method_handler(
+                    servicer.Compact,
+                    request_deserializer=swarndb_dot_v1_dot_vector__pb2.CompactRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_vector__pb2.CompactResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -344,6 +376,60 @@ class VectorService(object):
             '/swarndb.v1.VectorService/Optimize',
             swarndb_dot_v1_dot_vector__pb2.OptimizeRequest.SerializeToString,
             swarndb_dot_v1_dot_vector__pb2.OptimizeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PruneWAL(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.VectorService/PruneWAL',
+            swarndb_dot_v1_dot_vector__pb2.PruneWALRequest.SerializeToString,
+            swarndb_dot_v1_dot_vector__pb2.PruneWALResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Compact(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.VectorService/Compact',
+            swarndb_dot_v1_dot_vector__pb2.CompactRequest.SerializeToString,
+            swarndb_dot_v1_dot_vector__pb2.CompactResponse.FromString,
             options,
             channel_credentials,
             insecure,

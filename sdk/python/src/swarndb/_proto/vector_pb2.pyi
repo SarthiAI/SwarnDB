@@ -112,10 +112,12 @@ class BulkInsertStreamMessage(_message.Message):
     def __init__(self, options: _Optional[_Union[BulkInsertOptions, _Mapping]] = ..., vector: _Optional[_Union[InsertRequest, _Mapping]] = ...) -> None: ...
 
 class OptimizeRequest(_message.Message):
-    __slots__ = ("collection",)
+    __slots__ = ("collection", "rebuild_graph")
     COLLECTION_FIELD_NUMBER: _ClassVar[int]
+    REBUILD_GRAPH_FIELD_NUMBER: _ClassVar[int]
     collection: str
-    def __init__(self, collection: _Optional[str] = ...) -> None: ...
+    rebuild_graph: bool
+    def __init__(self, collection: _Optional[str] = ..., rebuild_graph: bool = ...) -> None: ...
 
 class OptimizeResponse(_message.Message):
     __slots__ = ("status", "message", "duration_ms", "vectors_processed")
@@ -128,3 +130,45 @@ class OptimizeResponse(_message.Message):
     duration_ms: int
     vectors_processed: int
     def __init__(self, status: _Optional[str] = ..., message: _Optional[str] = ..., duration_ms: _Optional[int] = ..., vectors_processed: _Optional[int] = ...) -> None: ...
+
+class PruneWALRequest(_message.Message):
+    __slots__ = ("collection",)
+    COLLECTION_FIELD_NUMBER: _ClassVar[int]
+    collection: str
+    def __init__(self, collection: _Optional[str] = ...) -> None: ...
+
+class PruneWALResponse(_message.Message):
+    __slots__ = ("status", "files_deleted", "bytes_freed", "duration_ms")
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    FILES_DELETED_FIELD_NUMBER: _ClassVar[int]
+    BYTES_FREED_FIELD_NUMBER: _ClassVar[int]
+    DURATION_MS_FIELD_NUMBER: _ClassVar[int]
+    status: str
+    files_deleted: int
+    bytes_freed: int
+    duration_ms: int
+    def __init__(self, status: _Optional[str] = ..., files_deleted: _Optional[int] = ..., bytes_freed: _Optional[int] = ..., duration_ms: _Optional[int] = ...) -> None: ...
+
+class CompactRequest(_message.Message):
+    __slots__ = ("collection", "min_segments", "remove_deleted")
+    COLLECTION_FIELD_NUMBER: _ClassVar[int]
+    MIN_SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    REMOVE_DELETED_FIELD_NUMBER: _ClassVar[int]
+    collection: str
+    min_segments: int
+    remove_deleted: bool
+    def __init__(self, collection: _Optional[str] = ..., min_segments: _Optional[int] = ..., remove_deleted: bool = ...) -> None: ...
+
+class CompactResponse(_message.Message):
+    __slots__ = ("status", "segments_merged", "vectors_written", "vectors_removed", "duration_ms")
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    SEGMENTS_MERGED_FIELD_NUMBER: _ClassVar[int]
+    VECTORS_WRITTEN_FIELD_NUMBER: _ClassVar[int]
+    VECTORS_REMOVED_FIELD_NUMBER: _ClassVar[int]
+    DURATION_MS_FIELD_NUMBER: _ClassVar[int]
+    status: str
+    segments_merged: int
+    vectors_written: int
+    vectors_removed: int
+    duration_ms: int
+    def __init__(self, status: _Optional[str] = ..., segments_merged: _Optional[int] = ..., vectors_written: _Optional[int] = ..., vectors_removed: _Optional[int] = ..., duration_ms: _Optional[int] = ...) -> None: ...

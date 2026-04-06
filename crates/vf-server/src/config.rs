@@ -92,6 +92,22 @@ pub struct ServerConfig {
     /// Maximum time between snapshots (seconds).
     #[serde(default = "default_snapshot_interval_secs")]
     pub snapshot_interval_secs: u64,
+
+    /// Background WAL pruner interval in seconds. 0 = disabled.
+    #[serde(default = "default_wal_prune_interval_secs")]
+    pub wal_prune_interval_secs: u64,
+
+    /// Auto-prune WAL after optimize().
+    #[serde(default = "default_wal_prune_after_optimize")]
+    pub wal_prune_after_optimize: bool,
+
+    /// Auto-compact segments after optimize().
+    #[serde(default = "default_auto_compact_after_optimize")]
+    pub auto_compact_after_optimize: bool,
+
+    /// Min segments to trigger auto-compaction.
+    #[serde(default = "default_compaction_min_segments")]
+    pub compaction_min_segments: usize,
 }
 
 fn default_host() -> String {
@@ -170,6 +186,22 @@ fn default_snapshot_interval_secs() -> u64 {
     900
 }
 
+fn default_wal_prune_interval_secs() -> u64 {
+    300
+}
+
+fn default_wal_prune_after_optimize() -> bool {
+    true
+}
+
+fn default_auto_compact_after_optimize() -> bool {
+    true
+}
+
+fn default_compaction_min_segments() -> usize {
+    4
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -193,6 +225,10 @@ impl Default for ServerConfig {
             snapshot_check_interval_secs: default_snapshot_check_interval_secs(),
             snapshot_mutation_threshold: default_snapshot_mutation_threshold(),
             snapshot_interval_secs: default_snapshot_interval_secs(),
+            wal_prune_interval_secs: default_wal_prune_interval_secs(),
+            wal_prune_after_optimize: default_wal_prune_after_optimize(),
+            auto_compact_after_optimize: default_auto_compact_after_optimize(),
+            compaction_min_segments: default_compaction_min_segments(),
         }
     }
 }
@@ -253,6 +289,10 @@ impl ServerConfig {
     /// - `SWARNDB_MAX_BATCH_LOCK_SIZE` -> max_batch_lock_size
     /// - `SWARNDB_MAX_WAL_FLUSH_INTERVAL` -> max_wal_flush_interval
     /// - `SWARNDB_MAX_EF_CONSTRUCTION` -> max_ef_construction
+    /// - `SWARNDB_WAL_PRUNE_INTERVAL_SECS` -> wal_prune_interval_secs
+    /// - `SWARNDB_WAL_PRUNE_AFTER_OPTIMIZE` -> wal_prune_after_optimize
+    /// - `SWARNDB_AUTO_COMPACT_AFTER_OPTIMIZE` -> auto_compact_after_optimize
+    /// - `SWARNDB_COMPACTION_MIN_SEGMENTS` -> compaction_min_segments
     pub fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("SWARNDB_HOST") {
             self.host = val;
@@ -397,6 +437,38 @@ impl ServerConfig {
                 tracing::warn!("Invalid SWARNDB_SNAPSHOT_INTERVAL_SECS value: {}", val);
             }
         }
+
+        if let Ok(val) = env::var("SWARNDB_WAL_PRUNE_INTERVAL_SECS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.wal_prune_interval_secs = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_WAL_PRUNE_INTERVAL_SECS value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_WAL_PRUNE_AFTER_OPTIMIZE") {
+            match val.to_lowercase().as_str() {
+                "true" | "1" | "yes" => self.wal_prune_after_optimize = true,
+                "false" | "0" | "no" => self.wal_prune_after_optimize = false,
+                _ => tracing::warn!("Invalid SWARNDB_WAL_PRUNE_AFTER_OPTIMIZE value: {}", val),
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_AUTO_COMPACT_AFTER_OPTIMIZE") {
+            match val.to_lowercase().as_str() {
+                "true" | "1" | "yes" => self.auto_compact_after_optimize = true,
+                "false" | "0" | "no" => self.auto_compact_after_optimize = false,
+                _ => tracing::warn!("Invalid SWARNDB_AUTO_COMPACT_AFTER_OPTIMIZE value: {}", val),
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_COMPACTION_MIN_SEGMENTS") {
+            if let Ok(n) = val.parse::<usize>() {
+                self.compaction_min_segments = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_COMPACTION_MIN_SEGMENTS value: {}", val);
+            }
+        }
     }
 
     /// Returns the gRPC socket address string (e.g., "0.0.0.0:50051").
@@ -449,6 +521,10 @@ mod tests {
         assert_eq!(config.snapshot_check_interval_secs, 30);
         assert_eq!(config.snapshot_mutation_threshold, 50_000);
         assert_eq!(config.snapshot_interval_secs, 900);
+        assert_eq!(config.wal_prune_interval_secs, 300);
+        assert_eq!(config.wal_prune_after_optimize, true);
+        assert_eq!(config.auto_compact_after_optimize, true);
+        assert_eq!(config.compaction_min_segments, 4);
     }
 
     #[test]

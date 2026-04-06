@@ -252,6 +252,45 @@ impl Collection {
         Ok(())
     }
 
+    // ── Compaction ────────────────────────────────────────────────────────
+
+    /// Compact all segments into a single new segment, removing deleted vectors.
+    pub fn compact(&mut self, options: crate::compaction::CompactionOptions) -> StorageResult<crate::compaction::CompactionResult> {
+        use crate::compaction::{compact_segments, should_compact};
+
+        if !should_compact(self.segments.len(), &options) {
+            return Err(StorageError::Other("Not enough segments to compact".into()));
+        }
+
+        // Flush memtable first if needed.
+        if !self.memtable.is_empty() {
+            self.flush_memtable()?;
+        }
+
+        // Deleted IDs set (empty for now -- Collection does not track deletions across segments).
+        let deleted_ids = std::collections::HashSet::new();
+
+        let new_segment_id = self.next_segment_id;
+        let result = compact_segments(&self.segments, &deleted_ids, &self.collection_dir, new_segment_id, &options)?;
+
+        // Collect old segment file paths before replacing.
+        let old_paths: Vec<_> = self.segments.iter().map(|s| s.path().to_path_buf()).collect();
+
+        // Open the new compacted segment.
+        let new_segment = Segment::open(&result.new_segment_path)?;
+
+        // Update collection state.
+        self.segments = vec![new_segment];
+        self.next_segment_id = new_segment_id + 1;
+
+        // Delete old segment files.
+        for path in old_paths {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        Ok(result)
+    }
+
     // ── Accessors ────────────────────────────────────────────────────────
 
     /// Returns the collection name.

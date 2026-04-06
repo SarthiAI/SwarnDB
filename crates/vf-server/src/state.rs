@@ -107,6 +107,7 @@ pub struct CollectionState {
 pub struct AppState {
     pub collections: Arc<RwLock<HashMap<String, CollectionState>>>,
     pub collection_manager: Arc<RwLock<CollectionManager>>,
+    pub config: crate::config::ServerConfig,
     pub max_ef_search: usize,
     pub max_batch_lock_size: u32,
     pub max_wal_flush_interval: u32,
@@ -126,6 +127,7 @@ impl AppState {
         max_batch_lock_size: u32,
         max_wal_flush_interval: u32,
         max_ef_construction: u32,
+        config: crate::config::ServerConfig,
     ) -> Result<Self, StorageError> {
         let collection_manager = CollectionManager::new(storage_path)?;
 
@@ -379,6 +381,7 @@ impl AppState {
         Ok(Self {
             collections: Arc::new(RwLock::new(collections)),
             collection_manager: Arc::new(RwLock::new(collection_manager)),
+            config,
             max_ef_search,
             max_batch_lock_size,
             max_wal_flush_interval,
@@ -423,11 +426,66 @@ impl AppState {
         (index, graph)
     }
 
+    /// Prune old WAL files for a collection.
+    ///
+    /// Deletes all `wal_*.log.old` files in the collection directory.
+    /// Returns `(files_deleted, bytes_freed)`.
+    pub fn prune_wal_for_collection(&self, name: &str) -> Result<(usize, u64), String> {
+        let collection_dir = {
+            let cm = self.collection_manager.read();
+            let coll = cm.get_collection(name)
+                .map_err(|e| format!("Collection '{}' not found: {}", name, e))?;
+            coll.collection_dir().to_path_buf()
+        };
+
+        let mut deleted = 0usize;
+        let mut bytes_freed = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&collection_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                    if fname.starts_with("wal_") && fname.ends_with(".log.old") {
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            bytes_freed += meta.len();
+                        }
+                        if std::fs::remove_file(&path).is_ok() {
+                            deleted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((deleted, bytes_freed))
+    }
+
+    /// Compact segments for a collection into a single segment.
+    ///
+    /// Returns compaction statistics or an error if there are too few segments.
+    pub fn compact_collection(&self, name: &str, min_segments: usize, remove_deleted: bool) -> Result<vf_storage::CompactionResult, String> {
+        let mut cm = self.collection_manager.write();
+        let coll = cm.get_collection_mut(name)
+            .map_err(|e| format!("Collection '{}' not found: {}", name, e))?;
+
+        let segment_count = coll.segment_count();
+        let effective_min = if min_segments == 0 { 4 } else { min_segments };
+
+        if segment_count < effective_min {
+            return Err(format!("Only {} segments, need at least {} to compact", segment_count, effective_min));
+        }
+
+        let options = vf_storage::CompactionOptions {
+            min_segments_to_compact: effective_min,
+            remove_deleted,
+        };
+
+        coll.compact(options).map_err(|e| format!("Compaction failed: {}", e))
+    }
+
     /// Rebuild deferred operations for a collection after bulk insert.
     ///
     /// Checks which operations were deferred (index, metadata, graph) and
     /// rebuilds each one. Returns statistics about the optimization.
-    pub fn optimize_collection(&self, collection_name: &str) -> Result<OptimizeResult, String> {
+    pub fn optimize_collection(&self, collection_name: &str, rebuild_graph: bool) -> Result<OptimizeResult, String> {
         let start = Instant::now();
 
         // Check collection exists and get deferred flags.
@@ -440,7 +498,9 @@ impl AppState {
             let need_metadata = coll.deferred_metadata.load(Ordering::Acquire);
             let need_graph = coll.deferred_graph.load(Ordering::Acquire);
 
-            if !need_index && !need_metadata && !need_graph {
+            // Nothing to do if no deferred ops, or only graph is deferred but rebuild_graph is false.
+            let effective_graph = need_graph && rebuild_graph;
+            if !need_index && !need_metadata && !effective_graph {
                 return Ok(OptimizeResult {
                     status: "already_optimized".to_string(),
                     message: "nothing to optimize".to_string(),
@@ -518,8 +578,8 @@ impl AppState {
                 );
             }
 
-            // 3. Recompute virtual graph edges if deferred.
-            if need_graph {
+            // 3. Recompute virtual graph edges if deferred and rebuild_graph is requested.
+            if need_graph && rebuild_graph {
                 let vector_data = coll.index.iter_vectors();
                 let vector_ids: Vec<u64> = vector_data.iter().map(|(id, _)| *id).collect();
                 let vector_map: HashMap<u64, Vec<f32>> = vector_data.into_iter().collect();
@@ -541,6 +601,8 @@ impl AppState {
                 }
                 coll.graph = new_graph;
                 coll.deferred_graph.store(false, Ordering::Release);
+                coll.dirty.store(true, Ordering::Release);
+                coll.mutation_count.store(50_001, Ordering::Release);
                 tracing::info!(
                     collection = %collection_name,
                     "rebuilt virtual graph"
@@ -559,6 +621,31 @@ impl AppState {
             }
         }
 
+        // Auto-prune WAL after optimize.
+        if result.is_ok() && self.config.wal_prune_after_optimize {
+            match self.prune_wal_for_collection(collection_name) {
+                Ok((count, bytes)) => {
+                    if count > 0 {
+                        tracing::info!("Pruned {} WAL files ({} bytes) after optimize", count, bytes);
+                    }
+                }
+                Err(e) => tracing::warn!("WAL prune after optimize failed: {}", e),
+            }
+        }
+
+        // Auto-compact after optimize.
+        if result.is_ok() && self.config.auto_compact_after_optimize {
+            match self.compact_collection(collection_name, self.config.compaction_min_segments, true) {
+                Ok(result) => {
+                    tracing::info!("Auto-compacted {} segments into 1 ({} vectors)", result.segments_merged, result.vectors_written);
+                }
+                Err(e) => {
+                    // Not an error if too few segments.
+                    tracing::debug!("Auto-compact skipped: {}", e);
+                }
+            }
+        }
+
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -566,7 +653,7 @@ impl AppState {
                 let mut parts = Vec::new();
                 if need_index { parts.push("HNSW index"); }
                 if need_metadata { parts.push("metadata indexes"); }
-                if need_graph { parts.push("virtual graph"); }
+                if need_graph && rebuild_graph { parts.push("virtual graph"); }
 
                 Ok(OptimizeResult {
                     status: "completed".to_string(),

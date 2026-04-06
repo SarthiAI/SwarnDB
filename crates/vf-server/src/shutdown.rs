@@ -144,34 +144,39 @@ pub async fn graceful_shutdown(state: AppState) {
                 }
             }
 
-            // 2. Serialize and persist virtual graph base snapshot.
+            // 2. Serialize and persist virtual graph base snapshot (only if not deferred).
             {
-                let graph_path = collection_dir.join("graph.base");
-                let res = vf_storage::atomic_write::atomic_write_with_callback(
-                    &graph_path,
-                    |file| {
-                        vf_graph::serialize_base(&coll_state.graph, current_lsn, file)
-                            .map_err(|e| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("graph serialize error: {}", e),
-                                )
-                            })?;
-                        Ok(())
-                    },
-                );
-                match res {
-                    Ok(()) => {
-                        tracing::info!(collection = %name, "virtual graph snapshot persisted");
+                let graph_deferred = coll_state.deferred_graph.load(std::sync::atomic::Ordering::Acquire);
+                if !graph_deferred {
+                    let graph_path = collection_dir.join("graph.base");
+                    let res = vf_storage::atomic_write::atomic_write_with_callback(
+                        &graph_path,
+                        |file| {
+                            vf_graph::serialize_base(&coll_state.graph, current_lsn, file)
+                                .map_err(|e| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        format!("graph serialize error: {}", e),
+                                    )
+                                })?;
+                            Ok(())
+                        },
+                    );
+                    match res {
+                        Ok(()) => {
+                            tracing::info!(collection = %name, "virtual graph snapshot persisted");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                collection = %name,
+                                "failed to persist virtual graph: {}",
+                                e
+                            );
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            collection = %name,
-                            "failed to persist virtual graph: {}",
-                            e
-                        );
-                        continue;
-                    }
+                } else {
+                    tracing::info!(collection = %name, "skipping graph snapshot (deferred)");
                 }
             }
 

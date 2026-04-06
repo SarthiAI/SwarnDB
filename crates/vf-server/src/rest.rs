@@ -327,6 +327,8 @@ pub fn rest_router(state: AppState) -> Router {
         .route("/api/v1/collections/{collection}/vectors/{id}", delete(delete_vector))
         .route("/api/v1/collections/{collection}/vectors/bulk", post(bulk_insert))
         .route("/api/v1/collections/{collection}/optimize", post(optimize_collection))
+        .route("/api/v1/collections/{collection}/prune-wal", post(prune_wal_collection))
+        .route("/api/v1/collections/{collection}/compact", post(compact_collection))
         // Search
         .route("/api/v1/collections/{collection}/search", post(search))
         .route("/api/v1/search/batch", post(batch_search))
@@ -887,6 +889,14 @@ async fn bulk_insert(
 
 // ── Optimize handler ────────────────────────────────────────────────────
 
+#[derive(Deserialize)]
+struct OptimizeReq {
+    #[serde(default)]
+    rebuild_graph: bool,
+}
+
+fn default_true() -> bool { true }
+
 #[derive(Serialize)]
 struct OptimizeRes {
     status: String,
@@ -898,8 +908,10 @@ struct OptimizeRes {
 async fn optimize_collection(
     State(state): State<AppState>,
     Path(collection): Path<String>,
+    body: Option<Json<OptimizeReq>>,
 ) -> Result<Json<OptimizeRes>, (StatusCode, Json<ErrorResponse>)> {
-    match state.optimize_collection(&collection) {
+    let rebuild_graph = body.map_or(false, |b| b.rebuild_graph);
+    match state.optimize_collection(&collection, rebuild_graph) {
         Ok(result) => Ok(Json(OptimizeRes {
             status: result.status,
             message: result.message,
@@ -909,6 +921,65 @@ async fn optimize_collection(
         Err(e) if e.contains("not found") => Err(err(StatusCode::NOT_FOUND, e)),
         Err(e) if e.contains("already being optimized") => {
             Err(err(StatusCode::CONFLICT, e))
+        }
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+// ── WAL Prune handler ──────────────────────────────────────────────────
+
+async fn prune_wal_collection(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let start = std::time::Instant::now();
+
+    match state.prune_wal_for_collection(&collection) {
+        Ok((files_deleted, bytes_freed)) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            Ok(Json(serde_json::json!({
+                "status": "completed",
+                "files_deleted": files_deleted,
+                "bytes_freed": bytes_freed,
+                "duration_ms": duration_ms
+            })))
+        }
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+// ── Compact handler ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CompactReq {
+    #[serde(default = "default_zero_u32")]
+    min_segments: u32,
+    #[serde(default = "default_true")]
+    remove_deleted: bool,
+}
+
+fn default_zero_u32() -> u32 { 0 }
+
+async fn compact_collection(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    body: Option<Json<CompactReq>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let start = std::time::Instant::now();
+    let req = body.map(|b| b.0).unwrap_or(CompactReq { min_segments: 0, remove_deleted: true });
+
+    let min_segments = if req.min_segments == 0 { 4 } else { req.min_segments as usize };
+
+    match state.compact_collection(&collection, min_segments, req.remove_deleted) {
+        Ok(result) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            Ok(Json(serde_json::json!({
+                "status": "completed",
+                "segments_merged": result.segments_merged,
+                "vectors_written": result.vectors_written,
+                "vectors_removed": result.vectors_removed,
+                "duration_ms": duration_ms
+            })))
         }
         Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }

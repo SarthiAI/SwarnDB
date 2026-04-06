@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, List
 
 from ._proto import collection_pb2, vector_pb2
 from .exceptions import CollectionNotFoundError
-from .types import CollectionInfo, OptimizeResult
+from .types import CollectionInfo, CompactResult, OptimizeResult, PruneWALResult
 
 logger = logging.getLogger(__name__)
 
@@ -145,24 +145,17 @@ class CollectionAPI:
         except CollectionNotFoundError:
             return False
 
-    def optimize(self, collection: str) -> OptimizeResult:
-        """Rebuild deferred indexes, graph, and metadata indexes.
-
-        Call this after bulk inserting with ``defer_graph=True`` or
-        ``index_mode="deferred"`` to finalize the collection's indexes
-        and make all vectors searchable at full quality.
+    def optimize(self, collection: str, rebuild_graph: bool = False) -> OptimizeResult:
+        """Optimize a collection (rebuild deferred HNSW index).
 
         Args:
-            collection: Collection name to optimize.
-
-        Returns:
-            An OptimizeResult with status, message, duration, and
-            number of vectors processed.
-
-        Raises:
-            CollectionNotFoundError: If the collection does not exist.
+            collection: Collection name.
+            rebuild_graph: If True, also rebuild the virtual graph. Default False.
         """
-        request = vector_pb2.OptimizeRequest(collection=collection)
+        request = vector_pb2.OptimizeRequest(
+            collection=collection,
+            rebuild_graph=rebuild_graph,
+        )
         response = self._client._call(
             self._client._vector_stub.Optimize, request
         )
@@ -171,6 +164,47 @@ class CollectionAPI:
             message=response.message,
             duration_ms=response.duration_ms,
             vectors_processed=response.vectors_processed,
+        )
+
+    def prune_wal(self, collection: str) -> PruneWALResult:
+        """Prune old WAL files for a collection.
+
+        Removes write-ahead log files that are no longer needed after
+        data has been flushed to segments.
+        """
+        request = vector_pb2.PruneWALRequest(collection=collection)
+        response = self._client._call(
+            self._client._vector_stub.PruneWAL, request
+        )
+        return PruneWALResult(
+            status=response.status,
+            files_deleted=response.files_deleted,
+            bytes_freed=response.bytes_freed,
+            duration_ms=response.duration_ms,
+        )
+
+    def compact(self, collection: str, min_segments: int = 0, remove_deleted: bool = True) -> CompactResult:
+        """Compact collection segments into fewer, larger files.
+
+        Args:
+            collection: Collection name.
+            min_segments: Minimum segment count to trigger compaction. 0 = use server default (4).
+            remove_deleted: Whether to remove deleted vectors during compaction. Default True.
+        """
+        request = vector_pb2.CompactRequest(
+            collection=collection,
+            min_segments=min_segments,
+            remove_deleted=remove_deleted,
+        )
+        response = self._client._call(
+            self._client._vector_stub.Compact, request
+        )
+        return CompactResult(
+            status=response.status,
+            segments_merged=response.segments_merged,
+            vectors_written=response.vectors_written,
+            vectors_removed=response.vectors_removed,
+            duration_ms=response.duration_ms,
         )
 
     def get_status(self, collection: str) -> str:

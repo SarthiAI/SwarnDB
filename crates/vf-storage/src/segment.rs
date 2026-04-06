@@ -24,7 +24,6 @@ use vf_core::vector::VectorData;
 /// A sealed, immutable, read-only segment backed by a memory-mapped file.
 pub struct Segment {
     id: u64,
-    #[allow(dead_code)]
     path: PathBuf,
     mmap: Mmap,
     header: SegmentHeader,
@@ -83,6 +82,11 @@ impl Segment {
     /// Returns the number of vectors stored in this segment.
     pub fn vector_count(&self) -> u64 {
         self.header.vector_count
+    }
+
+    /// Returns the path to the segment file.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Returns the vector dimensionality.

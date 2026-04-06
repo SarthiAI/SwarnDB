@@ -12,9 +12,10 @@ use crate::proto::swarndb::v1::vector_service_server::VectorService;
 use std::sync::atomic::Ordering;
 
 use crate::proto::swarndb::v1::{
-    BulkInsertResponse, BulkInsertStreamMessage, DeleteVectorRequest, DeleteVectorResponse,
-    GetVectorRequest, GetVectorResponse, InsertRequest, InsertResponse, OptimizeRequest,
-    OptimizeResponse, UpdateRequest, UpdateResponse, Vector,
+    BulkInsertResponse, BulkInsertStreamMessage, CompactRequest, CompactResponse,
+    DeleteVectorRequest, DeleteVectorResponse, GetVectorRequest, GetVectorResponse,
+    InsertRequest, InsertResponse, OptimizeRequest, OptimizeResponse, PruneWalRequest,
+    PruneWalResponse, UpdateRequest, UpdateResponse, Vector,
     bulk_insert_stream_message::Payload,
 };
 use crate::state::{AppState, CollectionStatus};
@@ -756,7 +757,7 @@ impl VectorService for VectorServiceImpl {
             return Err(Status::invalid_argument("collection name is required"));
         }
 
-        match self.state.optimize_collection(&req.collection) {
+        match self.state.optimize_collection(&req.collection, req.rebuild_graph) {
             Ok(result) => Ok(Response::new(OptimizeResponse {
                 status: result.status,
                 message: result.message,
@@ -766,6 +767,52 @@ impl VectorService for VectorServiceImpl {
             Err(e) if e.contains("not found") => Err(Status::not_found(e)),
             Err(e) if e.contains("already being optimized") => {
                 Err(Status::failed_precondition(e))
+            }
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
+
+    async fn prune_wal(
+        &self,
+        request: Request<PruneWalRequest>,
+    ) -> Result<Response<PruneWalResponse>, Status> {
+        let req = request.into_inner();
+        let start = std::time::Instant::now();
+
+        match self.state.prune_wal_for_collection(&req.collection) {
+            Ok((files_deleted, bytes_freed)) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                Ok(Response::new(PruneWalResponse {
+                    status: "completed".to_string(),
+                    files_deleted: files_deleted as u64,
+                    bytes_freed,
+                    duration_ms,
+                }))
+            }
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
+
+    async fn compact(
+        &self,
+        request: Request<CompactRequest>,
+    ) -> Result<Response<CompactResponse>, Status> {
+        let req = request.into_inner();
+        let start = std::time::Instant::now();
+
+        let min_segments = if req.min_segments == 0 { 4 } else { req.min_segments as usize };
+        let remove_deleted = req.remove_deleted;
+
+        match self.state.compact_collection(&req.collection, min_segments, remove_deleted) {
+            Ok(result) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                Ok(Response::new(CompactResponse {
+                    status: "completed".to_string(),
+                    segments_merged: result.segments_merged as u64,
+                    vectors_written: result.vectors_written,
+                    vectors_removed: result.vectors_removed,
+                    duration_ms,
+                }))
             }
             Err(e) => Err(Status::internal(e)),
         }
