@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
+use rayon::prelude::*;
 
 use vf_core::distance::DistanceMetric;
 use vf_core::types::{
@@ -186,18 +187,39 @@ impl QuantizedHnswIndex {
         let scales = quantizer.scales();
         let min_vals = quantizer.min_vals().to_vec();
 
-        // 5. Batch quantize all vectors into the QuantizedArena.
+        // 5. Encode every vector in parallel (heavy work), then push
+        //    sequentially into the arena (push is not thread-safe).
+        let encoded: Vec<Vec<u8>> = vectors
+            .par_iter()
+            .map(|(_, vec)| {
+                quantizer
+                    .quantize(vec)
+                    .expect("quantize failed for trained quantizer")
+            })
+            .collect();
+
         let mut codes = QuantizedArena::with_capacity(self.dimension, vectors.len());
         let mut code_slots = HashMap::with_capacity(vectors.len());
-        for (id, vec) in &vectors {
-            let code = quantizer
-                .quantize(vec)
-                .expect("quantize failed for trained quantizer");
-            let slot = codes.push(&code);
+        let mut slot_ids: Vec<VectorId> = Vec::with_capacity(vectors.len());
+        for ((id, _), code) in vectors.iter().zip(encoded.iter()) {
+            let slot = codes.push(code);
             code_slots.insert(*id, slot);
+            slot_ids.push(*id);
         }
 
-        // 6. Store everything under write locks.
+        // 6. Persist quantizer state and codes to disk so the next restart
+        //    can take the fast path. Failure to persist is logged but
+        //    non-fatal — the in-memory state is still valid.
+        let quantizer_path = data_dir.join("quantizer.json");
+        if let Err(e) = quantizer.save_to_path(&quantizer_path) {
+            log::warn!("failed to persist quantizer.json: {e}");
+        }
+        let codes_path = data_dir.join("codes.bin");
+        if let Err(e) = codes.save_to_path(&codes_path, &slot_ids) {
+            log::warn!("failed to persist codes.bin: {e}");
+        }
+
+        // 7. Store everything under write locks.
         *self.quantizer.write() = Some(quantizer);
         *self.codes.write() = codes;
         *self.code_slots.write() = code_slots;
@@ -205,9 +227,154 @@ impl QuantizedHnswIndex {
         *self.cached_scales.write() = scales;
         *self.cached_min_vals.write() = min_vals;
 
-        // 7. Free f32 vectors from RAM — graph topology is preserved.
+        // 8. Free f32 vectors from RAM — graph topology is preserved.
         self.hnsw.clear_arena();
         self.trained.store(true, Ordering::Release);
+    }
+
+    /// Recovery fast-path: build a `QuantizedHnswIndex` from a previously
+    /// persisted `quantizer.json` + `codes.bin` + `vectors.mmap` triple,
+    /// avoiding any retraining or re-encoding.
+    ///
+    /// Returns:
+    /// - `Ok(Some(index))` if all three artefacts exist, are valid, and
+    ///   match the HNSW topology in size and dimension.
+    /// - `Ok(None)` if any artefact is missing or fails validation —
+    ///   the caller should fall back to `train_quantizer`.
+    /// - `Err(io::Error)` only on hard IO errors that should not be
+    ///   silently ignored.
+    pub fn from_persisted(
+        hnsw: HnswIndex,
+        metric: DistanceMetricType,
+        config: ScalarQuantizationConfig,
+        data_dir: &Path,
+    ) -> Result<Option<Self>, std::io::Error> {
+        let quantizer_path = data_dir.join("quantizer.json");
+        let codes_path = data_dir.join("codes.bin");
+        let mmap_path = data_dir.join("vectors.mmap");
+
+        if !quantizer_path.exists() || !codes_path.exists() || !mmap_path.exists() {
+            return Ok(None);
+        }
+
+        let dimension = hnsw.dimension();
+        let hnsw_count = hnsw.vector_count();
+
+        // 1. Load the quantizer state.
+        let quantizer = match ScalarQuantizer::load_from_path(&quantizer_path) {
+            Ok(q) => q,
+            Err(e) => {
+                log::warn!(
+                    "SQ8 fast-path: failed to load quantizer.json ({e}); falling back to retrain"
+                );
+                return Ok(None);
+            }
+        };
+        if quantizer.dimension() != dimension {
+            log::warn!(
+                "SQ8 fast-path: quantizer dimension {} != hnsw dimension {}; falling back",
+                quantizer.dimension(),
+                dimension
+            );
+            return Ok(None);
+        }
+
+        // 2. Load the persisted codes + slot→id table.
+        let (codes, slot_ids) = match QuantizedArena::load_from_path(&codes_path, dimension) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!(
+                    "SQ8 fast-path: failed to load codes.bin ({e}); falling back to retrain"
+                );
+                return Ok(None);
+            }
+        };
+        if codes.len() != hnsw_count {
+            log::warn!(
+                "SQ8 fast-path: codes.bin count {} != hnsw vector_count {}; falling back",
+                codes.len(),
+                hnsw_count
+            );
+            return Ok(None);
+        }
+        if slot_ids.len() != codes.len() {
+            log::warn!(
+                "SQ8 fast-path: codes.bin slot_ids length mismatch; falling back"
+            );
+            return Ok(None);
+        }
+
+        // Sanity-check that every persisted ID is still present in the HNSW.
+        for &id in &slot_ids {
+            if !hnsw.contains(id) {
+                log::warn!(
+                    "SQ8 fast-path: persisted code references unknown id {id}; falling back"
+                );
+                return Ok(None);
+            }
+        }
+
+        // 3. Build the code_slots map from the persisted slot→id table.
+        let mut code_slots: HashMap<VectorId, usize> = HashMap::with_capacity(slot_ids.len());
+        for (slot, id) in slot_ids.iter().enumerate() {
+            code_slots.insert(*id, slot);
+        }
+        // Reject duplicates: the HashMap dedupes silently, so a shorter map
+        // means slot_ids contained duplicate ids and the persisted state is
+        // inconsistent.
+        if code_slots.len() != hnsw_count {
+            log::warn!(
+                "SQ8 fast-path: persisted slot table has duplicate ids ({} unique vs {} slots); falling back",
+                code_slots.len(),
+                hnsw_count
+            );
+            return Ok(None);
+        }
+
+        // 4. Open the existing on-disk f32 vector store (no rebuild).
+        let mmap_store = match MmapVectorStore::from_file(&mmap_path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "SQ8 fast-path: failed to open vectors.mmap ({e}); falling back to retrain"
+                );
+                return Ok(None);
+            }
+        };
+        // The mmap store and codes table must agree on the vector count;
+        // otherwise rescore would silently return wrong results for missing
+        // ids.
+        if mmap_store.len() != hnsw_count {
+            log::warn!(
+                "SQ8 fast-path: vectors.mmap count {} != hnsw vector_count {}; falling back",
+                mmap_store.len(),
+                hnsw_count
+            );
+            return Ok(None);
+        }
+
+        // 5. Cache SIMD scratch and clear the HNSW f32 arena (we never need it).
+        let scales = quantizer.scales();
+        let min_vals = quantizer.min_vals().to_vec();
+        hnsw.clear_arena();
+
+        let index = Self {
+            hnsw,
+            quantizer: RwLock::new(Some(quantizer)),
+            codes: RwLock::new(codes),
+            code_slots: RwLock::new(code_slots),
+            mmap_store: RwLock::new(Some(mmap_store)),
+            config,
+            metric,
+            distance_fn: DistanceMetric::from_metric_type(metric),
+            dimension,
+            trained: AtomicBool::new(true),
+            cached_scales: RwLock::new(scales),
+            cached_min_vals: RwLock::new(min_vals),
+            data_dir: RwLock::new(Some(data_dir.to_path_buf())),
+        };
+
+        Ok(Some(index))
     }
 
     // ── Asymmetric distance ─────────────────────────────────────────────

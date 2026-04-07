@@ -233,13 +233,51 @@ impl AppState {
                         // Wrap in QuantizedHnswIndex if quantization is configured.
                         match &config.quantization_config {
                             Some(QuantizationConfig::Scalar(sq_config)) => {
-                                let q_index = QuantizedHnswIndex::from_existing_hnsw(
+                                let q_index = match QuantizedHnswIndex::from_persisted(
                                     hnsw_idx,
                                     distance_metric,
                                     sq_config.clone(),
-                                );
-                                q_index.set_data_dir(collection_dir.clone());
-                                q_index.train_quantizer(&collection_dir);
+                                    &collection_dir,
+                                )
+                                .map_err(|e| format!("sq8 fast-path load failed: {e}"))?
+                                {
+                                    Some(idx) => {
+                                        tracing::info!(
+                                            collection = %name,
+                                            "SQ8 fast-path recovery: loaded quantizer.json + codes.bin"
+                                        );
+                                        idx
+                                    }
+                                    None => {
+                                        // Fast path unavailable: fall back to cold retrain.
+                                        // We must rebuild the HNSW because from_persisted
+                                        // consumed the previous instance.
+                                        let snapshot =
+                                            deserialize_topology_mmap(&hnsw_path).map_err(
+                                                |e| format!("hnsw base reload failed: {e}"),
+                                            )?;
+                                        let arena =
+                                            build_arena_from_topology(&vectors, &snapshot);
+                                        let hnsw_idx =
+                                            HnswIndex::restore_from_topology(snapshot, arena)
+                                                .map_err(|e| {
+                                                    format!("hnsw restore failed: {e}")
+                                                })?;
+                                        tracing::info!(
+                                            collection = %name,
+                                            vectors = vector_count,
+                                            "SQ8 cold recovery: training quantizer + encoding (parallelized)"
+                                        );
+                                        let idx = QuantizedHnswIndex::from_existing_hnsw(
+                                            hnsw_idx,
+                                            distance_metric,
+                                            sq_config.clone(),
+                                        );
+                                        idx.set_data_dir(collection_dir.clone());
+                                        idx.train_quantizer(&collection_dir);
+                                        idx
+                                    }
+                                };
                                 Ok(Box::new(q_index))
                             }
                             None => Ok(Box::new(hnsw_idx)),
@@ -248,6 +286,15 @@ impl AppState {
 
                     // Try loading graph base snapshot.
                     let graph_result = (|| -> Result<VirtualGraph, String> {
+                        if !graph_path.exists() {
+                            // No graph base persisted (collection uses defer_graph=true).
+                            // Initialize an empty graph using the collection's configured threshold.
+                            let g = match config.default_similarity_threshold {
+                                Some(t) if t > 0.0 => VirtualGraph::with_threshold(t, config.distance_metric),
+                                _ => VirtualGraph::with_threshold(0.7, config.distance_metric),
+                            };
+                            return Ok(g);
+                        }
                         let mut file = std::fs::File::open(&graph_path)
                             .map_err(|e| format!("graph base open failed: {e}"))?;
                         let (_lsn, graph) = deserialize_graph_base(&mut file)
@@ -304,33 +351,90 @@ impl AppState {
                         // Wrap in QuantizedHnswIndex if quantization is configured.
                         let idx: Box<dyn PersistableIndex> = match &config.quantization_config {
                             Some(QuantizationConfig::Scalar(sq_config)) => {
-                                let q_index = QuantizedHnswIndex::from_existing_hnsw(
+                                let q_index = match QuantizedHnswIndex::from_persisted(
                                     hnsw_idx,
                                     distance_metric,
                                     sq_config.clone(),
-                                );
-                                q_index.set_data_dir(collection_dir.clone());
-                                q_index.train_quantizer(&collection_dir);
+                                    &collection_dir,
+                                )
+                                .map_err(|e| format!("sq8 fast-path load failed: {e}"))?
+                                {
+                                    Some(idx) => {
+                                        tracing::info!(
+                                            collection = %name,
+                                            "SQ8 fast-path recovery: loaded quantizer.json + codes.bin"
+                                        );
+                                        idx
+                                    }
+                                    None => {
+                                        // Fast path unavailable: rebuild HNSW (consumed)
+                                        // and run cold recovery training.
+                                        let mut snapshot =
+                                            deserialize_topology_mmap(&hnsw_path).map_err(
+                                                |e| format!("hnsw base reload failed: {e}"),
+                                            )?;
+                                        let base_lsn = snapshot.snapshot_lsn;
+                                        if hnsw_delta_path.exists() {
+                                            let _ = vf_index::hnsw_delta::replay_delta_after_lsn(
+                                                &mut snapshot,
+                                                &hnsw_delta_path,
+                                                base_lsn,
+                                            )
+                                            .map_err(|e| {
+                                                format!("hnsw delta replay failed: {e}")
+                                            })?;
+                                        }
+                                        let arena =
+                                            build_arena_from_topology(&vectors, &snapshot);
+                                        let hnsw_idx =
+                                            HnswIndex::restore_from_topology(snapshot, arena)
+                                                .map_err(|e| {
+                                                    format!("hnsw restore failed: {e}")
+                                                })?;
+                                        tracing::info!(
+                                            collection = %name,
+                                            vectors = vector_count,
+                                            "SQ8 cold recovery: training quantizer + encoding (parallelized)"
+                                        );
+                                        let idx = QuantizedHnswIndex::from_existing_hnsw(
+                                            hnsw_idx,
+                                            distance_metric,
+                                            sq_config.clone(),
+                                        );
+                                        idx.set_data_dir(collection_dir.clone());
+                                        idx.train_quantizer(&collection_dir);
+                                        idx
+                                    }
+                                };
                                 Box::new(q_index)
                             }
                             None => Box::new(hnsw_idx),
                         };
 
-                        // Load graph base and replay delta.
-                        let mut file = std::fs::File::open(&graph_path)
-                            .map_err(|e| format!("graph base open failed: {e}"))?;
-                        let (graph_base_lsn, mut graph) = deserialize_graph_base(&mut file)
-                            .map_err(|e| format!("graph base load failed: {e}"))?;
+                        // Load graph base and replay delta. If graph.base is missing
+                        // (defer_graph=true), initialize an empty graph and skip replay.
+                        let graph = if graph_path.exists() {
+                            let mut file = std::fs::File::open(&graph_path)
+                                .map_err(|e| format!("graph base open failed: {e}"))?;
+                            let (graph_base_lsn, mut graph) = deserialize_graph_base(&mut file)
+                                .map_err(|e| format!("graph base load failed: {e}"))?;
 
-                        if graph_delta_path.exists() {
-                            let replayed = vf_graph::graph_delta::replay_delta_after_lsn(
-                                &mut graph, &graph_delta_path, graph_base_lsn,
-                            ).map_err(|e| format!("graph delta replay failed: {e}"))?;
-                            tracing::info!(
-                                collection = %name,
-                                "replayed graph delta, entries: {replayed}"
-                            );
-                        }
+                            if graph_delta_path.exists() {
+                                let replayed = vf_graph::graph_delta::replay_delta_after_lsn(
+                                    &mut graph, &graph_delta_path, graph_base_lsn,
+                                ).map_err(|e| format!("graph delta replay failed: {e}"))?;
+                                tracing::info!(
+                                    collection = %name,
+                                    "replayed graph delta, entries: {replayed}"
+                                );
+                            }
+                            graph
+                        } else {
+                            match config.default_similarity_threshold {
+                                Some(t) if t > 0.0 => VirtualGraph::with_threshold(t, config.distance_metric),
+                                _ => VirtualGraph::with_threshold(0.7, config.distance_metric),
+                            }
+                        };
 
                         Ok((idx, graph))
                     })();

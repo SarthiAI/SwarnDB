@@ -2297,6 +2297,7 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "vf-core",

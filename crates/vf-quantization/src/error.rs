@@ -18,4 +18,13 @@ pub enum QuantizationError {
 
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("corrupt persisted state: {0}")]
+    Corrupt(String),
 }

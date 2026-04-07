@@ -9,6 +9,16 @@
 //! instead of `f32` vectors. Each slot holds exactly `dimension` bytes
 //! (one byte per original vector dimension after SQ8 quantization).
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::Path;
+
+use vf_core::types::VectorId;
+
+const SQ8C_MAGIC: &[u8; 4] = b"SQ8C";
+const SQ8C_VERSION: u32 = 1;
+const SQ8C_HEADER_SIZE: usize = 16;
+
 /// Contiguous u8 storage for scalar-quantized vector codes.
 ///
 /// Each slot stores `dimension` bytes. Slot `i` occupies
@@ -129,6 +139,167 @@ impl QuantizedArena {
         // struct fields (dimension, slot_count, 3 Vec headers)
         let struct_overhead = std::mem::size_of::<Self>();
         data_bytes + free_list_bytes + struct_overhead
+    }
+
+    /// Total number of slots (including freed ones still in the buffer).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.slot_count
+    }
+
+    /// Whether the arena holds zero slots.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.slot_count == 0
+    }
+
+    /// Atomically persist the arena's u8 codes plus a slot→VectorId mapping
+    /// to disk.
+    ///
+    /// Format: 16-byte header `[magic "SQ8C", version u32 LE, count u32 LE,
+    /// dim u32 LE]` followed by `count * 8` bytes of `VectorId` (one id per
+    /// slot) followed by `count * dim` raw u8 code bytes.
+    ///
+    /// `slot_ids[i]` is the VectorId stored in slot `i`. The arena must
+    /// currently be free-list-empty (i.e. no holes); recovery does not
+    /// support sparse slots — call `compact()` first if needed.
+    pub fn save_to_path(
+        &self,
+        path: &Path,
+        slot_ids: &[VectorId],
+    ) -> Result<(), io::Error> {
+        if slot_ids.len() != self.slot_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "slot_ids length {} does not match slot_count {}",
+                    slot_ids.len(),
+                    self.slot_count
+                ),
+            ));
+        }
+        if !self.free_slots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot persist QuantizedArena with non-empty free list",
+            ));
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let tmp_path = path.with_extension("tmp");
+        let _ = fs::remove_file(&tmp_path);
+
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+
+            file.write_all(SQ8C_MAGIC)?;
+            file.write_all(&SQ8C_VERSION.to_le_bytes())?;
+            file.write_all(&(self.slot_count as u32).to_le_bytes())?;
+            file.write_all(&(self.dimension as u32).to_le_bytes())?;
+
+            for id in slot_ids {
+                file.write_all(&id.to_le_bytes())?;
+            }
+            file.write_all(&self.data[..self.slot_count * self.dimension])?;
+
+            file.sync_data()?;
+        }
+
+        fs::rename(&tmp_path, path)?;
+
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load a previously persisted arena (and its slot→VectorId mapping)
+    /// from disk.
+    ///
+    /// Validates magic, version, and dimension. Returns `InvalidData` on
+    /// any mismatch or short read. The returned `Vec<VectorId>` is indexed
+    /// by slot number.
+    pub fn load_from_path(
+        path: &Path,
+        dimension: usize,
+    ) -> Result<(Self, Vec<VectorId>), io::Error> {
+        let mut file = File::open(path)?;
+        let mut header = [0u8; SQ8C_HEADER_SIZE];
+        file.read_exact(&mut header)?;
+
+        if &header[0..4] != SQ8C_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid magic bytes: not an SQ8C file",
+            ));
+        }
+
+        let version = u32::from_le_bytes(header[4..8].try_into().expect("slice len"));
+        if version != SQ8C_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported SQ8C version {version}"),
+            ));
+        }
+
+        let count = u32::from_le_bytes(header[8..12].try_into().expect("slice len")) as usize;
+        let stored_dim =
+            u32::from_le_bytes(header[12..16].try_into().expect("slice len")) as usize;
+
+        if stored_dim != dimension {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SQ8C dimension mismatch: file has {stored_dim}, expected {dimension}"
+                ),
+            ));
+        }
+
+        // Read slot→id table.
+        let id_bytes = count * 8;
+        let mut id_buf = vec![0u8; id_bytes];
+        file.read_exact(&mut id_buf)?;
+        let mut slot_ids: Vec<VectorId> = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = i * 8;
+            let id = u64::from_le_bytes(id_buf[off..off + 8].try_into().expect("slice len"));
+            slot_ids.push(id);
+        }
+
+        // Read codes body.
+        let expected_bytes = count * dimension;
+        let mut data = Vec::with_capacity(expected_bytes);
+        file.read_to_end(&mut data)?;
+
+        if data.len() != expected_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SQ8C body length mismatch: expected {expected_bytes} bytes, got {}",
+                    data.len()
+                ),
+            ));
+        }
+
+        Ok((
+            Self {
+                data,
+                dimension,
+                slot_count: count,
+                free_slots: Vec::new(),
+            },
+            slot_ids,
+        ))
     }
 }
 

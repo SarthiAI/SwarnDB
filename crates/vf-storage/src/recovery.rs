@@ -362,9 +362,9 @@ pub fn plan_recovery(collection_name: &str, collection_dir: &Path) -> Collection
     let has_hnsw_delta = collection_dir.join("hnsw.delta").exists();
     let has_graph_delta = collection_dir.join("graph.delta").exists();
 
-    let strategy = if has_shutdown_clean && has_hnsw_base && has_graph_base {
+    let strategy = if has_shutdown_clean && has_hnsw_base {
         RecoveryStrategy::CleanShutdown
-    } else if has_hnsw_base && has_graph_base {
+    } else if has_hnsw_base {
         RecoveryStrategy::IncrementalReplay {
             hnsw_base_lsn: 0, // caller will read actual LSN from files
             graph_base_lsn: 0,

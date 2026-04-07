@@ -10,6 +10,7 @@ description = "Quantization codecs (scalar, product, binary) for SwarnDB"
 [dependencies]
 vf-core = { path = "../vf-core" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }

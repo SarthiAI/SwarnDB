@@ -3,10 +3,25 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::QuantizationError;
+
+const PERSIST_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedScalarQuantizer {
+    version: u32,
+    dimension: usize,
+    bits: u8,
+    min_vals: Vec<f32>,
+    max_vals: Vec<f32>,
+}
 
 /// Scalar quantizer that maps each f32 dimension to a u8 value [0, 255].
 ///
@@ -229,25 +244,24 @@ impl ScalarQuantizer {
         let low_idx = ((1.0 - quantile) / 2.0 * n as f32) as usize;
         let high_idx = (n - 1).min(((1.0 + quantile) / 2.0 * n as f32) as usize);
 
+        // Parallelize across dimensions: each thread sorts its own dim_values buffer.
+        let bounds: Vec<(f32, f32)> = (0..self.dimension)
+            .into_par_iter()
+            .map(|d| {
+                let mut dim_values: Vec<f32> = vectors.iter().map(|v| v[d]).collect();
+                dim_values
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                (dim_values[low_idx], dim_values[high_idx])
+            })
+            .collect();
+
         let mut min_vals = vec![0.0f32; self.dimension];
         let mut max_vals = vec![0.0f32; self.dimension];
-
-        // For each dimension, collect all values, sort, and pick percentile bounds
-        let mut dim_values = vec![0.0f32; n];
-        for d in 0..self.dimension {
-            for (i, v) in vectors.iter().enumerate() {
-                dim_values[i] = v[d];
-            }
-            dim_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-            min_vals[d] = dim_values[low_idx];
-            max_vals[d] = dim_values[high_idx];
-        }
-
-        // Compute ranges, handle zero-range case
         let mut ranges = vec![0.0f32; self.dimension];
-        for d in 0..self.dimension {
-            let range = max_vals[d] - min_vals[d];
+        for (d, (lo, hi)) in bounds.into_iter().enumerate() {
+            min_vals[d] = lo;
+            max_vals[d] = hi;
+            let range = hi - lo;
             ranges[d] = if range == 0.0 { 1.0 } else { range };
         }
 
@@ -287,5 +301,89 @@ impl ScalarQuantizer {
     /// Returns precomputed scales (ranges / 255.0) for SIMD distance functions.
     pub fn scales(&self) -> Vec<f32> {
         self.ranges.iter().map(|r| r / 255.0).collect()
+    }
+
+    /// Atomically persist the trained quantizer state to a JSON file.
+    pub fn save_to_path(&self, path: &Path) -> Result<(), QuantizationError> {
+        if !self.trained {
+            return Err(QuantizationError::NotTrained);
+        }
+
+        let payload = PersistedScalarQuantizer {
+            version: PERSIST_VERSION,
+            dimension: self.dimension,
+            bits: 8,
+            min_vals: self.min_vals.clone(),
+            max_vals: self.max_vals.clone(),
+        };
+
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|e| QuantizationError::Serialization(e.to_string()))?;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let tmp_path = path.with_extension("tmp");
+        let _ = fs::remove_file(&tmp_path);
+
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
+
+        fs::rename(&tmp_path, path)?;
+
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load a previously persisted quantizer state from a JSON file.
+    pub fn load_from_path(path: &Path) -> Result<Self, QuantizationError> {
+        let bytes = fs::read(path)?;
+        let payload: PersistedScalarQuantizer = serde_json::from_slice(&bytes)
+            .map_err(|e| QuantizationError::Serialization(e.to_string()))?;
+
+        if payload.version != PERSIST_VERSION {
+            return Err(QuantizationError::Corrupt(format!(
+                "unsupported quantizer file version {}",
+                payload.version
+            )));
+        }
+        if payload.bits != 8 {
+            return Err(QuantizationError::Corrupt(format!(
+                "unsupported quantizer bits {}",
+                payload.bits
+            )));
+        }
+        if payload.dimension == 0 {
+            return Err(QuantizationError::Corrupt("dimension is zero".into()));
+        }
+        if payload.min_vals.len() != payload.dimension
+            || payload.max_vals.len() != payload.dimension
+        {
+            return Err(QuantizationError::Corrupt(format!(
+                "min/max length mismatch: dim={} min={} max={}",
+                payload.dimension,
+                payload.min_vals.len(),
+                payload.max_vals.len()
+            )));
+        }
+
+        Ok(Self::from_trained(
+            payload.dimension,
+            payload.min_vals,
+            payload.max_vals,
+        ))
     }
 }
