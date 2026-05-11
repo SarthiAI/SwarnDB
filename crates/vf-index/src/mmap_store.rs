@@ -536,7 +536,10 @@ mod tests {
 
         let result = MmapVectorStore::from_file(&path);
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
         assert!(err.to_string().contains("invalid magic"));
     }
 

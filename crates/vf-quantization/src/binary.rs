@@ -3,7 +3,7 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
-//! Binary Quantization (BQ) — encodes each vector dimension as a single bit.
+//! Binary Quantization (BQ) - encodes each vector dimension as a single bit.
 //!
 //! BQ is the most aggressive quantization: 32x compression vs f32.
 //! It's extremely fast for first-pass filtering via Hamming distance,

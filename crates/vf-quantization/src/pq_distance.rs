@@ -289,7 +289,7 @@ impl PqDistanceTable {
     ///
     /// Uses SIMD gather (AVX2 `_mm256_i32gather_ps`) to fetch 8 table entries
     /// at once when available, with automatic scalar fallback on other platforms.
-    /// This is the sum of `M` table lookups — extremely fast (no floating-point
+    /// This is the sum of `M` table lookups - extremely fast (no floating-point
     /// arithmetic beyond addition).
     #[inline]
     pub fn distance(&self, codes: &[u8]) -> f32 {

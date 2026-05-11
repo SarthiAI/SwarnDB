@@ -201,7 +201,7 @@ impl TieredVectorStore {
                 // Can only demote to warm if warm mmap has this vector's offset.
                 // Update tier_map BEFORE removing from hot so concurrent get()
                 // sees consistent state (tier says Warm while data is still in hot
-                // is safe; the reverse — data gone but tier still Hot — is not).
+                // is safe; the reverse - data gone but tier still Hot - is not).
                 if self.warm_offsets.contains_key(&id) {
                     self.tier_map.insert(id, StorageTier::Warm);
                     self.hot.remove(&id);

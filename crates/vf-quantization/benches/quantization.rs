@@ -52,7 +52,7 @@ fn trained_bq(dim: usize, vectors: &[Vec<f32>]) -> BinaryQuantizer {
 }
 
 // ---------------------------------------------------------------------------
-// (1) Quantization Throughput — encode/decode speed
+// (1) Quantization Throughput - encode/decode speed
 // ---------------------------------------------------------------------------
 
 fn bench_quantization_throughput(c: &mut Criterion) {
@@ -124,7 +124,7 @@ fn bench_quantization_throughput(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// (2) Distance Computation — quantized vs full-precision
+// (2) Distance Computation - quantized vs full-precision
 // ---------------------------------------------------------------------------
 
 fn bench_distance_computation(c: &mut Criterion) {
@@ -244,7 +244,7 @@ fn bench_distance_computation(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// (3) Memory Comparison — formatted table of bytes-per-vector
+// (3) Memory Comparison - formatted table of bytes-per-vector
 // ---------------------------------------------------------------------------
 
 fn bench_memory_comparison(c: &mut Criterion) {

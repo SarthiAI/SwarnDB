@@ -315,7 +315,7 @@ impl InMemoryVectorStore {
     }
 
     /// Bulk insert multiple vectors. Stops on first error.
-    /// Note: This is NOT transactional — records inserted before an error remain in the store.
+    /// Note: This is NOT transactional - records inserted before an error remain in the store.
     pub fn insert_batch(
         &self,
         records: Vec<VectorRecord>,

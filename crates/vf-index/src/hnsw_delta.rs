@@ -3,7 +3,7 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
-//! HNSW Delta Log — append-only mutation journal between base snapshots.
+//! HNSW Delta Log - append-only mutation journal between base snapshots.
 //!
 //! Records graph mutations (add/remove node, set neighbors, set entry point)
 //! as compact binary entries. Recovery = load base snapshot + replay delta.

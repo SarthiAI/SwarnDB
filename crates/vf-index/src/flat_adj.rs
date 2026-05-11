@@ -177,7 +177,7 @@ impl FlatAdjacencyList {
 
     /// Returns the neighbors of `id` at the given `layer` as a contiguous slice.
     ///
-    /// This is an O(1) operation — just pointer arithmetic into the flat buffer.
+    /// This is an O(1) operation - just pointer arithmetic into the flat buffer.
     /// Returns `None` if the node doesn't exist, is deleted, or the layer is out of range.
     pub fn get_neighbors(&self, id: VectorId, layer: usize) -> Option<&[VectorId]> {
         let layout = self.index.get(&id)?;
@@ -217,7 +217,7 @@ impl FlatAdjacencyList {
         let old_count = layout.layer_sizes[layer] as usize;
 
         if neighbors.len() == old_count {
-            // In-place update — same size, just overwrite the slice.
+            // In-place update - same size, just overwrite the slice.
             let start = layout.offset as usize
                 + layout.layer_sizes[..layer]
                     .iter()
@@ -227,7 +227,7 @@ impl FlatAdjacencyList {
             return true;
         }
 
-        // Size changed — collect all layer data, mark old space as gap, re-append.
+        // Size changed - collect all layer data, mark old space as gap, re-append.
         let num_layers = layout.num_layers as usize;
         let old_total = layout.total_size() as usize;
         let mut all_layers: Vec<Vec<VectorId>> = Vec::with_capacity(num_layers);
@@ -307,7 +307,7 @@ impl FlatAdjacencyList {
     ///
     /// In `Inline` mode, compaction runs immediately and `true` is returned.
     /// In `Deferred` mode, the `needs_compaction` flag is set and `false` is
-    /// returned — the caller should later invoke `run_deferred_compaction()`.
+    /// returned - the caller should later invoke `run_deferred_compaction()`.
     pub fn maybe_compact(&mut self) -> bool {
         if self.fragmentation_ratio() > self.fragmentation_threshold {
             match self.compaction_mode {
@@ -543,7 +543,7 @@ mod tests {
         adj.insert_node(1, &[&[10, 20, 30]]); // 3 slots
         assert_eq!(adj.wasted_slot_count(), 0);
 
-        // Resize from 3 to 2 — old 3 slots become wasted.
+        // Resize from 3 to 2 - old 3 slots become wasted.
         adj.set_neighbors(1, 0, &[100, 200]);
         assert_eq!(adj.wasted_slot_count(), 3);
         // Buffer: 3 (old dead) + 2 (new) = 5 total.

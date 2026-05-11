@@ -22,10 +22,10 @@ pub struct KMeansResult {
 /// Run k-means clustering on the given data.
 ///
 /// # Arguments
-/// * `data` — training subvectors (each slice has the same dimensionality)
-/// * `k` — number of clusters (typically 256 for PQ so codes fit in u8)
-/// * `max_iters` — maximum Lloyd iterations before stopping
-/// * `seed` — RNG seed for reproducible k-means++ initialization
+/// * `data` - training subvectors (each slice has the same dimensionality)
+/// * `k` - number of clusters (typically 256 for PQ so codes fit in u8)
+/// * `max_iters` - maximum Lloyd iterations before stopping
+/// * `seed` - RNG seed for reproducible k-means++ initialization
 ///
 /// # Panics
 /// Panics if `data` is empty or `k` is 0.

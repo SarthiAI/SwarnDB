@@ -9,12 +9,12 @@ Real-world scenario: document embeddings pipeline where new documents arrive
 continuously and must survive restarts without loss.
 
 Usage:
-    # Phase 1 — insert data and save expectations
+    # Phase 1: insert data and save expectations
     python test_persistence_delta.py --phase before
 
     # (restart SwarnDB server here)
 
-    # Phase 2 — verify all data survived the restart
+    # Phase 2: verify all data survived the restart
     python test_persistence_delta.py --phase after
 """
 

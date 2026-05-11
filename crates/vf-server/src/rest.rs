@@ -420,6 +420,28 @@ async fn create_collection(
         quantization_config,
     };
 
+    // Check for duplicate in-memory BEFORE persisting to storage
+    {
+        let collections = state.collections.read();
+        if collections.contains_key(&req.name) {
+            return Err(err(StatusCode::CONFLICT, format!("collection '{}' already exists", req.name)));
+        }
+    }
+
+    // Persist to storage layer first so collection_dir is available for set_data_dir.
+    {
+        let mut cm = state.collection_manager.write();
+        if let Err(e) = cm.create_collection(config.clone()) {
+            let msg = e.to_string();
+            // Storage layer may report duplicate via existing config.json.
+            let lower = msg.to_lowercase();
+            if lower.contains("already exists") || lower.contains("exists") {
+                return Err(err(StatusCode::CONFLICT, format!("collection '{}' already exists", req.name)));
+            }
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("storage create failed: {}", msg)));
+        }
+    }
+
     let store = InMemoryVectorStore::new(dimension);
     let index: Box<dyn vf_index::traits::PersistableIndex> = match &config.quantization_config {
         Some(vf_core::types::QuantizationConfig::Scalar(sq_config)) => {
@@ -429,41 +451,51 @@ async fn create_collection(
                 vf_index::hnsw::HnswParams::default(),
                 sq_config.clone(),
             );
-            // Set data_dir so post_optimize() can train the quantizer.
+            // Set data_dir unconditionally so post_optimize() can train the quantizer.
             let collection_dir = {
                 let cm = state.collection_manager.read();
                 cm.get_collection(&req.name)
                     .map(|c| c.collection_dir().to_path_buf())
                     .ok()
             };
-            if let Some(dir) = collection_dir {
-                q_index.set_data_dir(dir);
+            match collection_dir {
+                Some(dir) => q_index.set_data_dir(dir),
+                None => {
+                    return Err(err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("collection_dir missing after create for '{}'", req.name),
+                    ));
+                }
             }
             Box::new(q_index)
         }
         None => Box::new(vf_index::hnsw::HnswIndex::with_defaults(dimension, distance_metric)),
     };
+
+    // Attach a fresh hnsw.delta writer so first inserts are recorded for
+    // incremental replay on the next boot.
+    let collection_dir_for_delta = {
+        let cm = state.collection_manager.read();
+        cm.get_collection(&req.name)
+            .map(|c| c.collection_dir().to_path_buf())
+            .ok()
+    };
+    if let Some(dir) = collection_dir_for_delta {
+        let hnsw_delta_path = dir.join("hnsw.delta");
+        match vf_index::hnsw_delta::HnswDeltaWriter::create(&hnsw_delta_path) {
+            Ok(writer) => index.set_delta_writer(writer),
+            Err(e) => tracing::warn!(
+                collection = %req.name,
+                "failed to create initial hnsw delta writer: {e}"
+            ),
+        }
+    }
+
     let index_manager = IndexManager::with_defaults();
     let graph = match threshold {
         Some(t) => vf_graph::VirtualGraph::with_threshold(t, distance_metric),
         None => vf_graph::VirtualGraph::with_threshold(0.7, distance_metric),
     };
-
-    // Check for duplicate in-memory BEFORE persisting to storage
-    {
-        let collections = state.collections.read();
-        if collections.contains_key(&req.name) {
-            return Err(err(StatusCode::CONFLICT, format!("collection '{}' already exists", req.name)));
-        }
-    }
-
-    // Persist to storage layer
-    {
-        let mut cm = state.collection_manager.write();
-        if let Err(e) = cm.create_collection(config.clone()) {
-            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("storage create failed: {}", e)));
-        }
-    }
 
     let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new(), status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)), deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), mutation_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) };
 
@@ -769,7 +801,10 @@ async fn bulk_insert(
     }
 
     let batch_lock_size = raw_batch_lock_size.max(1) as usize;
-    let wal_flush_every = raw_wal_flush_every as usize;
+    // wal_flush_every is retained for API compatibility but no longer batches
+    // storage writes. Each insert now writes the WAL inline so the resulting
+    // LSN can be threaded into the HNSW delta writer (add_with_lsn).
+    let _wal_flush_every = raw_wal_flush_every as usize;
     let _ef_construction = req.ef_construction; // TODO: HNSW parameter override
     let deferred_index_mode = index_mode == "deferred";
     let skip_metadata_index = req.skip_metadata_index.unwrap_or(false);
@@ -814,115 +849,97 @@ async fn bulk_insert(
         });
     }
 
-    // Process vectors in batches (batch_lock_size controls how many vectors
-    // are inserted per lock acquisition to reduce lock contention)
-    let mut wal_counter: usize = 0;
-    let mut pending_wal: Vec<(u64, Vec<f32>, Option<Metadata>)> = Vec::new();
-
+    // Process vectors in batches. Per item we now write WAL first to obtain
+    // the LSN, then call index.add_with_lsn so the hnsw.delta writer records
+    // the insert. This matches single-insert semantics and enables fast
+    // incremental replay after a hard restart.
     for chunk in prepared.chunks(batch_lock_size.max(1)) {
-        // Acquire write lock once per batch
-        let mut batch_assigned: Vec<(u64, Vec<f32>, Option<Metadata>)> = Vec::new();
-
-        {
-            let mut collections = state.collections.write();
-            let coll = match collections.get_mut(&collection) {
-                Some(c) => c,
-                None => {
-                    for pv in chunk {
-                        errors.push(format!("item {}: collection '{}' not found", pv.index, collection));
-                    }
-                    continue;
+        let mut collections = state.collections.write();
+        let coll = match collections.get_mut(&collection) {
+            Some(c) => c,
+            None => {
+                for pv in chunk {
+                    errors.push(format!("item {}: collection '{}' not found", pv.index, collection));
                 }
-            };
+                continue;
+            }
+        };
 
-            for pv in chunk {
-                if pv.values.len() != coll.config.dimension {
-                    errors.push(format!(
-                        "item {}: vector dimension mismatch: expected {}, got {}",
-                        pv.index, coll.config.dimension, pv.values.len()
-                    ));
-                    continue;
-                }
+        for pv in chunk {
+            if pv.values.len() != coll.config.dimension {
+                errors.push(format!(
+                    "item {}: vector dimension mismatch: expected {}, got {}",
+                    pv.index, coll.config.dimension, pv.values.len()
+                ));
+                continue;
+            }
 
-                let assigned_id = if pv.id == 0 {
-                    match coll.store.insert_metadata_auto_id(pv.metadata.clone()) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            errors.push(format!("item {}: store insert failed: {}", pv.index, e));
-                            continue;
-                        }
-                    }
-                } else {
-                    match coll.store.insert_metadata(pv.id, pv.metadata.clone()) {
-                        Ok(()) => pv.id,
-                        Err(e) => {
-                            errors.push(format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e));
-                            continue;
-                        }
-                    }
-                };
-
-                // Index: skip if deferred mode
-                if !deferred_index_mode {
-                    if let Err(e) = coll.index.add(assigned_id, &pv.values) {
-                        let _ = coll.store.delete(assigned_id);
-                        errors.push(format!("item {}: index insert failed: {}", pv.index, e));
+            let assigned_id = if pv.id == 0 {
+                match coll.store.insert_metadata_auto_id(pv.metadata.clone()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        errors.push(format!("item {}: store insert failed: {}", pv.index, e));
                         continue;
                     }
                 }
-
-                // Metadata index: skip if flag set
-                if !skip_metadata_index {
-                    if let Some(ref meta) = pv.metadata {
-                        coll.index_manager.index_record(assigned_id, meta);
+            } else {
+                match coll.store.insert_metadata(pv.id, pv.metadata.clone()) {
+                    Ok(()) => pv.id,
+                    Err(e) => {
+                        errors.push(format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e));
+                        continue;
                     }
                 }
+            };
 
-                // Graph: compute per-vector only if not deferred
-                if !defer_graph {
-                    if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-                        &mut coll.graph, coll.index.as_vector_index(), assigned_id, &pv.values, 10,
-                    ) {
-                        tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
-                    }
-                }
-
-                batch_assigned.push((assigned_id, pv.values.clone(), pv.metadata.clone()));
-                inserted_ids.push(assigned_id);
-                inserted_vectors.insert(assigned_id, pv.values.clone());
-                inserted_count += 1;
-            }
-        } // write lock released
-
-        // WAL persistence with batched flushing
-        for (assigned_id, values, core_metadata) in batch_assigned {
-            pending_wal.push((assigned_id, values, core_metadata));
-            wal_counter += 1;
-
-            if wal_flush_every <= 1 || wal_counter >= wal_flush_every {
+            // Persist to storage layer first so we can capture the WAL LSN.
+            let lsn = {
                 let mut cm = state.collection_manager.write();
                 if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
-                    for (id, vals, meta) in pending_wal.drain(..) {
-                        if let Err(e) = storage_coll.insert(id, VectorData::F32(vals), meta) {
-                            tracing::warn!(collection = %collection, id = id, "storage bulk insert failed: {}", e);
-                        }
+                    if let Err(e) = storage_coll.insert(
+                        assigned_id,
+                        VectorData::F32(pv.values.clone()),
+                        pv.metadata.clone(),
+                    ) {
+                        tracing::warn!(collection = %collection, id = assigned_id, "storage bulk insert failed: {}", e);
                     }
+                    storage_coll.current_lsn().saturating_sub(1)
+                } else {
+                    0
                 }
-                wal_counter = 0;
-            }
-        }
-    }
+            };
 
-    // Flush any remaining WAL entries
-    if !pending_wal.is_empty() {
-        let mut cm = state.collection_manager.write();
-        if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
-            for (id, vals, meta) in pending_wal.drain(..) {
-                if let Err(e) = storage_coll.insert(id, VectorData::F32(vals), meta) {
-                    tracing::warn!(collection = %collection, id = id, "storage bulk insert failed: {}", e);
+            // Index: skip if deferred mode. add_with_lsn records the entry
+            // in the hnsw.delta writer for incremental replay on restart.
+            if !deferred_index_mode {
+                if let Err(e) = coll.index.add_with_lsn(assigned_id, &pv.values, lsn) {
+                    let _ = coll.store.delete(assigned_id);
+                    errors.push(format!("item {}: index insert failed: {}", pv.index, e));
+                    continue;
                 }
             }
+
+            // Metadata index: skip if flag set
+            if !skip_metadata_index {
+                if let Some(ref meta) = pv.metadata {
+                    coll.index_manager.index_record(assigned_id, meta);
+                }
+            }
+
+            // Graph: compute per-vector only if not deferred
+            if !defer_graph {
+                if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
+                    &mut coll.graph, coll.index.as_vector_index(), assigned_id, &pv.values, 10,
+                ) {
+                    tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
+                }
+            }
+
+            inserted_ids.push(assigned_id);
+            inserted_vectors.insert(assigned_id, pv.values.clone());
+            inserted_count += 1;
         }
+        // write lock released at end of chunk
     }
 
     // Batch graph recomputation (only when graph is NOT deferred)

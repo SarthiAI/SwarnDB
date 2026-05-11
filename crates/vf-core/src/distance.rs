@@ -147,7 +147,7 @@ pub fn get_distance_fn(metric: DistanceMetricType) -> Box<dyn DistanceFunction> 
     }
 }
 
-/// Enum-based distance dispatch — avoids vtable overhead of `Box<dyn DistanceFunction>`.
+/// Enum-based distance dispatch - avoids vtable overhead of `Box<dyn DistanceFunction>`.
 ///
 /// All methods are `#[inline]` so the compiler can inline the match arms directly
 /// into hot loops (HNSW search, brute-force scan, k-means, etc.), yielding a

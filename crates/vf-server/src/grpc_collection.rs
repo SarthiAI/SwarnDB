@@ -131,6 +131,26 @@ impl CollectionService for CollectionServiceImpl {
             }
             None => Box::new(HnswIndex::with_defaults(dimension, distance_metric)),
         };
+
+        // Attach a fresh hnsw.delta writer so first inserts are recorded for
+        // incremental replay on the next boot.
+        let collection_dir_for_delta = {
+            let cm = self.state.collection_manager.read();
+            cm.get_collection(&req.name)
+                .map(|c| c.collection_dir().to_path_buf())
+                .ok()
+        };
+        if let Some(dir) = collection_dir_for_delta {
+            let hnsw_delta_path = dir.join("hnsw.delta");
+            match vf_index::hnsw_delta::HnswDeltaWriter::create(&hnsw_delta_path) {
+                Ok(writer) => index.set_delta_writer(writer),
+                Err(e) => tracing::warn!(
+                    collection = %req.name,
+                    "failed to create initial hnsw delta writer: {e}"
+                ),
+            }
+        }
+
         let index_manager = IndexManager::with_defaults();
         let graph = match threshold {
             Some(t) => VirtualGraph::with_threshold(t, distance_metric),

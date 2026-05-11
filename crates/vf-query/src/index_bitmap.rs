@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use roaring::RoaringBitmap;
 use vf_core::types::{MetadataValue, VectorId};
 
-/// Key type for bitmap index — discrete, hashable values only.
+/// Key type for bitmap index - discrete, hashable values only.
 /// Float values are excluded (f64 is not hashable); use BTreeIndex for floats.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BitmapKey {
@@ -112,7 +112,7 @@ impl BitmapIndex {
         self.bitmaps.retain(|_, bm| !bm.is_empty());
     }
 
-    /// Exact equality lookup — returns the bitmap for a single value.
+    /// Exact equality lookup - returns the bitmap for a single value.
     pub fn eq_lookup(&self, value: &MetadataValue) -> RoaringBitmap {
         match Self::to_key(value) {
             Some(key) => self.bitmaps.get(&key).cloned().unwrap_or_default(),
@@ -120,13 +120,13 @@ impl BitmapIndex {
         }
     }
 
-    /// Not-equal lookup — all indexed IDs minus those matching `value`.
+    /// Not-equal lookup - all indexed IDs minus those matching `value`.
     pub fn ne_lookup(&self, value: &MetadataValue) -> RoaringBitmap {
         let eq = self.eq_lookup(value);
         &self.all_ids - &eq
     }
 
-    /// IN query — union of bitmaps for each value in the list.
+    /// IN query - union of bitmaps for each value in the list.
     pub fn in_lookup(&self, values: &[MetadataValue]) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
         for value in values {

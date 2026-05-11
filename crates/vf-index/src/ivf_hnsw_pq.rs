@@ -125,8 +125,8 @@ impl IvfHnswPqIndex {
         // Use smaller params since the centroid set is small.
         let hnsw_params = HnswParams::new(
             16,  // m
-            64,  // ef_construction — modest for a small graph
-            32,  // ef_search — enough for nprobe lookups
+            64,  // ef_construction - modest for a small graph
+            32,  // ef_search - enough for nprobe lookups
         );
         let coarse_quantizer = HnswIndex::new(
             dimension,
@@ -251,7 +251,7 @@ impl IvfHnswPqIndex {
     /// quantizer, its residual is PQ-encoded, and the compressed entry is
     /// stored in the corresponding inverted list.
     ///
-    /// This method is safe to call concurrently from multiple threads — each
+    /// This method is safe to call concurrently from multiple threads - each
     /// inverted list has its own lock.
     ///
     /// # Errors

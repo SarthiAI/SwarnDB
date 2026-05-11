@@ -108,6 +108,13 @@ pub struct ServerConfig {
     /// Min segments to trigger auto-compaction.
     #[serde(default = "default_compaction_min_segments")]
     pub compaction_min_segments: usize,
+
+    /// Maximum number of collections loaded in parallel during server startup.
+    /// Defaults to the smaller of available parallelism and 4. Tune down if
+    /// collections are large in RAM, tune up if disks are fast and collections
+    /// are small.
+    #[serde(default = "default_max_concurrent_collection_loads")]
+    pub max_concurrent_collection_loads: usize,
 }
 
 fn default_host() -> String {
@@ -202,6 +209,12 @@ fn default_compaction_min_segments() -> usize {
     4
 }
 
+fn default_max_concurrent_collection_loads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2)
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -229,6 +242,7 @@ impl Default for ServerConfig {
             wal_prune_after_optimize: default_wal_prune_after_optimize(),
             auto_compact_after_optimize: default_auto_compact_after_optimize(),
             compaction_min_segments: default_compaction_min_segments(),
+            max_concurrent_collection_loads: default_max_concurrent_collection_loads(),
         }
     }
 }
@@ -293,6 +307,7 @@ impl ServerConfig {
     /// - `SWARNDB_WAL_PRUNE_AFTER_OPTIMIZE` -> wal_prune_after_optimize
     /// - `SWARNDB_AUTO_COMPACT_AFTER_OPTIMIZE` -> auto_compact_after_optimize
     /// - `SWARNDB_COMPACTION_MIN_SEGMENTS` -> compaction_min_segments
+    /// - `SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS` -> max_concurrent_collection_loads
     pub fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("SWARNDB_HOST") {
             self.host = val;
@@ -469,6 +484,18 @@ impl ServerConfig {
                 tracing::warn!("Invalid SWARNDB_COMPACTION_MIN_SEGMENTS value: {}", val);
             }
         }
+
+        if let Ok(val) = env::var("SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS") {
+            if let Ok(n) = val.parse::<usize>() {
+                if n == 0 {
+                    tracing::warn!("Invalid SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS value: 0, ignoring");
+                } else {
+                    self.max_concurrent_collection_loads = n;
+                }
+            } else {
+                tracing::warn!("Invalid SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS value: {}", val);
+            }
+        }
     }
 
     /// Returns the gRPC socket address string (e.g., "0.0.0.0:50051").
@@ -525,6 +552,8 @@ mod tests {
         assert_eq!(config.wal_prune_after_optimize, true);
         assert_eq!(config.auto_compact_after_optimize, true);
         assert_eq!(config.compaction_min_segments, 4);
+        assert!(config.max_concurrent_collection_loads >= 1);
+        assert!(config.max_concurrent_collection_loads <= 4);
     }
 
     #[test]

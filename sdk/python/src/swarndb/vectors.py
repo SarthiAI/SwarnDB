@@ -267,8 +267,14 @@ class VectorAPI:
                 max=10000). Higher values reduce lock overhead.
             defer_graph: If True, skip graph computation during insert.
                 Use ``client.collections.optimize()`` afterward.
-            wal_flush_every: WAL flush interval in operations (default=1,
-                0=disable WAL flushing for max throughput).
+            wal_flush_every: Preserved for backward compatibility. Only the
+                value ``0`` has effect: it opts out of storage-layer WAL
+                writes during this bulk insert (max throughput, no crash
+                recovery for these entries). Any positive integer is
+                accepted but ignored, and behaves identically to ``None``;
+                per-entry WAL writes happen unconditionally in that case.
+                The legacy "flush every N operations" batching behavior
+                no longer exists.
             ef_construction: Override HNSW ef_construction for this batch.
             index_mode: Index build mode: ``"immediate"`` (default) or
                 ``"deferred"`` (build index after all inserts).

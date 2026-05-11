@@ -309,7 +309,29 @@ impl VectorService for VectorServiceImpl {
                 }
             };
 
-            if let Err(e) = coll.index.add(assigned_id, &values) {
+            // Save values for batch graph recomputation before they're moved
+            let values_for_graph = values.clone();
+
+            // Persist to storage layer first to obtain the WAL LSN.
+            let lsn = {
+                let mut cm = self.state.collection_manager.write();
+                if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
+                    if let Err(e) = storage_coll.insert(
+                        assigned_id,
+                        VectorData::F32(values.clone()),
+                        core_metadata.clone(),
+                    ) {
+                        tracing::warn!(collection = %req.collection, id = assigned_id, "storage bulk insert failed: {}", e);
+                    }
+                    storage_coll.current_lsn().saturating_sub(1)
+                } else {
+                    0
+                }
+            };
+
+            // add_with_lsn records the entry in the hnsw.delta writer so a
+            // crash before snapshot can be recovered incrementally on restart.
+            if let Err(e) = coll.index.add_with_lsn(assigned_id, &values, lsn) {
                 // Rollback: remove from store since index add failed
                 let _ = coll.store.delete(assigned_id);
                 errors.push(format!("item {}: index insert failed for id {}: {}", current_item, assigned_id, e));
@@ -325,19 +347,6 @@ impl VectorService for VectorServiceImpl {
                 &mut coll.graph, coll.index.as_vector_index(), assigned_id, &values, 10,
             ) {
                 tracing::warn!(collection = %req.collection, id = assigned_id, "graph compute failed: {}", e);
-            }
-
-            // Save values for batch graph recomputation before they're moved
-            let values_for_graph = values.clone();
-
-            // Persist to storage layer (best-effort)
-            {
-                let mut cm = self.state.collection_manager.write();
-                if let Ok(storage_coll) = cm.get_collection_mut(&req.collection) {
-                    if let Err(e) = storage_coll.insert(assigned_id, VectorData::F32(values), core_metadata) {
-                        tracing::warn!(collection = %req.collection, id = assigned_id, "storage bulk insert failed: {}", e);
-                    }
-                }
             }
 
             let entry = batch_vectors.entry(req.collection.clone()).or_insert_with(|| (Vec::new(), std::collections::HashMap::new()));
@@ -430,8 +439,6 @@ impl VectorService for VectorServiceImpl {
         let mut inserted_count: u64 = 0;
         let mut item_index: u64 = 0;
         let mut errors: Vec<String> = Vec::new();
-        let mut wal_counter: u32 = 0;
-        let mut pending_wal: Vec<(String, u64, Vec<f32>, Option<vf_core::types::Metadata>)> = Vec::new();
 
         // Buffer for batched lock acquisition
         struct BatchItem {
@@ -450,12 +457,18 @@ impl VectorService for VectorServiceImpl {
         let mut collections_with_deferrals: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        // Helper closure to process a batch of items
+        // Helper closure to process a batch of items. Per item we now write
+        // the WAL first to capture the LSN, then call index.add_with_lsn so
+        // the hnsw.delta writer records the insert for incremental replay.
+        // wal_flush_every retains its semantics: 0 disables the WAL entirely
+        // (and the resulting index entry is recorded with lsn=0, matching the
+        // single-insert fallback when storage is unavailable). Non-zero values
+        // no longer batch (each insert writes inline) but the option is still
+        // accepted for API compatibility.
         let process_batch = |batch: &mut Vec<BatchItem>,
                              state: &AppState,
                              errors: &mut Vec<String>,
                              inserted_count: &mut u64,
-                             wal_counter: &mut u32,
                              wal_flush_every: u32,
                              defer_graph: bool,
                              index_mode_deferred: bool,
@@ -464,7 +477,6 @@ impl VectorService for VectorServiceImpl {
             String,
             (Vec<u64>, std::collections::HashMap<u64, Vec<f32>>),
         >,
-                             pending_wal: &mut Vec<(String, u64, Vec<f32>, Option<vf_core::types::Metadata>)>,
         | {
             if batch.is_empty() {
                 return;
@@ -536,9 +548,36 @@ impl VectorService for VectorServiceImpl {
                         }
                     };
 
-                    // HNSW index: skip if deferred
+                    // Persist to storage layer first to obtain the WAL LSN.
+                    // When wal_flush_every == 0 the caller has opted out of
+                    // WAL persistence entirely and we fall back to lsn=0.
+                    let lsn = if wal_flush_every > 0 {
+                        let mut cm = state.collection_manager.write();
+                        if let Ok(storage_coll) = cm.get_collection_mut(coll_name) {
+                            if let Err(e) = storage_coll.insert(
+                                assigned_id,
+                                VectorData::F32(values.clone()),
+                                core_metadata.clone(),
+                            ) {
+                                tracing::warn!(
+                                    collection = %coll_name,
+                                    id = assigned_id,
+                                    "storage insert failed: {}",
+                                    e
+                                );
+                            }
+                            storage_coll.current_lsn().saturating_sub(1)
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+
+                    // HNSW index: skip if deferred. add_with_lsn records the
+                    // entry in the hnsw.delta writer for incremental replay.
                     if !index_mode_deferred {
-                        if let Err(e) = coll.index.add(assigned_id, &values) {
+                        if let Err(e) = coll.index.add_with_lsn(assigned_id, &values, lsn) {
                             let _ = coll.store.delete(assigned_id);
                             errors.push(format!(
                                 "item {}: index insert failed for id {}: {}",
@@ -581,34 +620,6 @@ impl VectorService for VectorServiceImpl {
                     entry.1.insert(assigned_id, values.clone());
 
                     *inserted_count += 1;
-
-                    // WAL persistence: accumulate into pending buffer, flush at threshold
-                    if wal_flush_every > 0 {
-                        pending_wal.push((coll_name.clone(), assigned_id, values, core_metadata));
-                        *wal_counter += 1;
-
-                        if wal_flush_every <= 1 || *wal_counter >= wal_flush_every {
-                            let mut cm = state.collection_manager.write();
-                            for (cn, id, vals, meta) in pending_wal.drain(..) {
-                                if let Ok(storage_coll) = cm.get_collection_mut(&cn) {
-                                    if let Err(e) = storage_coll.insert(
-                                        id,
-                                        VectorData::F32(vals),
-                                        meta,
-                                    ) {
-                                        tracing::warn!(
-                                            collection = %cn,
-                                            id = id,
-                                            "storage insert failed: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            *wal_counter = 0;
-                        }
-                    }
-                    // wal_flush_every == 0 means skip WAL entirely
                 }
             }
 
@@ -637,13 +648,11 @@ impl VectorService for VectorServiceImpl {
                             &self.state,
                             &mut errors,
                             &mut inserted_count,
-                            &mut wal_counter,
                             wal_flush_every,
                             defer_graph,
                             index_mode_deferred,
                             skip_metadata_index,
                             &mut batch_vectors,
-                            &mut pending_wal,
                         );
                     }
                 }
@@ -673,31 +682,12 @@ impl VectorService for VectorServiceImpl {
             &self.state,
             &mut errors,
             &mut inserted_count,
-            &mut wal_counter,
             wal_flush_every,
             defer_graph,
             index_mode_deferred,
             skip_metadata_index,
             &mut batch_vectors,
-            &mut pending_wal,
         );
-
-        // Flush any remaining WAL entries
-        if !pending_wal.is_empty() {
-            let mut cm = self.state.collection_manager.write();
-            for (cn, id, vals, meta) in pending_wal.drain(..) {
-                if let Ok(storage_coll) = cm.get_collection_mut(&cn) {
-                    if let Err(e) = storage_coll.insert(id, VectorData::F32(vals), meta) {
-                        tracing::warn!(
-                            collection = %cn,
-                            id = id,
-                            "storage insert failed: {}",
-                            e
-                        );
-                    }
-                }
-            }
-        }
 
         // Recompute graph edges for all inserted vectors (only if graph not deferred)
         if !defer_graph {

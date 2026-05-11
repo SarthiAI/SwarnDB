@@ -21,7 +21,7 @@ use crate::kmeans;
 /// Residuals (vector minus centroid) are **not** stored here because IVF-flat
 /// computes exact distances against the original vectors. Residual storage
 /// would be used in an IVF-PQ variant where product-quantized residuals
-/// replace the full vectors — that is a separate implementation.
+/// replace the full vectors - that is a separate implementation.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InvertedListEntry {
     /// Unique vector identifier.
@@ -44,8 +44,8 @@ impl IvfIndex {
     /// Create a new untrained IVF index.
     ///
     /// # Arguments
-    /// * `dimension` — dimensionality of vectors
-    /// * `num_partitions` — number of Voronoi cells (nlist). Must be 1..=256.
+    /// * `dimension` - dimensionality of vectors
+    /// * `num_partitions` - number of Voronoi cells (nlist). Must be 1..=256.
     pub fn new(dimension: usize, num_partitions: usize) -> Result<Self, QuantizationError> {
         if num_partitions == 0 || num_partitions > 256 {
             return Err(QuantizationError::InvalidParameter(format!(

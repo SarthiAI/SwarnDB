@@ -20,7 +20,7 @@
 //! `dequant[d] = code[d] as f32 * scales[d] + min_vals[d]`.
 
 // ==========================================================================
-// Public API — runtime dispatch
+// Public API - runtime dispatch
 // ==========================================================================
 
 /// Asymmetric L2 (Euclidean) distance: f32 query vs u8 code, SIMD-accelerated.

@@ -40,7 +40,7 @@ fn build_hnsw_index(vectors: &[Vec<f32>], dim: usize) -> HnswIndex {
 }
 
 // ---------------------------------------------------------------------------
-// (a) HNSW Search QPS — single and multi-threaded
+// (a) HNSW Search QPS - single and multi-threaded
 // ---------------------------------------------------------------------------
 
 fn bench_hnsw_search_qps(c: &mut Criterion) {
@@ -90,7 +90,7 @@ fn bench_hnsw_search_qps(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// (b) HNSW Build Throughput — sequential vs parallel
+// (b) HNSW Build Throughput - sequential vs parallel
 // ---------------------------------------------------------------------------
 
 fn bench_hnsw_build_throughput(c: &mut Criterion) {
@@ -134,7 +134,7 @@ fn bench_hnsw_build_throughput(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// (c) Distance Function Throughput — SIMD dispatch validation
+// (c) Distance Function Throughput - SIMD dispatch validation
 // ---------------------------------------------------------------------------
 
 fn bench_distance_functions(c: &mut Criterion) {
@@ -173,7 +173,7 @@ fn bench_distance_functions(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// (d) DashMap Store Throughput — concurrent reads and writes
+// (d) DashMap Store Throughput - concurrent reads and writes
 // ---------------------------------------------------------------------------
 
 fn bench_dashmap_store(c: &mut Criterion) {

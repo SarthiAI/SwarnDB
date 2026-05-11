@@ -1,6 +1,6 @@
 # SwarnDB Python SDK
 
-Official Python SDK for SwarnDB — the vector database that thinks in graphs.
+Official Python SDK for SwarnDB, the vector database that thinks in graphs.
 
 Combines HNSW + IVF-PQ indexing with virtual graph traversal and 15+ vector math operations.
 

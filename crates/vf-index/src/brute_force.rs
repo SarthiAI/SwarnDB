@@ -13,7 +13,7 @@ use vf_core::types::{DistanceMetricType, ScoredResult, VectorId};
 use crate::traits::{IndexError, VectorIndex};
 
 /// Brute-force (flat/linear scan) index.
-/// Computes distances to all stored vectors — O(n) per query.
+/// Computes distances to all stored vectors - O(n) per query.
 /// Used as a baseline for correctness testing and for small collections.
 pub struct BruteForceIndex {
     vectors: RwLock<HashMap<VectorId, Vec<f32>>>,
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn test_search_euclidean() {
         let index = make_index();
-        // Query [1, 0, 0] — should find itself (id=0) as nearest
+        // Query [1, 0, 0] - should find itself (id=0) as nearest
         let results = index.search(&[1.0, 0.0, 0.0], 3, None).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, 0); // exact match

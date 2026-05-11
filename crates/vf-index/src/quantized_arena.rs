@@ -24,7 +24,7 @@ const SQ8C_HEADER_SIZE: usize = 16;
 /// Each slot stores `dimension` bytes. Slot `i` occupies
 /// `[i * dim .. (i + 1) * dim]` in the flat buffer.
 ///
-/// Supports push, get, and free with slot reuse — same pattern as
+/// Supports push, get, and free with slot reuse, same pattern as
 /// [`crate::arena::VectorArena`].
 pub struct QuantizedArena {
     /// Flat buffer: slot `i` occupies `[i*dim .. (i+1)*dim]`.
@@ -60,6 +60,32 @@ impl QuantizedArena {
         }
     }
 
+    /// Build an arena from a dense byte buffer where slot `i` occupies
+    /// `data[i * dimension .. (i+1) * dimension]`. Used by parallel cold-build
+    /// to skip the per-slot push overhead. The caller is responsible for
+    /// ensuring `data.len() == slot_count * dimension`.
+    ///
+    /// # Panics
+    /// Panics if `data.len() != slot_count * dimension`. This is a programmer
+    /// error in the cold-build path, not a runtime fallback condition.
+    pub fn from_dense(data: Vec<u8>, dimension: usize, slot_count: usize) -> Self {
+        assert!(dimension > 0, "QuantizedArena dimension must be > 0");
+        assert_eq!(
+            data.len(),
+            slot_count * dimension,
+            "QuantizedArena::from_dense: data.len() ({}) does not match slot_count ({}) * dimension ({})",
+            data.len(),
+            slot_count,
+            dimension
+        );
+        Self {
+            data,
+            dimension,
+            slot_count,
+            free_slots: Vec::new(),
+        }
+    }
+
     /// Stores a quantized code in the arena and returns its slot index.
     ///
     /// Reuses a previously freed slot if available, otherwise appends.
@@ -76,7 +102,7 @@ impl QuantizedArena {
         );
 
         if let Some(slot) = self.free_slots.pop() {
-            // Reuse a freed slot — overwrite in place.
+            // Reuse a freed slot, overwrite in place.
             let start = slot * self.dimension;
             self.data[start..start + self.dimension].copy_from_slice(code);
             slot
@@ -101,7 +127,7 @@ impl QuantizedArena {
 
     /// Marks a slot as free for future reuse.
     ///
-    /// The underlying memory is not reclaimed — it will be overwritten by the
+    /// The underlying memory is not reclaimed, it will be overwritten by the
     /// next `push` that reuses this slot. Callers must not access the slot
     /// after freeing it.
     pub fn free(&mut self, slot: usize) {
@@ -162,7 +188,7 @@ impl QuantizedArena {
     ///
     /// `slot_ids[i]` is the VectorId stored in slot `i`. The arena must
     /// currently be free-list-empty (i.e. no holes); recovery does not
-    /// support sparse slots — call `compact()` first if needed.
+    /// support sparse slots, call `compact()` first if needed.
     pub fn save_to_path(
         &self,
         path: &Path,

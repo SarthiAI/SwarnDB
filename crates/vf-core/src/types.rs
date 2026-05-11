@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-/// Internal vector identifier — 64-bit for efficiency.
+/// Internal vector identifier - 64-bit for efficiency.
 /// External APIs expose UUIDs, mapped to VectorId internally.
 pub type VectorId = u64;
 

@@ -59,7 +59,7 @@ impl RecoveryManager {
     /// Replay a WAL file into the given in-memory vector store.
     ///
     /// If the WAL file does not exist, returns empty [`RecoveryStats`] (not an
-    /// error). On a CRC mismatch the replay stops immediately — entries after
+    /// error). On a CRC mismatch the replay stops immediately - entries after
     /// corruption are considered unreliable.
     pub fn replay_wal(
         wal_path: &Path,
@@ -116,7 +116,7 @@ impl RecoveryManager {
                 Err(StorageError::ChecksumMismatch { expected, computed }) => {
                     warn!(
                         "WAL CRC mismatch at {:?}: expected {:#010x}, computed {:#010x}. \
-                         Stopping replay — subsequent entries are unreliable.",
+                         Stopping replay - subsequent entries are unreliable.",
                         wal_path, expected, computed
                     );
                     break;
@@ -278,7 +278,7 @@ impl RecoveryManager {
         match memtable.update(id, data.clone(), metadata.clone()) {
             Ok(()) => Ok(()),
             Err(vf_core::store::StoreError::NotFound(_)) => {
-                // Vector not present yet — insert it if data is available.
+                // Vector not present yet - insert it if data is available.
                 let Some(d) = data else {
                     return Ok(());
                 };
@@ -308,7 +308,7 @@ impl RecoveryManager {
         match memtable.delete(id) {
             Ok(_) => Ok(()),
             Err(vf_core::store::StoreError::NotFound(_)) => {
-                // Silently ignore — vector was not present.
+                // Silently ignore - vector was not present.
                 Ok(())
             }
             Err(e) => Err(StorageError::Serialization(format!(

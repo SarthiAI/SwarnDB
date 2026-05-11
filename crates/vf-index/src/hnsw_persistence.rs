@@ -254,7 +254,7 @@ fn parse_envelope(env: &[u8; ENVELOPE_SIZE]) -> Result<EnvelopeFields, IndexErro
     // [66-73] uncompressed_size
     let uncompressed_size = u64::from_le_bytes(env[pos..pos + 8].try_into().unwrap());
     // pos += 8;
-    // [74-79] reserved — skip
+    // [74-79] reserved, skip
 
     Ok(EnvelopeFields {
         snapshot_lsn,
@@ -600,4 +600,72 @@ pub fn validate_base(path: &Path) -> Result<(u64, u64), IndexError> {
     }
 
     Ok((fields.snapshot_lsn, fields.node_count))
+}
+
+/// Validate the on-disk topology envelope at `path` against `expected_dimension`.
+///
+/// Returns:
+///   Ok(true) when the file exists, the envelope's magic and version are
+///     recognised, the CRC32 footer verifies, and the dimension stored in
+///     the envelope matches `expected_dimension`.
+///   Ok(false) when the file is missing, truncated, has a bad magic, a bad
+///     version, a bad CRC, or a dimension mismatch. These are all
+///     soft-recoverable conditions; the caller falls back to a full rebuild.
+///   Err(IndexError::Internal) for hard IO failures that should not be
+///     silently swallowed (e.g., permission denied while opening a file).
+///
+/// This helper is intentionally cheap: it reads only the envelope and the
+/// CRC footer, plus the bytes in between to recompute the CRC. It performs
+/// no decompression and no node-by-node parsing.
+pub(crate) fn validate_envelope_at_path(
+    path: &Path,
+    expected_dimension: usize,
+) -> Result<bool, IndexError> {
+    // Missing file is a soft failure.
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(IndexError::Internal(format!(
+                "topology validate: failed to read {}: {}",
+                path.display(),
+                e
+            )));
+        }
+    };
+
+    // Truncated below envelope plus CRC footer is a soft failure (corrupt).
+    if data.len() < ENVELOPE_SIZE + 4 {
+        return Ok(false);
+    }
+
+    // Soft-parse the envelope. Bad magic, bad version, etc. are soft failures.
+    let envelope: &[u8; ENVELOPE_SIZE] = match data[..ENVELOPE_SIZE].try_into() {
+        Ok(arr) => arr,
+        Err(_) => return Ok(false),
+    };
+    let fields = match parse_envelope(envelope) {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+
+    // Dimension mismatch is a soft failure (cross-collection contamination).
+    if fields.dimension as usize != expected_dimension {
+        return Ok(false);
+    }
+
+    // CRC32 over (envelope plus compressed payload).
+    let crc_offset = data.len() - 4;
+    let stored_crc = match data[crc_offset..].try_into() {
+        Ok(bytes) => u32::from_le_bytes(bytes),
+        Err(_) => return Ok(false),
+    };
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&data[..crc_offset]);
+    let computed_crc = hasher.finalize();
+    if stored_crc != computed_crc {
+        return Ok(false);
+    }
+
+    Ok(true)
 }

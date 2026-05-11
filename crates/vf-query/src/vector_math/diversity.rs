@@ -73,7 +73,7 @@ impl DiversitySampler {
         selected
     }
 
-    /// Select k most diverse vectors from a set (no query — maximize mutual distance).
+    /// Select k most diverse vectors from a set (no query - maximize mutual distance).
     pub fn max_diversity(candidates: &[(VectorId, &[f32])], k: usize) -> Vec<VectorId> {
         let k = k.min(candidates.len());
         if k == 0 || candidates.is_empty() {

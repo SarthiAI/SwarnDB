@@ -83,6 +83,16 @@ impl Collection {
 
         let memtable = InMemoryVectorStore::new(config.dimension);
 
+        // Replay WAL into memtable to recover unflushed inserts after a crash.
+        let wal_stats = crate::recovery::RecoveryManager::replay_wal(&wal_path, &memtable)?;
+        if wal_stats.entries_replayed > 0 {
+            log::info!(
+                "Collection::open: replayed {} WAL entries into memtable for {}",
+                wal_stats.entries_replayed,
+                collection_dir.display()
+            );
+        }
+
         // Scan for segment files.
         let mut segments = Vec::new();
         if collection_dir.is_dir() {
@@ -134,7 +144,7 @@ impl Collection {
         self.wal.append(WalOp::Insert, 0, &payload)?;
 
         let record = VectorRecord::new(id, Some(data), metadata);
-        // Ignore AlreadyExists from memtable — WAL is the source of truth.
+        // Ignore AlreadyExists from memtable - WAL is the source of truth.
         let _ = self.memtable.insert(record);
 
         if self.memtable.len() >= DEFAULT_MEMTABLE_FLUSH_THRESHOLD {
@@ -177,7 +187,7 @@ impl Collection {
         let payload = bincode::serialize(&id)?;
         self.wal.append(WalOp::Delete, 0, &payload)?;
 
-        // Ignore not-found — the vector may only be in segments.
+        // Ignore not-found - the vector may only be in segments.
         let _ = self.memtable.delete(id);
 
         Ok(())

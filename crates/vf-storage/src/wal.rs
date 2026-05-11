@@ -184,7 +184,7 @@ impl WalWriter {
                 }
                 let entry_len = u32::from_le_bytes(len_buf) as usize;
                 if entry_len < MIN_ENTRY_LEN_V2 {
-                    break; // Corrupt entry — stop scanning.
+                    break; // Corrupt entry - stop scanning.
                 }
 
                 // Read lsn (first 8 bytes of body).
@@ -209,7 +209,7 @@ impl WalWriter {
                 }
             }
         }
-        // For v1 files, max_lsn stays 0 — initial_lsn takes over.
+        // For v1 files, max_lsn stays 0 - initial_lsn takes over.
 
         drop(scan_reader);
 
@@ -321,7 +321,7 @@ impl WalWriter {
 
     /// Rotate the current WAL file.
     ///
-    /// LSN continuity is preserved — the fresh WAL inherits `next_lsn`.
+    /// LSN continuity is preserved - the fresh WAL inherits `next_lsn`.
     /// Returns the path the old WAL was moved to.
     pub fn rotate(&mut self, new_path: &Path) -> StorageResult<PathBuf> {
         self.sync()?;

@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
-use rayon::prelude::*;
 
 use vf_core::distance::DistanceMetric;
 use vf_core::types::{
@@ -32,8 +31,12 @@ use crate::hnsw::{HnswIndex, HnswParams};
 use crate::hnsw_delta::HnswDeltaWriter;
 use crate::hnsw_persistence::HnswTopologySnapshot;
 use crate::mmap_store::MmapVectorStore;
+use crate::parallel_build::{parallel_encode_dense, plan_batches};
 use crate::quantized_arena::QuantizedArena;
-use crate::traits::{IndexError, PersistableIndex, VectorIndex};
+use crate::traits::{
+    IndexError, ParallelBuildConfig, ParallelBuildUnit, PersistableIndex, RestoreOutcome,
+    VectorIndex,
+};
 
 // ── Main struct ─────────────────────────────────────────────────────────
 
@@ -187,29 +190,48 @@ impl QuantizedHnswIndex {
         let scales = quantizer.scales();
         let min_vals = quantizer.min_vals().to_vec();
 
-        // 5. Encode every vector in parallel (heavy work), then push
-        //    sequentially into the arena (push is not thread-safe).
-        let encoded: Vec<Vec<u8>> = vectors
-            .par_iter()
-            .map(|(_, vec)| {
-                quantizer
-                    .quantize(vec)
-                    .expect("quantize failed for trained quantizer")
-            })
+        // 5. Stable-sort by VectorId so the parallel encode path produces
+        //    deterministic on-disk bytes regardless of worker count, then
+        //    encode in parallel directly into a dense byte buffer. This
+        //    replaces the old "encode in parallel into Vec<Vec<u8>> then
+        //    sequentially push into QuantizedArena" bottleneck.
+        let mut sorted_vectors: Vec<(VectorId, &[f32])> = vectors
+            .iter()
+            .map(|(id, v)| (*id, v.as_slice()))
             .collect();
+        sorted_vectors.sort_by_key(|(id, _)| *id);
 
-        let mut codes = QuantizedArena::with_capacity(self.dimension, vectors.len());
-        let mut code_slots = HashMap::with_capacity(vectors.len());
-        let mut slot_ids: Vec<VectorId> = Vec::with_capacity(vectors.len());
-        for ((id, _), code) in vectors.iter().zip(encoded.iter()) {
-            let slot = codes.push(code);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let config = ParallelBuildConfig {
+            workers,
+            memory_cap_bytes: None,
+            deterministic: true,
+        };
+
+        let (data, _slot_indices) =
+            match parallel_encode_dense(&sorted_vectors, &quantizer, &config) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    log::warn!("parallel_encode_dense failed inside train_quantizer; keeping previous in-memory state unchanged: {e}");
+                    return;
+                }
+            };
+
+        let codes = QuantizedArena::from_dense(data, self.dimension, sorted_vectors.len());
+
+        let mut code_slots: HashMap<VectorId, usize> =
+            HashMap::with_capacity(sorted_vectors.len());
+        let mut slot_ids: Vec<VectorId> = Vec::with_capacity(sorted_vectors.len());
+        for (slot, (id, _)) in sorted_vectors.iter().enumerate() {
             code_slots.insert(*id, slot);
             slot_ids.push(*id);
         }
 
         // 6. Persist quantizer state and codes to disk so the next restart
         //    can take the fast path. Failure to persist is logged but
-        //    non-fatal — the in-memory state is still valid.
+        //    non-fatal, the in-memory state is still valid.
         let quantizer_path = data_dir.join("quantizer.json");
         if let Err(e) = quantizer.save_to_path(&quantizer_path) {
             log::warn!("failed to persist quantizer.json: {e}");
@@ -227,154 +249,8 @@ impl QuantizedHnswIndex {
         *self.cached_scales.write() = scales;
         *self.cached_min_vals.write() = min_vals;
 
-        // 8. Free f32 vectors from RAM — graph topology is preserved.
-        self.hnsw.clear_arena();
+        // Retain f32 arena: HNSW insert path reads neighbour vectors from it. The mmap rescore store on disk is the durable f32 copy.
         self.trained.store(true, Ordering::Release);
-    }
-
-    /// Recovery fast-path: build a `QuantizedHnswIndex` from a previously
-    /// persisted `quantizer.json` + `codes.bin` + `vectors.mmap` triple,
-    /// avoiding any retraining or re-encoding.
-    ///
-    /// Returns:
-    /// - `Ok(Some(index))` if all three artefacts exist, are valid, and
-    ///   match the HNSW topology in size and dimension.
-    /// - `Ok(None)` if any artefact is missing or fails validation —
-    ///   the caller should fall back to `train_quantizer`.
-    /// - `Err(io::Error)` only on hard IO errors that should not be
-    ///   silently ignored.
-    pub fn from_persisted(
-        hnsw: HnswIndex,
-        metric: DistanceMetricType,
-        config: ScalarQuantizationConfig,
-        data_dir: &Path,
-    ) -> Result<Option<Self>, std::io::Error> {
-        let quantizer_path = data_dir.join("quantizer.json");
-        let codes_path = data_dir.join("codes.bin");
-        let mmap_path = data_dir.join("vectors.mmap");
-
-        if !quantizer_path.exists() || !codes_path.exists() || !mmap_path.exists() {
-            return Ok(None);
-        }
-
-        let dimension = hnsw.dimension();
-        let hnsw_count = hnsw.vector_count();
-
-        // 1. Load the quantizer state.
-        let quantizer = match ScalarQuantizer::load_from_path(&quantizer_path) {
-            Ok(q) => q,
-            Err(e) => {
-                log::warn!(
-                    "SQ8 fast-path: failed to load quantizer.json ({e}); falling back to retrain"
-                );
-                return Ok(None);
-            }
-        };
-        if quantizer.dimension() != dimension {
-            log::warn!(
-                "SQ8 fast-path: quantizer dimension {} != hnsw dimension {}; falling back",
-                quantizer.dimension(),
-                dimension
-            );
-            return Ok(None);
-        }
-
-        // 2. Load the persisted codes + slot→id table.
-        let (codes, slot_ids) = match QuantizedArena::load_from_path(&codes_path, dimension) {
-            Ok(pair) => pair,
-            Err(e) => {
-                log::warn!(
-                    "SQ8 fast-path: failed to load codes.bin ({e}); falling back to retrain"
-                );
-                return Ok(None);
-            }
-        };
-        if codes.len() != hnsw_count {
-            log::warn!(
-                "SQ8 fast-path: codes.bin count {} != hnsw vector_count {}; falling back",
-                codes.len(),
-                hnsw_count
-            );
-            return Ok(None);
-        }
-        if slot_ids.len() != codes.len() {
-            log::warn!(
-                "SQ8 fast-path: codes.bin slot_ids length mismatch; falling back"
-            );
-            return Ok(None);
-        }
-
-        // Sanity-check that every persisted ID is still present in the HNSW.
-        for &id in &slot_ids {
-            if !hnsw.contains(id) {
-                log::warn!(
-                    "SQ8 fast-path: persisted code references unknown id {id}; falling back"
-                );
-                return Ok(None);
-            }
-        }
-
-        // 3. Build the code_slots map from the persisted slot→id table.
-        let mut code_slots: HashMap<VectorId, usize> = HashMap::with_capacity(slot_ids.len());
-        for (slot, id) in slot_ids.iter().enumerate() {
-            code_slots.insert(*id, slot);
-        }
-        // Reject duplicates: the HashMap dedupes silently, so a shorter map
-        // means slot_ids contained duplicate ids and the persisted state is
-        // inconsistent.
-        if code_slots.len() != hnsw_count {
-            log::warn!(
-                "SQ8 fast-path: persisted slot table has duplicate ids ({} unique vs {} slots); falling back",
-                code_slots.len(),
-                hnsw_count
-            );
-            return Ok(None);
-        }
-
-        // 4. Open the existing on-disk f32 vector store (no rebuild).
-        let mmap_store = match MmapVectorStore::from_file(&mmap_path) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!(
-                    "SQ8 fast-path: failed to open vectors.mmap ({e}); falling back to retrain"
-                );
-                return Ok(None);
-            }
-        };
-        // The mmap store and codes table must agree on the vector count;
-        // otherwise rescore would silently return wrong results for missing
-        // ids.
-        if mmap_store.len() != hnsw_count {
-            log::warn!(
-                "SQ8 fast-path: vectors.mmap count {} != hnsw vector_count {}; falling back",
-                mmap_store.len(),
-                hnsw_count
-            );
-            return Ok(None);
-        }
-
-        // 5. Cache SIMD scratch and clear the HNSW f32 arena (we never need it).
-        let scales = quantizer.scales();
-        let min_vals = quantizer.min_vals().to_vec();
-        hnsw.clear_arena();
-
-        let index = Self {
-            hnsw,
-            quantizer: RwLock::new(Some(quantizer)),
-            codes: RwLock::new(codes),
-            code_slots: RwLock::new(code_slots),
-            mmap_store: RwLock::new(Some(mmap_store)),
-            config,
-            metric,
-            distance_fn: DistanceMetric::from_metric_type(metric),
-            dimension,
-            trained: AtomicBool::new(true),
-            cached_scales: RwLock::new(scales),
-            cached_min_vals: RwLock::new(min_vals),
-            data_dir: RwLock::new(Some(data_dir.to_path_buf())),
-        };
-
-        Ok(Some(index))
     }
 
     // ── Asymmetric distance ─────────────────────────────────────────────
@@ -581,6 +457,79 @@ impl QuantizedHnswIndex {
         } else {
             Ok(candidates.into_iter().take(k).collect())
         }
+    }
+
+    // ── SQ8 disk-state save helper ──────────────────────────────────────
+
+    /// Persist the three SQ8 artefacts (quantizer.json, codes.bin, vectors.mmap)
+    /// to the target directory. Format compatible with quantization_v3.
+    ///
+    /// Returns an error only if the quantizer is untrained or a hard IO
+    /// failure occurs on the quantizer or codes write. The mmap file is
+    /// already synced to disk by MmapVectorStore (build, append, and rebuild
+    /// each call file.sync_all before remapping), so this helper does not
+    /// re-flush the mmap.
+    fn save_quantization_state_to_dir(&self, dir: &Path) -> Result<(), IndexError> {
+        if !self.trained.load(Ordering::Acquire) {
+            return Err(IndexError::Internal(
+                "save_quantization_state_to_dir called on untrained QuantizedHnswIndex".into(),
+            ));
+        }
+
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return Err(IndexError::Internal(format!(
+                "save_quantization_state_to_dir: failed to create {}: {}",
+                dir.display(),
+                e
+            )));
+        }
+
+        // 1. Write quantizer.json via the existing atomic save path.
+        {
+            let quantizer_guard = self.quantizer.read();
+            let quantizer = quantizer_guard.as_ref().ok_or_else(|| {
+                IndexError::Internal(
+                    "save_quantization_state_to_dir: quantizer is missing".into(),
+                )
+            })?;
+            let quantizer_path = dir.join("quantizer.json");
+            quantizer.save_to_path(&quantizer_path).map_err(|e| {
+                IndexError::Internal(format!(
+                    "save_quantization_state_to_dir: failed to write quantizer.json: {}",
+                    e
+                ))
+            })?;
+        }
+
+        // 2. Write codes.bin via the existing atomic save path. Build the
+        //    slot table from code_slots, indexed by slot number.
+        {
+            let codes = self.codes.read();
+            let code_slots = self.code_slots.read();
+            let mut slot_ids: Vec<VectorId> = vec![0; codes.len()];
+            for (id, &slot) in code_slots.iter() {
+                if slot >= slot_ids.len() {
+                    return Err(IndexError::Internal(format!(
+                        "save_quantization_state_to_dir: slot {} out of range for codes.len={}",
+                        slot,
+                        codes.len()
+                    )));
+                }
+                slot_ids[slot] = *id;
+            }
+            let codes_path = dir.join("codes.bin");
+            codes.save_to_path(&codes_path, &slot_ids).map_err(|e| {
+                IndexError::Internal(format!(
+                    "save_quantization_state_to_dir: failed to write codes.bin: {}",
+                    e
+                ))
+            })?;
+        }
+
+        // 3. vectors.mmap is already file-backed and synced by MmapVectorStore
+        //    on every build, append, or rebuild. No further action required.
+
+        Ok(())
     }
 }
 
@@ -839,6 +788,171 @@ impl PersistableIndex for QuantizedHnswIndex {
         self.hnsw.build_parallel(vectors)
     }
 
+    fn cold_build_parallel(
+        &mut self,
+        vectors: &[(VectorId, &[f32])],
+        config: ParallelBuildConfig,
+    ) -> Result<(), IndexError> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Pre-flight dimension check so a bad input does not leave the
+        //    index half-built.
+        for (_id, v) in vectors.iter() {
+            if v.len() != self.dimension {
+                return Err(IndexError::DimensionMismatch {
+                    expected: self.dimension,
+                    actual: v.len(),
+                });
+            }
+        }
+
+        // 2. Pre-flight uniqueness check.
+        {
+            let mut seen: HashSet<VectorId> = HashSet::with_capacity(vectors.len());
+            for (id, _) in vectors.iter() {
+                if !seen.insert(*id) {
+                    return Err(IndexError::AlreadyExists(*id));
+                }
+            }
+        }
+
+        // 3. Always sort by VectorId for deterministic on-disk bytes. The
+        //    field `config.deterministic` is honored implicitly: we always
+        //    sort because the cost is negligible relative to encode.
+        let mut sorted_vectors: Vec<(VectorId, &[f32])> = vectors.to_vec();
+        sorted_vectors.sort_by_key(|(id, _)| *id);
+
+        // 4. Build the inner HNSW graph sequentially into a LOCAL HnswIndex
+        //    so that any failure does not leave `self.hnsw` partially
+        //    populated. Parallel HNSW build is out of scope for P03; the
+        //    parallel win for SQ8 cold-build comes from the encode step,
+        //    which is the dominant cost.
+        let local_hnsw =
+            HnswIndex::new(self.dimension, self.metric, self.hnsw.params().clone());
+        for (id, vec) in sorted_vectors.iter() {
+            local_hnsw.add(*id, vec)?;
+        }
+
+        // 5. Resolve the data directory before any disk work.
+        let dir_guard = self.data_dir.read();
+        let data_dir = match dir_guard.as_ref() {
+            Some(dir) => dir.clone(),
+            None => {
+                return Err(IndexError::Internal(
+                    "QuantizedHnswIndex::cold_build_parallel: data_dir is unset; \
+                     call set_data_dir before cold_build_parallel"
+                        .into(),
+                ));
+            }
+        };
+        drop(dir_guard);
+
+        // 6. Build the mmap rescore store into a LOCAL handle.
+        let mmap_vectors: Vec<(VectorId, Vec<f32>)> = sorted_vectors
+            .iter()
+            .map(|(id, v)| (*id, v.to_vec()))
+            .collect();
+        let mmap_path = data_dir.join("vectors.mmap");
+        let local_mmap_store = MmapVectorStore::build(&mmap_path, &mmap_vectors, self.dimension)
+            .map_err(|e| {
+                IndexError::Internal(format!(
+                    "cold_build_parallel: failed to build mmap vector store: {e}"
+                ))
+            })?;
+
+        // 7. Train the scalar quantizer, single-threaded inside, on the
+        //    sorted slice. Stays local until atomic publication.
+        let mut local_quantizer = ScalarQuantizer::new(self.dimension);
+        let vec_refs: Vec<&[f32]> = sorted_vectors.iter().map(|(_, v)| *v).collect();
+        local_quantizer
+            .train_with_quantile(&vec_refs, self.config.quantile)
+            .map_err(|e| {
+                IndexError::Internal(format!(
+                    "cold_build_parallel: failed to train scalar quantizer: {e}"
+                ))
+            })?;
+
+        // 8. Parallel encode into a dense byte buffer.
+        let (data, _slot_indices) =
+            parallel_encode_dense(&sorted_vectors, &local_quantizer, &config)?;
+
+        let local_codes =
+            QuantizedArena::from_dense(data, self.dimension, sorted_vectors.len());
+
+        let mut local_code_slots: HashMap<VectorId, usize> =
+            HashMap::with_capacity(sorted_vectors.len());
+        let mut slot_ids: Vec<VectorId> = Vec::with_capacity(sorted_vectors.len());
+        for (slot, (id, _)) in sorted_vectors.iter().enumerate() {
+            local_code_slots.insert(*id, slot);
+            slot_ids.push(*id);
+        }
+
+        // 9. Persist quantizer state and codes for the next restart's
+        //    fast path. Failure to persist is logged but non-fatal, the
+        //    in-memory state is still valid.
+        let quantizer_path = data_dir.join("quantizer.json");
+        if let Err(e) = local_quantizer.save_to_path(&quantizer_path) {
+            log::warn!("cold_build_parallel: failed to persist quantizer.json: {e}");
+        }
+        let codes_path = data_dir.join("codes.bin");
+        if let Err(e) = local_codes.save_to_path(&codes_path, &slot_ids) {
+            log::warn!("cold_build_parallel: failed to persist codes.bin: {e}");
+        }
+
+        // 10. Compute cached SIMD parameters from the (already trained)
+        //     local quantizer. Preserves the original ordering of
+        //     scales / min_vals capture.
+        let scales = local_quantizer.scales();
+        let min_vals = local_quantizer.min_vals().to_vec();
+
+        // 11. ATOMIC PUBLICATION. Every step above has succeeded, so the
+        //     build is committed in one block. No `self.*` mutation
+        //     happens before this point, which keeps the trait-contract
+        //     promise that the index is left empty on any error.
+        self.hnsw = local_hnsw;
+        *self.quantizer.write() = Some(local_quantizer);
+        *self.codes.write() = local_codes;
+        *self.code_slots.write() = local_code_slots;
+        *self.mmap_store.write() = Some(local_mmap_store);
+        *self.cached_scales.write() = scales;
+        *self.cached_min_vals.write() = min_vals;
+
+        // Retain f32 arena: HNSW insert path reads neighbour vectors from it. The mmap rescore store on disk is the durable f32 copy.
+        self.trained.store(true, Ordering::Release);
+
+        log::info!(
+            "QuantizedHnswIndex cold_build_parallel complete: collection_dim={} vector_count={} workers={}",
+            self.dimension,
+            vectors.len(),
+            config.workers
+        );
+
+        Ok(())
+    }
+
+    fn parallel_build_units(
+        &self,
+        vectors: &[(VectorId, &[f32])],
+        config: &ParallelBuildConfig,
+    ) -> Vec<ParallelBuildUnit> {
+        if vectors.is_empty() {
+            return Vec::new();
+        }
+        let code_size = self.dimension;
+        let batches = plan_batches(vectors.len(), code_size, config);
+        batches
+            .into_iter()
+            .enumerate()
+            .map(|(shard_index, (start, end))| ParallelBuildUnit {
+                shard_index,
+                vector_count: end - start,
+                byte_range_hint: Some((start * code_size, end * code_size)),
+            })
+            .collect()
+    }
+
     fn set_delta_writer(&self, writer: HnswDeltaWriter) {
         self.hnsw.set_delta_writer(writer);
     }
@@ -866,6 +980,284 @@ impl PersistableIndex for QuantizedHnswIndex {
         if let Some(ref data_dir) = *dir {
             self.train_quantizer(data_dir);
         }
+    }
+
+    // ── Fast-restart trait surface ──────────────────────────────────────
+
+    fn serialize_state_to_dir(&self, dir: &Path) -> Result<(), IndexError> {
+        // Composition: delegate the HNSW base graph snapshot to the inner
+        // index, then write the SQ8 layer on top.
+        self.hnsw.serialize_state_to_dir(dir)?;
+
+        // Auto-train on first persistence if optimize was never called.
+        // train_quantizer uses interior mutability and is callable through &self.
+        if !self.trained.load(Ordering::Acquire) {
+            let configured_dir_opt = self.data_dir.read().clone();
+            if let Some(configured_dir) = configured_dir_opt {
+                let target = if configured_dir == dir {
+                    configured_dir
+                } else {
+                    dir.to_path_buf()
+                };
+                // Catch panics so a graceful-shutdown caller never crashes
+                // the process on edge-case training failures.
+                let train_result = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| self.train_quantizer(&target)),
+                );
+                if train_result.is_err() {
+                    return Err(IndexError::Internal(
+                        "auto-train inside serialize_state_to_dir panicked".into(),
+                    ));
+                }
+                // train_quantizer returns silently on empty inner-HNSW; trained stays false,
+                // save_quantization_state_to_dir below will then surface the untrained error.
+            }
+        }
+
+        self.save_quantization_state_to_dir(dir)?;
+        Ok(())
+    }
+
+    fn recovery_files(&self) -> &'static [&'static str] {
+        &[
+            "hnsw.base",
+            "hnsw.delta",
+            "shutdown_clean",
+            "quantizer.json",
+            "codes.bin",
+            "vectors.mmap",
+        ]
+    }
+
+    fn try_restore_from_dir(&mut self, dir: &Path) -> Result<RestoreOutcome, IndexError> {
+        // Format: compatible with quantization_v3 on-disk SQ8 layout.
+
+        // 1. Restore the inner HNSW first. Propagate StateMissing or
+        //    StateCorrupt outcomes without touching the SQ8 layer.
+        let hnsw_outcome = self.hnsw.try_restore_from_dir(dir)?;
+        let strategy = match hnsw_outcome {
+            RestoreOutcome::StateMissing => return Ok(RestoreOutcome::StateMissing),
+            RestoreOutcome::StateCorrupt { reason } => {
+                return Ok(RestoreOutcome::StateCorrupt { reason });
+            }
+            RestoreOutcome::Restored { strategy } => strategy,
+        };
+
+        // 2. Existence check on the 3 SQ8 artefacts. Treat any missing
+        //    file as StateMissing so AppState falls back to FullRebuild.
+        let quantizer_path = dir.join("quantizer.json");
+        let codes_path = dir.join("codes.bin");
+        let mmap_path = dir.join("vectors.mmap");
+        if !quantizer_path.exists() || !codes_path.exists() || !mmap_path.exists() {
+            return Ok(RestoreOutcome::StateMissing);
+        }
+
+        let hnsw_count = self.hnsw.vector_count();
+
+        // 3. Load the quantizer state. Soft-fail on validation errors.
+        let quantizer = match ScalarQuantizer::load_from_path(&quantizer_path) {
+            Ok(q) => q,
+            Err(e) => {
+                return Ok(RestoreOutcome::StateCorrupt {
+                    reason: format!("quantizer.json load failed: {}", e),
+                });
+            }
+        };
+        if quantizer.dimension() != self.dimension {
+            return Ok(RestoreOutcome::StateCorrupt {
+                reason: format!(
+                    "quantizer dimension {} does not match configured {}",
+                    quantizer.dimension(),
+                    self.dimension
+                ),
+            });
+        }
+
+        // 4. Load the persisted codes plus slot table.
+        let (codes, slot_ids) = match QuantizedArena::load_from_path(&codes_path, self.dimension) {
+            Ok(pair) => pair,
+            Err(e) => {
+                return Ok(RestoreOutcome::StateCorrupt {
+                    reason: format!("codes.bin load failed: {}", e),
+                });
+            }
+        };
+        if codes.len() != hnsw_count {
+            return Ok(RestoreOutcome::StateCorrupt {
+                reason: format!(
+                    "codes.bin count {} does not match hnsw vector_count {}",
+                    codes.len(),
+                    hnsw_count
+                ),
+            });
+        }
+        if slot_ids.len() != codes.len() {
+            return Ok(RestoreOutcome::StateCorrupt {
+                reason: "codes.bin slot_ids length does not match codes length".into(),
+            });
+        }
+        for &id in &slot_ids {
+            if !self.hnsw.contains(id) {
+                return Ok(RestoreOutcome::StateCorrupt {
+                    reason: format!("codes.bin references id {} not present in HNSW", id),
+                });
+            }
+        }
+
+        // 5. Build the code_slots map and reject duplicate ids in the
+        //    persisted slot table.
+        let mut code_slots: HashMap<VectorId, usize> = HashMap::with_capacity(slot_ids.len());
+        for (slot, id) in slot_ids.iter().enumerate() {
+            code_slots.insert(*id, slot);
+        }
+        if code_slots.len() != hnsw_count {
+            return Ok(RestoreOutcome::StateCorrupt {
+                reason: format!(
+                    "codes.bin slot table has duplicate ids ({} unique vs {} slots)",
+                    code_slots.len(),
+                    hnsw_count
+                ),
+            });
+        }
+
+        // 6. Open the on-disk f32 vector store and validate its count
+        //    against the HNSW. No re-write of the mmap file.
+        let mmap_store = match MmapVectorStore::from_file(&mmap_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(RestoreOutcome::StateCorrupt {
+                    reason: format!("vectors.mmap open failed: {}", e),
+                });
+            }
+        };
+        if mmap_store.len() != hnsw_count {
+            return Ok(RestoreOutcome::StateCorrupt {
+                reason: format!(
+                    "vectors.mmap count {} does not match hnsw vector_count {}",
+                    mmap_store.len(),
+                    hnsw_count
+                ),
+            });
+        }
+
+        // 7. Cache SIMD scratch fields before the publication step.
+        let scales = quantizer.scales();
+        let min_vals = quantizer.min_vals().to_vec();
+
+        // 8. Reset any pre-existing SQ8 state on self so a partially-
+        //    populated caller does not leak codes from a prior collection
+        //    into the freshly-restored view.
+        {
+            *self.quantizer.write() = None;
+            *self.codes.write() = QuantizedArena::new(self.dimension);
+            self.code_slots.write().clear();
+            *self.mmap_store.write() = None;
+            self.cached_scales.write().clear();
+            self.cached_min_vals.write().clear();
+            self.trained.store(false, Ordering::Release);
+        }
+
+        // 9. Publish the loaded SQ8 state.
+        *self.quantizer.write() = Some(quantizer);
+        *self.codes.write() = codes;
+        *self.code_slots.write() = code_slots;
+        *self.mmap_store.write() = Some(mmap_store);
+        *self.cached_scales.write() = scales;
+        *self.cached_min_vals.write() = min_vals;
+        *self.data_dir.write() = Some(dir.to_path_buf());
+        self.trained.store(true, Ordering::Release);
+
+        // Retain f32 arena: HNSW insert path reads neighbour vectors from it. The mmap rescore store on disk is the durable f32 copy.
+
+        Ok(RestoreOutcome::Restored { strategy })
+    }
+
+    fn validate_state_on_disk(dir: &Path, dimension: usize) -> Result<bool, IndexError>
+    where
+        Self: Sized,
+    {
+        // 1. Plain HNSW base validation. Soft-fail propagates as Ok(false).
+        if !HnswIndex::validate_state_on_disk(dir, dimension)? {
+            return Ok(false);
+        }
+
+        // 2. quantizer.json: parseable JSON envelope with matching dim.
+        let quantizer_path = dir.join("quantizer.json");
+        match ScalarQuantizer::load_from_path(&quantizer_path) {
+            Ok(q) => {
+                if q.dimension() != dimension {
+                    return Ok(false);
+                }
+            }
+            Err(_) => return Ok(false),
+        }
+
+        // 3. codes.bin: read the 16-byte header and check magic, version,
+        //    and dimension fields. Magic b"SQ8C", version u32 LE = 1.
+        let codes_path = dir.join("codes.bin");
+        match std::fs::read(&codes_path) {
+            Ok(bytes) => {
+                if bytes.len() < 16 {
+                    return Ok(false);
+                }
+                if &bytes[0..4] != b"SQ8C" {
+                    return Ok(false);
+                }
+                let version = u32::from_le_bytes(
+                    bytes[4..8].try_into().unwrap_or([0, 0, 0, 0]),
+                );
+                if version != 1 {
+                    return Ok(false);
+                }
+                let dim_on_disk = u32::from_le_bytes(
+                    bytes[12..16].try_into().unwrap_or([0, 0, 0, 0]),
+                ) as usize;
+                if dim_on_disk != dimension {
+                    return Ok(false);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(IndexError::Internal(format!(
+                    "validate_state_on_disk: failed to read {}: {}",
+                    codes_path.display(),
+                    e
+                )));
+            }
+        }
+
+        // 4. vectors.mmap: presence check only. Deep validation deferred
+        //    to load time inside try_restore_from_dir.
+        let mmap_path = dir.join("vectors.mmap");
+        if !mmap_path.exists() {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn clear_state_from_dir(dir: &Path) -> Result<(), IndexError>
+    where
+        Self: Sized,
+    {
+        // 1. Clear plain HNSW state first.
+        HnswIndex::clear_state_from_dir(dir)?;
+
+        // 2. Remove the 3 SQ8 artefacts. Tolerate ENOENT.
+        for name in ["quantizer.json", "codes.bin", "vectors.mmap"].iter() {
+            let path = dir.join(name);
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(|e| {
+                    IndexError::Internal(format!(
+                        "clear_state_from_dir: failed to remove {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+
+        Ok(())
     }
 
     fn as_vector_index(&self) -> &dyn VectorIndex {

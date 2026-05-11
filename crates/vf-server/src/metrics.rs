@@ -17,10 +17,10 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 // ── Metric name constants ───────────────────────────────────────────────
 
-/// Search latency histogram (seconds) — REST endpoint.
+/// Search latency histogram (seconds) - REST endpoint.
 pub const SEARCH_LATENCY_REST: &str = "swarndb_search_latency_seconds_rest";
 
-/// Search latency histogram (seconds) — gRPC endpoint.
+/// Search latency histogram (seconds) - gRPC endpoint.
 pub const SEARCH_LATENCY_GRPC: &str = "swarndb_search_latency_seconds_grpc";
 
 /// Total request counter, labelled by endpoint and status.

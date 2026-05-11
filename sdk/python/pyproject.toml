@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "swarndb"
 version = "1.0.0"
-description = "Official Python SDK for SwarnDB — the vector database that thinks in graphs. Combines HNSW + IVF-PQ indexing with virtual graph traversal and 15+ vector math operations."
+description = "Official Python SDK for SwarnDB, the vector database that thinks in graphs. Combines HNSW + IVF-PQ indexing with virtual graph traversal and 15+ vector math operations."
 license = {text = "ELv2"}
 requires-python = ">=3.9"
 authors = [

@@ -6,6 +6,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{Read as IoRead, Write as IoWrite};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ordered_float::OrderedFloat;
@@ -19,10 +20,13 @@ use vf_core::types::{DistanceMetricType, ScoredResult, VectorId};
 use crate::arena::VectorArena;
 use crate::flat_adj::FlatAdjacencyList;
 use crate::hnsw_delta::{HnswDeltaEntry, HnswDeltaOp, HnswDeltaWriter};
-use crate::hnsw_persistence::{HnswTopologySnapshot, TopologyNode};
+use crate::hnsw_persistence::{
+    deserialize_topology_mmap, serialize_topology, validate_envelope_at_path,
+    HnswTopologySnapshot, TopologyNode,
+};
 use crate::hnsw_types::HnswNode;
 use crate::prefetch::{prefetch_neighbors, prefetch_vector};
-use crate::traits::{IndexError, PersistableIndex, VectorIndex};
+use crate::traits::{IndexError, IndexRecoveryStrategy, PersistableIndex, RestoreOutcome, VectorIndex};
 
 #[derive(Debug, Clone)]
 pub struct HnswParams {
@@ -1253,7 +1257,7 @@ impl HnswIndex {
     /// with automatic defragmentation when wasted space exceeds 30%.
     /// Only `build_parallel()` invalidates it entirely (requiring a fresh `compact()`).
     ///
-    /// This is an optional optimization — the index works correctly without it.
+    /// This is an optional optimization; the index works correctly without it.
     pub fn compact(&self) {
         let mut inner = self.inner.write();
         let flat = FlatAdjacencyList::from_hnsw_nodes(&inner.nodes);
@@ -1267,7 +1271,7 @@ impl HnswIndex {
 
     // ── Backward-compatible alias ────────────────────────────────────────
 
-    /// Alias for `bulk_add` — the arena is now the default storage backend,
+    /// Alias for `bulk_add`; the arena is now the default storage backend,
     /// so there is no separate arena-backed construction path.
     #[deprecated(note = "Arena is now the default storage. Use `bulk_add` or `build_parallel` instead.")]
     #[allow(deprecated)]
@@ -1526,6 +1530,85 @@ impl HnswIndex {
         let inner = self.inner.read();
         inner.nodes.len()
     }
+
+    /// Returns a reference to the HNSW configuration parameters.
+    pub fn params(&self) -> &HnswParams {
+        &self.params
+    }
+
+    /// Populate the index's VectorArena from a base-topology snapshot and a
+    /// borrowed (id, vector) lookup map.
+    ///
+    /// Pre-condition: `self` must be empty (no nodes, empty arena), as
+    /// produced by `HnswIndex::with_defaults`. The arena is grown by
+    /// pushing vectors in the slot order recorded in `snapshot.nodes`,
+    /// so the final layout matches the topology's `vector_slot`
+    /// references one-for-one.
+    ///
+    /// Missing entries in `vectors` (vectors that the snapshot mentions
+    /// but the storage layer did not return) are filled with zeros to
+    /// keep slot indices aligned; this matches the behaviour of the
+    /// existing inline boot path in `vf-server`.
+    ///
+    /// The lookup is taken by borrowed slices to avoid forcing the caller
+    /// to clone every vector into an owned `Vec<f32>`. The boot path can
+    /// build the map directly from the segment-loaded `Vec<(VectorId,
+    /// Vec<f32>, Option<Metadata>)>` slice without an intermediate clone.
+    ///
+    /// This is the helper the boot path uses before
+    /// `<HnswIndex as PersistableIndex>::try_restore_from_dir` so that the
+    /// trait method only has to wire the topology onto an already-loaded
+    /// arena.
+    pub fn populate_arena_from_snapshot(
+        &mut self,
+        snapshot: &HnswTopologySnapshot,
+        vectors: &HashMap<VectorId, &[f32]>,
+    ) {
+        // Preserve the original vector_slot indices from the snapshot.
+        // After a partial-delete sequence, the surviving nodes keep their
+        // original slot numbers (with gaps where deletes happened); naively
+        // re-appending in slot order would compact the layout and break
+        // every vector_slot reference in `inner.nodes`. Instead, size the
+        // arena to (max_slot + 1) and write each vector at its original
+        // offset, padding gaps with zeros.
+        let mut nodes_by_slot: Vec<(usize, VectorId)> = snapshot
+            .nodes
+            .iter()
+            .map(|n| (n.vector_slot, n.id))
+            .collect();
+        nodes_by_slot.sort_by_key(|(slot, _)| *slot);
+
+        let mut inner = self.inner.write();
+        inner.vectors.clear();
+        if nodes_by_slot.is_empty() {
+            return;
+        }
+
+        let max_slot = nodes_by_slot.last().map(|(s, _)| *s).unwrap_or(0);
+        let total_slots = max_slot + 1;
+        let zero_vec = vec![0.0f32; self.dimension];
+
+        // Pre-grow the buffer in one shot with zero fill, then overwrite
+        // each live slot at its original index. This preserves the
+        // snapshot's vector_slot references one-for-one even when the
+        // snapshot has gaps from deleted vectors.
+        inner.vectors.resize_to_slots(total_slots, &zero_vec);
+        let mut live: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(nodes_by_slot.len());
+        for (slot, id) in &nodes_by_slot {
+            let data = vectors.get(id).copied().unwrap_or(zero_vec.as_slice());
+            inner.vectors.write_slot(*slot, data);
+            live.insert(*slot);
+        }
+        // Mark non-live slots as free so active_count is accurate and
+        // future pushes reuse the gaps rather than appending past the
+        // existing range.
+        for slot in 0..total_slots {
+            if !live.contains(&slot) {
+                inner.vectors.free(slot);
+            }
+        }
+    }
 }
 
 impl VectorIndex for HnswIndex {
@@ -1641,6 +1724,19 @@ impl PersistableIndex for HnswIndex {
         self.build_parallel(vectors)
     }
 
+    fn cold_build_parallel(
+        &mut self,
+        vectors: &[(VectorId, &[f32])],
+        _config: crate::traits::ParallelBuildConfig,
+    ) -> Result<(), IndexError> {
+        // Delegate to the existing parallel HNSW build. Parallel HNSW
+        // graph build is out of scope for P03; quantized indices are
+        // the priority for the new contract. The legacy build_parallel
+        // is still on the trait and remains the working entry point
+        // for plain HNSW.
+        self.build_parallel(vectors)
+    }
+
     fn set_delta_writer(&self, writer: HnswDeltaWriter) {
         self.set_delta_writer(writer)
     }
@@ -1655,5 +1751,208 @@ impl PersistableIndex for HnswIndex {
 
     fn as_vector_index(&self) -> &dyn VectorIndex {
         self
+    }
+
+    // ── Fast-restart contract (P01) ────────────────────────────────────
+    //
+    // Writes and reads `hnsw.base` (the topology snapshot) in `dir`. The
+    // delta log file `hnsw.delta` is appended live by the delta writer,
+    // not serialised here. The `shutdown_clean` marker is owned by the
+    // shutdown path in vf-storage, not by this trait method.
+    //
+    // The vectors themselves are not serialised by `serialize_state_to_dir`
+    // and not loaded by `try_restore_from_dir`. Vectors live in the
+    // collection's segment files and the caller is responsible for
+    // populating the index's VectorArena before calling restore. See the
+    // architecture doc `persistable-index-trait.md`.
+
+    fn serialize_state_to_dir(&self, dir: &Path) -> Result<(), IndexError> {
+        // Topology snapshot does not carry a "live" LSN at this level; the
+        // delta writer owns the live LSN tail. P01 uses 0 here because the
+        // delta log is the authoritative tail. When the project adds a
+        // proper snapshot-LSN bookkeeping path the value plumbed in here
+        // can be the real one without changing the on-disk format.
+        let snapshot = self.snapshot_topology(0);
+
+        let base_path = dir.join("hnsw.base");
+        let tmp_path = dir.join("hnsw.base.tmp");
+
+        // Write to a temp file, fsync, rename. Atomic publish so a crash
+        // mid-write leaves either the prior file or nothing at the target.
+        {
+            let mut tmp_file = std::fs::File::create(&tmp_path).map_err(|e| {
+                IndexError::Internal(format!(
+                    "serialize_state_to_dir: failed to create {}: {}",
+                    tmp_path.display(),
+                    e
+                ))
+            })?;
+
+            serialize_topology(&snapshot, &mut tmp_file).map_err(|e| {
+                // Best-effort cleanup of the temp file on a write failure.
+                let _ = std::fs::remove_file(&tmp_path);
+                IndexError::Internal(format!(
+                    "serialize_state_to_dir: failed to serialise topology into {}: {}",
+                    tmp_path.display(),
+                    e
+                ))
+            })?;
+
+            tmp_file.sync_all().map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                IndexError::Internal(format!(
+                    "serialize_state_to_dir: fsync failed on {}: {}",
+                    tmp_path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        std::fs::rename(&tmp_path, &base_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            IndexError::Internal(format!(
+                "serialize_state_to_dir: rename {} to {} failed: {}",
+                tmp_path.display(),
+                base_path.display(),
+                e
+            ))
+        })?;
+
+        // fsync the parent directory so the rename is durable.
+        if let Ok(dir_handle) = std::fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+
+        Ok(())
+    }
+
+    fn recovery_files(&self) -> &'static [&'static str] {
+        &["hnsw.base", "hnsw.delta", "shutdown_clean"]
+    }
+
+    /// Pre-condition: `self` must be in the empty state produced by
+    /// `HnswIndex::with_defaults` (no nodes, no entry point), and the
+    /// caller must have populated `self.inner.vectors` (the VectorArena)
+    /// with the collection's vectors prior to this call. The topology
+    /// snapshot references vectors by arena slot, not by value, so the
+    /// arena must line up slot-for-slot with the snapshot. See
+    /// `architecture/persistable-index-trait.md` for the full contract.
+    ///
+    /// Delta replay carve-out (P01): this method loads only the base
+    /// topology from `hnsw.base`. If `shutdown_clean` is absent and the
+    /// base is present, the strategy is reported as `IncrementalReplay`
+    /// and the caller is responsible for replaying `hnsw.delta` on top.
+    /// Lifting delta replay into the trait may happen in a later phase.
+    fn try_restore_from_dir(&mut self, dir: &Path) -> Result<RestoreOutcome, IndexError> {
+        // Enforce the empty-state precondition. We do NOT silently
+        // overwrite a populated index, which would corrupt on-disk state.
+        {
+            let inner = self.inner.read();
+            if !inner.nodes.is_empty() || inner.entry_point.is_some() {
+                return Err(IndexError::Internal(
+                    "try_restore_from_dir called on non-empty HnswIndex".into(),
+                ));
+            }
+        }
+
+        let base_path = dir.join("hnsw.base");
+        if !base_path.exists() {
+            return Ok(RestoreOutcome::StateMissing);
+        }
+
+        // Soft-load the topology. CRC, magic, or version failures are
+        // recoverable; we report them as StateCorrupt for the caller to
+        // fall back to a full rebuild.
+        let snapshot = match deserialize_topology_mmap(&base_path) {
+            Ok(s) => s,
+            Err(IndexError::Internal(reason)) => {
+                return Ok(RestoreOutcome::StateCorrupt { reason });
+            }
+            Err(other) => {
+                return Ok(RestoreOutcome::StateCorrupt {
+                    reason: format!("{}", other),
+                });
+            }
+        };
+
+        // Dimension guard: a snapshot from a different-dimensioned index
+        // must not be silently loaded into this one.
+        if snapshot.dimension as usize != self.dimension {
+            return Ok(RestoreOutcome::StateCorrupt {
+                reason: format!(
+                    "dimension mismatch: snapshot={}, configured={}",
+                    snapshot.dimension, self.dimension
+                ),
+            });
+        }
+
+        // Decide the recovery strategy based on the shutdown marker.
+        // CleanShutdown means a successful base plus a shutdown_clean
+        // marker (caller already validated the base exists). The base
+        // existence is implied here because we just loaded it.
+        let shutdown_marker = dir.join("shutdown_clean");
+        let strategy = if shutdown_marker.exists() {
+            IndexRecoveryStrategy::CleanShutdown
+        } else {
+            IndexRecoveryStrategy::IncrementalReplay {
+                hnsw_base_lsn: snapshot.snapshot_lsn,
+                graph_base_lsn: 0,
+            }
+        };
+
+        // Apply the snapshot in place. Lock the inner state for writing,
+        // walk the topology, and populate the nodes map plus the entry-
+        // point and max-level fields. The VectorArena is left alone; it
+        // was populated by the caller before this method was invoked.
+        {
+            let mut inner = self.inner.write();
+            inner.nodes.reserve(snapshot.nodes.len());
+            for topo_node in snapshot.nodes {
+                let node = HnswNode {
+                    vector_slot: topo_node.vector_slot,
+                    neighbors: topo_node.neighbors,
+                };
+                inner.nodes.insert(topo_node.id, node);
+            }
+            inner.entry_point = snapshot.entry_point;
+            inner.max_level = snapshot.max_level as usize;
+            // The flat adjacency cache is invalidated by any mutation; a
+            // freshly-restored index has no cache.
+            inner.flat_adj = None;
+        }
+
+        Ok(RestoreOutcome::Restored { strategy })
+    }
+
+    fn validate_state_on_disk(dir: &Path, dimension: usize) -> Result<bool, IndexError>
+    where
+        Self: Sized,
+    {
+        let base_path = dir.join("hnsw.base");
+        validate_envelope_at_path(&base_path, dimension)
+    }
+
+    fn clear_state_from_dir(dir: &Path) -> Result<(), IndexError>
+    where
+        Self: Sized,
+    {
+        let remove_if_present = |name: &str| -> Result<(), IndexError> {
+            let path = dir.join(name);
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(IndexError::Internal(format!(
+                    "clear_state_from_dir: failed to remove {}: {}",
+                    path.display(),
+                    e
+                ))),
+            }
+        };
+
+        // Order matches recovery_files(): base, delta, shutdown marker.
+        remove_if_present("hnsw.base")?;
+        remove_if_present("hnsw.delta")?;
+        remove_if_present("shutdown_clean")?;
+        Ok(())
     }
 }

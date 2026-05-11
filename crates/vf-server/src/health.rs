@@ -111,7 +111,7 @@ async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
 // K8s probe handlers
 // ---------------------------------------------------------------------------
 
-/// `GET /healthz` – Kubernetes liveness probe.
+/// `GET /healthz` - Kubernetes liveness probe.
 /// Returns 200 as long as the server process is running (simple ping).
 async fn healthz() -> Json<ProbeResponse> {
     Json(ProbeResponse {
@@ -120,7 +120,7 @@ async fn healthz() -> Json<ProbeResponse> {
     })
 }
 
-/// `GET /readyz` – Kubernetes readiness probe.
+/// `GET /readyz` - Kubernetes readiness probe.
 /// Returns 200 when all checks pass, 503 otherwise.
 ///
 /// Checks:
@@ -174,7 +174,7 @@ async fn readyz(State(state): State<ProbeState>) -> impl IntoResponse {
     }
 }
 
-/// `GET /startupz` – Kubernetes startup probe.
+/// `GET /startupz` - Kubernetes startup probe.
 /// Returns 200 once server initialization is complete, 503 otherwise.
 async fn startupz(State(state): State<ProbeState>) -> impl IntoResponse {
     if state.server_status.is_initialized() {

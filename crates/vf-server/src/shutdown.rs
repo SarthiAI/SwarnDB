@@ -144,6 +144,30 @@ pub async fn graceful_shutdown(state: AppState) {
                 }
             }
 
+            // Persist any index-specific sidecars via the PersistableIndex trait.
+            // On plain HNSW this rewrites hnsw.base (redundant but cheap).
+            // On SQ8 this writes quantizer.json + codes.bin + vectors.mmap.
+            if let Err(e) = coll_state.index.serialize_state_to_dir(&collection_dir) {
+                tracing::error!(
+                    collection = %name,
+                    "failed to persist index sidecars via trait: {}", e
+                );
+                // Continue: hnsw.base was already written by the manual path above, so
+                // the collection is at least partially persisted on a sidecar error.
+            }
+
+            // Sync pending HNSW delta writer buffers so the BufWriter contents
+            // survive shutdown and feed the next boot's IncrementalReplay path.
+            if let Some(mut delta_writer) = coll_state.index.take_delta_writer() {
+                if let Err(e) = delta_writer.sync() {
+                    tracing::warn!(
+                        collection = %name,
+                        "failed to sync hnsw delta on graceful shutdown: {}", e
+                    );
+                }
+                drop(delta_writer);
+            }
+
             // 2. Serialize and persist virtual graph base snapshot (only if not deferred).
             {
                 let graph_deferred = coll_state.deferred_graph.load(std::sync::atomic::Ordering::Acquire);

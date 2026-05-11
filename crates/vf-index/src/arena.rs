@@ -28,7 +28,7 @@ pub struct ArenaNode {
 /// # Design
 ///
 /// * Chunks are `Vec<ArenaNode>` pre-allocated to `chunk_size` capacity.
-/// * New chunks are appended when the current one is full — existing chunks are
+/// * New chunks are appended when the current one is full - existing chunks are
 ///   never moved or reallocated.
 /// * [`ArenaNodeId`] encodes `(chunk_index, offset)` in a single `u32` using
 ///   bit-shifting so that `get` / `get_mut` are O(1).
@@ -38,7 +38,7 @@ pub struct ArenaNode {
 pub struct NodeArena {
     chunks: Vec<Vec<ArenaNode>>,
     chunk_size: usize,
-    /// log2(chunk_size) — used for bit-shift encoding of ArenaNodeId.
+    /// log2(chunk_size) - used for bit-shift encoding of ArenaNodeId.
     shift: u32,
     /// Bitmask for extracting offset from an ArenaNodeId (`chunk_size - 1`).
     mask: u32,
@@ -78,10 +78,10 @@ impl NodeArena {
 
     /// Allocates a node in the arena and returns its compact id.
     ///
-    /// * `vector` — the embedding vector for this node.
-    /// * `max_level` — the HNSW level assigned to this node (0-based). Neighbor
+    /// * `vector` - the embedding vector for this node.
+    /// * `max_level` - the HNSW level assigned to this node (0-based). Neighbor
     ///   vecs are pre-allocated for levels `0..=max_level`.
-    /// * `max_neighbors` — capacity hint for each level's neighbor list.
+    /// * `max_neighbors` - capacity hint for each level's neighbor list.
     pub fn alloc(
         &mut self,
         vector: Vec<f32>,
@@ -232,7 +232,7 @@ impl VectorArena {
         );
 
         if let Some(slot) = self.free_slots.pop() {
-            // Reuse a freed slot — overwrite in place.
+            // Reuse a freed slot - overwrite in place.
             let start = slot * self.dimension;
             self.data[start..start + self.dimension].copy_from_slice(vector);
             slot
@@ -257,12 +257,61 @@ impl VectorArena {
 
     /// Marks a slot as free for future reuse.
     ///
-    /// The underlying memory is not reclaimed — it will be overwritten by the
+    /// The underlying memory is not reclaimed - it will be overwritten by the
     /// next `push` that reuses this slot. Callers must not access the slot
     /// after freeing it.
     pub fn free(&mut self, slot: usize) {
         debug_assert!(slot < self.slot_count, "VectorArena::free: slot out of bounds");
         self.free_slots.push(slot);
+    }
+
+    /// Grows the arena to hold exactly `total_slots` slots, filling new
+    /// slots with `fill`. Used by the restore path to preserve the
+    /// original `vector_slot` layout from a topology snapshot (which may
+    /// contain gaps from deleted vectors). The caller is expected to
+    /// then overwrite the live slots via `write_slot` and call `free`
+    /// for the gap slots.
+    ///
+    /// # Panics
+    /// Panics if `fill.len() != self.dimension`.
+    pub fn resize_to_slots(&mut self, total_slots: usize, fill: &[f32]) {
+        assert_eq!(
+            fill.len(),
+            self.dimension,
+            "VectorArena::resize_to_slots: fill dim {} != arena dim {}",
+            fill.len(),
+            self.dimension
+        );
+        self.data.clear();
+        self.data.reserve(total_slots * self.dimension);
+        for _ in 0..total_slots {
+            self.data.extend_from_slice(fill);
+        }
+        self.slot_count = total_slots;
+        self.free_slots.clear();
+    }
+
+    /// Overwrites the vector at an existing slot index. Used by the
+    /// restore path after `resize_to_slots`.
+    ///
+    /// # Panics
+    /// Panics if `slot >= slot_count` or `vector.len() != self.dimension`.
+    pub fn write_slot(&mut self, slot: usize, vector: &[f32]) {
+        assert!(
+            slot < self.slot_count,
+            "VectorArena::write_slot: slot {} out of range (slot_count={})",
+            slot,
+            self.slot_count
+        );
+        assert_eq!(
+            vector.len(),
+            self.dimension,
+            "VectorArena::write_slot: expected dim {}, got {}",
+            self.dimension,
+            vector.len()
+        );
+        let start = slot * self.dimension;
+        self.data[start..start + self.dimension].copy_from_slice(vector);
     }
 
     /// Returns the vector dimension.

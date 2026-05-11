@@ -3,7 +3,7 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
-//! Product Quantizer — splits vectors into M subvectors, quantizes each
+//! Product Quantizer - splits vectors into M subvectors, quantizes each
 //! independently using a 256-entry codebook (codes fit in `u8`).
 
 use rayon::prelude::*;
@@ -107,8 +107,8 @@ impl ProductQuantizer {
     /// Train the product quantizer by running k-means on each subvector slice.
     ///
     /// # Arguments
-    /// * `vectors` — training vectors, each of length `self.dimension`.
-    /// * `max_iters` — maximum k-means iterations per sub-quantizer.
+    /// * `vectors` - training vectors, each of length `self.dimension`.
+    /// * `max_iters` - maximum k-means iterations per sub-quantizer.
     ///
     /// # Errors
     /// * `EmptyTrainingData` if `vectors` is empty.

@@ -255,7 +255,7 @@ class SwarnDBClient:
                     time.sleep(delay)
                     continue
 
-                # Non-retryable or exhausted retries — convert to SDK error
+                # Non-retryable or exhausted retries, convert to SDK error
                 raise self._translate_error(exc) from exc
 
         # Should not reach here, but guard anyway
