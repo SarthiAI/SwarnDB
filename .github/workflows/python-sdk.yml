@@ -44,9 +44,9 @@ jobs:
         os:
           - ubuntu-latest      # Linux x86_64
           - ubuntu-24.04-arm   # Linux ARM64
-          - macos-13           # macOS x86_64 (Intel)
           - macos-14           # macOS ARM64 (Apple Silicon)
           - windows-latest     # Windows x86_64
+          - windows-11-arm     # Windows ARM64
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
