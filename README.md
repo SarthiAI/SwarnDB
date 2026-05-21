@@ -23,6 +23,7 @@ SwarnDB is a high-performance vector database written in Rust that combines HNSW
 **One engine, three capabilities: vector search, graph traversal, and vector mathematics.**
 
 > - **macOS Intel (x86_64) is not built by CI.** Apple Silicon Macs only for the macOS wheel today. Intel-Mac users can run the manual release script on an x86_64 macOS host or wait for native support.
+> - **Windows ARM64 is not built by CI.** Windows x86_64 only for the Windows wheel today. Windows on ARM hosts can run the x86_64 wheel under Windows' built-in x86 emulation, or wait for native support.
 
 ---
 
