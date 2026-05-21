@@ -105,7 +105,7 @@ Reading the same 1M dataset via the streaming gRPC bulk insert path on the same 
 
 ### Reproduction recipe
 
-Stage the data as a `.npy` file in a directory listed in the server's `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` (which defaults to `SWARNDB_DATA_DIR`):
+Stage the data as a `.npy` file on a path the server can read:
 
 ```python
 import numpy as np
@@ -205,16 +205,15 @@ docker run -d --name swarndb \
   -p 50051:50051 \
   -v swarndb_data:/data \
   -e SWARNDB_DATA_DIR=/data \
-  -e SWARNDB_BULK_INSERT_ALLOWED_ROOTS=/data \
   -e SWARNDB_WAL_FSYNC_MODE=per_batch:10000 \
   sarthiai/swarndb:latest
 ```
 
-For the ingestion run, mount the directory that holds your `.npy` file at the path you pass to `bulk_insert_from_path`, and include it in `SWARNDB_BULK_INSERT_ALLOWED_ROOTS`.
+For the ingestion run, mount the directory that holds your `.npy` file at the path you pass to `bulk_insert_from_path`.
 
 ### 2. Stage the dataset
 
-Stage the W1M-1536 dataset (DBpedia 1M at 1536 dim) as a `.npy` file inside an allowed root:
+Stage the W1M-1536 dataset (DBpedia 1M at 1536 dim) as a `.npy` file on a path the server can read:
 
 ```python
 import numpy as np

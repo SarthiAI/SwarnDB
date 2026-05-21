@@ -38,7 +38,7 @@ with SwarnDBClient(host="localhost", port=50051) as client:
 
 ## Bulk Insert From a File
 
-For large loads, stage your vectors as a `.npy` (or flat `.f32`) file in a directory listed in the server's `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` (which defaults to `SWARNDB_DATA_DIR`), then point the server at the file. The server reads the file via memory mapping, so the working memory for the load is bounded by the index being built rather than by the input file size.
+For large loads, stage your vectors as a `.npy` (or flat `.f32`) file on a path the server can read, then point the server at the file. The server reads the file via memory mapping, so the working memory for the load is bounded by the index being built rather than by the input file size.
 
 ```python
 import numpy as np

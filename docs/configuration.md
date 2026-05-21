@@ -136,21 +136,6 @@ SwarnDB persists collections to disk through a write-ahead log plus periodic sna
 |----------|---------|------|-------------|
 | `SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS` | `min(cores, 4)` | usize | Number of collections loaded in parallel during server startup. |
 
-### Bulk Insert From Path
-
-The `bulk_insert_from_path` API reads files from the server's local filesystem. This variable controls which filesystem roots the server will accept files from.
-
-| Variable | Default | Type | Description |
-|----------|---------|------|-------------|
-| `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` | value of `SWARNDB_DATA_DIR` | string | Comma-separated list of absolute directory paths the server will read bulk-insert files from. Paths must be absolute; relative paths cause the server to fail at startup. Paths outside the listed roots, symlinks, and `..` traversal are rejected at request time. |
-
-Example: allow staging from two object-store mount points alongside the data dir.
-
-```bash
-SWARNDB_DATA_DIR=/var/lib/swarndb/data
-SWARNDB_BULK_INSERT_ALLOWED_ROOTS=/var/lib/swarndb/data,/mnt/s3/uploads,/mnt/nfs/ingest
-```
-
 ---
 
 ## 9. Setting Configuration

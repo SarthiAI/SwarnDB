@@ -602,12 +602,12 @@ Ingests vectors from a `.npy` or flat `.f32` file on the server's local filesyst
 
 | Parameter             | Type   | Required | Default       | Description                                                                                                                                                                                                                  |
 |-----------------------|--------|----------|---------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| path                  | string | Yes      |               | Absolute path to the vector file on the server's filesystem. Must sit inside one of the directories listed in `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` (which defaults to `SWARNDB_DATA_DIR`). Symlinks and `..` traversal are rejected. |
+| path                  | string | Yes      |               | Absolute path to the vector file on the server's filesystem. The server process must have permission to read it. |
 | dim                   | uint32 | No       | `0`           | Vector dimensionality. `0` defers to the collection's configured dimension.                                                                                                                                                  |
 | expected_count        | uint64 | No       | `0`           | Expected number of vectors. `0` lets the server infer from file size.                                                                                                                                                        |
 | total_count_hint      | uint64 | No       | `0`           | Hint for the total vector count across multiple bulk inserts; used for arena capacity planning.                                                                                                                              |
 | id_start              | uint64 | No       | `1`           | Starting ID for auto-assigned IDs.                                                                                                                                                                                           |
-| ids_path              | string | No       | `""`          | Optional path to a sidecar file containing explicit IDs (one per vector). Empty string uses auto-assigned IDs starting at `id_start`. Same allowed-roots rules apply.                                                       |
+| ids_path              | string | No       | `""`          | Optional path to a sidecar file containing explicit IDs (one per vector). Empty string uses auto-assigned IDs starting at `id_start`. The server process must have permission to read it. |
 | skip_metadata_index   | bool   | No       | `false`       | Skip metadata indexing during insert. Rebuild later via `optimize()`.                                                                                                                                                        |
 | index_mode            | string | No       | `"immediate"` | `"immediate"` builds the index during insert. `"deferred"` builds it after, via `optimize()`.                                                                                                                                |
 | ef_construction       | uint32 | No       | `0`           | HNSW `ef_construction` override for this batch. `0` uses the collection default.                                                                                                                                             |
@@ -620,7 +620,7 @@ Ingests vectors from a `.npy` or flat `.f32` file on the server's local filesyst
 
 **Response:** same fields as the bulk insert response (`inserted_count`, `errors`, `last_completed_batch_idx`, `last_committed_lsn`, `resume_token`, `assigned_ids`).
 
-**Status Codes:** 200 (success, possibly partial), 400 (invalid options, dimension mismatch, file size mismatch), 403 (path outside allowed roots, symlink, traversal), 404 (collection not found, file not found), 500 (storage error)
+**Status Codes:** 200 (success, possibly partial), 400 (invalid options, dimension mismatch, file size mismatch), 403 (server denied the path), 404 (collection not found, file not found), 500 (storage error)
 
 Resume mid-call is not supported for `bulk-from-path`; on failure, restart the full call. For resumable bulk loads, use streaming `BulkInsertWithOptions` with `checkpoint_every` and `resume_token`.
 

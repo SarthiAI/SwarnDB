@@ -192,7 +192,7 @@ SwarnDB is organized as seven Rust crates with clean dependency boundaries:
 
 - **Single insert** for one-at-a-time writes via gRPC or REST
 - **Streaming bulk insert** with batched gRPC streams, configurable batch lock size, write-ahead log flush interval, and optional parallel HNSW construction
-- **File-based bulk insert** via `bulk_insert_from_path`: the server reads a `.npy` or flat `.f32` file from a configured allowed root and ingests directly from the kernel page cache, without copying the payload through gRPC
+- **File-based bulk insert** via `bulk_insert_from_path`: the server reads a `.npy` or flat `.f32` file from any path it can read and ingests directly from the kernel page cache, without copying the payload through gRPC
 - **Deferred indexing** during bulk loads, finalized by a single `optimize()` call that rebuilds the HNSW index and the metadata index, with the virtual graph rebuilt on the same call when `rebuild_graph=true` is passed
 - **Bulk insert checkpoints and resume** via per-batch checkpoints and an opaque `resume_token` returned in the bulk-insert response, so interrupted loads can pick up from the last committed batch
 

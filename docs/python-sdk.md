@@ -344,7 +344,7 @@ bulk_insert_from_path(
 **Path and format requirements:**
 
 - The `path` must be absolute and must point to a file the server can read.
-- The path must sit inside one of the directories listed in the server's `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` environment variable, which defaults to `SWARNDB_DATA_DIR`. Paths outside the allowed roots are rejected. Symlinks and `..` traversal are rejected.
+- The path must point to a file the server process can read.
 - Supported wire formats: `.npy` (auto-detected via NumPy magic bytes) and flat little-endian `float32` (`.f32`), where the file is `expected_count * dim * 4` bytes.
 
 Resume mid-call is not supported for `bulk_insert_from_path`; on failure, restart the full call. For resumable bulk loads, use streaming `bulk_insert` with `BulkInsertResult.resume_token`.
@@ -955,7 +955,7 @@ print(ps.last_snapshot_lsn, ps.current_lsn, ps.next_lsn)
 Forces a synchronous snapshot for a collection and returns the LSN written. Useful before deliberate restarts or for taking snapshots on a schedule outside the server's auto-snapshot policy.
 
 ```python
-lsn = client.collections.snapshot_collection("docs")
+lsn = client.collections.snapshot("docs")
 print(f"snapshot at LSN {lsn}")
 ```
 
