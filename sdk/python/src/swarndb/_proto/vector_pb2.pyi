@@ -78,15 +78,23 @@ class DeleteVectorResponse(_message.Message):
     def __init__(self, success: bool = ...) -> None: ...
 
 class BulkInsertResponse(_message.Message):
-    __slots__ = ("inserted_count", "errors")
+    __slots__ = ("inserted_count", "errors", "last_completed_batch_idx", "last_committed_lsn", "resume_token", "assigned_ids")
     INSERTED_COUNT_FIELD_NUMBER: _ClassVar[int]
     ERRORS_FIELD_NUMBER: _ClassVar[int]
+    LAST_COMPLETED_BATCH_IDX_FIELD_NUMBER: _ClassVar[int]
+    LAST_COMMITTED_LSN_FIELD_NUMBER: _ClassVar[int]
+    RESUME_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    ASSIGNED_IDS_FIELD_NUMBER: _ClassVar[int]
     inserted_count: int
     errors: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, inserted_count: _Optional[int] = ..., errors: _Optional[_Iterable[str]] = ...) -> None: ...
+    last_completed_batch_idx: int
+    last_committed_lsn: int
+    resume_token: str
+    assigned_ids: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, inserted_count: _Optional[int] = ..., errors: _Optional[_Iterable[str]] = ..., last_completed_batch_idx: _Optional[int] = ..., last_committed_lsn: _Optional[int] = ..., resume_token: _Optional[str] = ..., assigned_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class BulkInsertOptions(_message.Message):
-    __slots__ = ("batch_lock_size", "defer_graph", "wal_flush_every", "ef_construction", "index_mode", "skip_metadata_index", "parallel_build")
+    __slots__ = ("batch_lock_size", "defer_graph", "wal_flush_every", "ef_construction", "index_mode", "skip_metadata_index", "parallel_build", "checkpoint_every", "resume_token")
     BATCH_LOCK_SIZE_FIELD_NUMBER: _ClassVar[int]
     DEFER_GRAPH_FIELD_NUMBER: _ClassVar[int]
     WAL_FLUSH_EVERY_FIELD_NUMBER: _ClassVar[int]
@@ -94,6 +102,8 @@ class BulkInsertOptions(_message.Message):
     INDEX_MODE_FIELD_NUMBER: _ClassVar[int]
     SKIP_METADATA_INDEX_FIELD_NUMBER: _ClassVar[int]
     PARALLEL_BUILD_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_EVERY_FIELD_NUMBER: _ClassVar[int]
+    RESUME_TOKEN_FIELD_NUMBER: _ClassVar[int]
     batch_lock_size: int
     defer_graph: bool
     wal_flush_every: int
@@ -101,7 +111,9 @@ class BulkInsertOptions(_message.Message):
     index_mode: str
     skip_metadata_index: bool
     parallel_build: bool
-    def __init__(self, batch_lock_size: _Optional[int] = ..., defer_graph: bool = ..., wal_flush_every: _Optional[int] = ..., ef_construction: _Optional[int] = ..., index_mode: _Optional[str] = ..., skip_metadata_index: bool = ..., parallel_build: bool = ...) -> None: ...
+    checkpoint_every: int
+    resume_token: str
+    def __init__(self, batch_lock_size: _Optional[int] = ..., defer_graph: bool = ..., wal_flush_every: _Optional[int] = ..., ef_construction: _Optional[int] = ..., index_mode: _Optional[str] = ..., skip_metadata_index: bool = ..., parallel_build: bool = ..., checkpoint_every: _Optional[int] = ..., resume_token: _Optional[str] = ...) -> None: ...
 
 class BulkInsertStreamMessage(_message.Message):
     __slots__ = ("options", "vector")
@@ -172,3 +184,29 @@ class CompactResponse(_message.Message):
     vectors_removed: int
     duration_ms: int
     def __init__(self, status: _Optional[str] = ..., segments_merged: _Optional[int] = ..., vectors_written: _Optional[int] = ..., vectors_removed: _Optional[int] = ..., duration_ms: _Optional[int] = ...) -> None: ...
+
+class BulkInsertFromPathRequest(_message.Message):
+    __slots__ = ("collection", "path", "dim", "expected_count", "total_count_hint", "id_start", "ids_path", "skip_metadata_index", "index_mode", "ef_construction", "chunk_size")
+    COLLECTION_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    DIM_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_COUNT_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_COUNT_HINT_FIELD_NUMBER: _ClassVar[int]
+    ID_START_FIELD_NUMBER: _ClassVar[int]
+    IDS_PATH_FIELD_NUMBER: _ClassVar[int]
+    SKIP_METADATA_INDEX_FIELD_NUMBER: _ClassVar[int]
+    INDEX_MODE_FIELD_NUMBER: _ClassVar[int]
+    EF_CONSTRUCTION_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_SIZE_FIELD_NUMBER: _ClassVar[int]
+    collection: str
+    path: str
+    dim: int
+    expected_count: int
+    total_count_hint: int
+    id_start: int
+    ids_path: str
+    skip_metadata_index: bool
+    index_mode: str
+    ef_construction: int
+    chunk_size: int
+    def __init__(self, collection: _Optional[str] = ..., path: _Optional[str] = ..., dim: _Optional[int] = ..., expected_count: _Optional[int] = ..., total_count_hint: _Optional[int] = ..., id_start: _Optional[int] = ..., ids_path: _Optional[str] = ..., skip_metadata_index: bool = ..., index_mode: _Optional[str] = ..., ef_construction: _Optional[int] = ..., chunk_size: _Optional[int] = ...) -> None: ...

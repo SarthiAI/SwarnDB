@@ -17,6 +17,7 @@ pub mod restore;
 pub mod backup;
 pub mod atomic_write;
 pub mod file_lock;
+pub mod bulk_checkpoint;
 mod util;
 
 pub use error::{StorageError, StorageResult};

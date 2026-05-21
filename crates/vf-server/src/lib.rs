@@ -4,6 +4,8 @@
 // Change License: MIT
 
 pub mod auth;
+pub mod bulk_checkpoint_token;
+pub mod bulk_insert_from_path;
 pub mod concurrency;
 pub mod config;
 pub mod convert;

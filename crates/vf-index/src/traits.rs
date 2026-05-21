@@ -4,6 +4,7 @@
 // Change License: MIT
 
 use std::path::Path;
+use std::sync::Arc;
 
 use vf_core::types::{ScoredResult, SearchQuantizationParams, VectorId};
 
@@ -110,6 +111,35 @@ pub trait VectorIndex: Send + Sync {
 pub trait PersistableIndex: VectorIndex {
     /// Insert a vector and emit a delta entry if a writer is attached.
     fn add_with_lsn(&self, id: VectorId, vector: &[f32], lsn: u64) -> Result<(), IndexError>;
+
+    // Bulk parallel insert with delta entries; default impl loops per-item so non-HNSW indices stay correct.
+    // Vectors arrive wrapped in Arc so the index path avoids byte-level clones; the parallel HNSW impl
+    // uses Arc::clone (refcount bump only) for the concurrent node map.
+    fn bulk_add_with_lsn(
+        &self,
+        items: &[(VectorId, Arc<Vec<f32>>, u64)],
+    ) -> Result<(), IndexError> {
+        for (id, vector, lsn) in items {
+            self.add_with_lsn(*id, vector.as_slice(), *lsn)?;
+        }
+        Ok(())
+    }
+
+    // Bulk insert that accepts borrowed slices (typically backed by an mmap) to skip the per-row
+    // Arc<Vec<f32>> allocation. Default impl synthesizes owned buffers and delegates to
+    // bulk_add_with_lsn so non-HNSW indices stay correct; the HNSW impl overrides to keep the
+    // borrow live and avoid the existing-node snapshot.
+    fn bulk_add_from_slice_iter<'mmap>(
+        &self,
+        items: &[(VectorId, &'mmap [f32], u64)],
+        _total_count_hint: usize,
+    ) -> Result<(), IndexError> {
+        let owned: Vec<(VectorId, Arc<Vec<f32>>, u64)> = items
+            .iter()
+            .map(|(id, v, lsn)| (*id, Arc::new(v.to_vec()), *lsn))
+            .collect();
+        self.bulk_add_with_lsn(&owned)
+    }
 
     /// Remove a vector and emit a delta entry if a writer is attached.
     fn remove_with_lsn(&self, id: VectorId, lsn: u64) -> Result<(), IndexError>;

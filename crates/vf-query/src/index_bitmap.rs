@@ -162,6 +162,17 @@ impl BitmapIndex {
         self.all_ids.is_empty()
     }
 
+    /// Release excess capacity in the internal maps after a bulk insert.
+    /// HashMap does not shrink automatically when entries are removed; calling
+    /// this at a quiescent point returns memory accumulated by capacity ratchet.
+    pub fn compact(&mut self) {
+        self.bitmaps.shrink_to_fit();
+        self.id_to_keys.shrink_to_fit();
+        for keys in self.id_to_keys.values_mut() {
+            keys.shrink_to_fit();
+        }
+    }
+
     /// Convert a `MetadataValue` to a `BitmapKey`.
     /// Returns `None` for Float and StringList (StringList is handled separately).
     fn to_key(value: &MetadataValue) -> Option<BitmapKey> {

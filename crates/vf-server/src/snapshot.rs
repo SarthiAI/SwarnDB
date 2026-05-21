@@ -18,15 +18,15 @@ use tokio::sync::watch;
 
 use std::sync::atomic::Ordering;
 
-use crate::state::AppState;
+use crate::state::{metered_read, metered_write, AppState};
 
 /// Configuration for the background snapshot scheduler.
 pub struct SnapshotConfig {
     /// How often to check snapshot triggers (default 30s).
     pub check_interval: Duration,
-    /// Snapshot after this many mutations (default 50_000).
+    /// Snapshot after this many mutations (default 25_000, sized for 60s recovery SLA at 1M).
     pub mutation_threshold: u64,
-    /// Max time between snapshots (default 15 min).
+    /// Max time between snapshots (default 120s, sized for 60s recovery SLA at 1M).
     pub time_interval: Duration,
 }
 
@@ -34,8 +34,8 @@ impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
             check_interval: Duration::from_secs(30),
-            mutation_threshold: 50_000,
-            time_interval: Duration::from_secs(900),
+            mutation_threshold: 25_000,
+            time_interval: Duration::from_secs(120),
         }
     }
 }
@@ -106,15 +106,16 @@ pub async fn start_snapshot_scheduler(
             let time_triggered = time_since_last >= config.time_interval;
 
             // Check dirty flag and mutation count from CollectionState.
-            let (is_dirty, mutations) = {
-                let collections = state.collections.read();
-                match collections.get(name) {
-                    Some(coll) => (
+            // Brief per-collection read lock; atomics are cheap.
+            let (is_dirty, mutations) = match state.collection_handle(name) {
+                Some(handle) => {
+                    let coll = metered_read(&handle);
+                    (
                         coll.dirty.load(Ordering::Acquire),
                         coll.mutation_count.load(Ordering::Acquire),
-                    ),
-                    None => continue,
+                    )
                 }
+                None => continue,
             };
 
             let mutation_triggered = mutations >= config.mutation_threshold;
@@ -125,6 +126,8 @@ pub async fn start_snapshot_scheduler(
             }
 
             // Resolve the collection directory from CollectionManager.
+            // current_lsn is read inside snapshot_collection so the LSN
+            // and the snapshot share the same lifetime window.
             let collection_dir = {
                 let cm = state.collection_manager.read();
                 match cm.get_collection(name) {
@@ -140,22 +143,13 @@ pub async fn start_snapshot_scheduler(
                 }
             };
 
-            // Get the current LSN from the storage collection.
-            let current_lsn = {
-                let cm = state.collection_manager.read();
-                match cm.get_collection(name) {
-                    Ok(coll) => coll.current_lsn(),
-                    Err(_) => continue,
-                }
-            };
-
             // Perform the snapshot under a read lock on collections.
-            match snapshot_collection(name, &state, &collection_dir, current_lsn) {
-                Ok(()) => {
+            match snapshot_collection(name, &state, &collection_dir) {
+                Ok(snapshot_lsn) => {
                     last_snapshot_times.insert(name.clone(), Instant::now());
                     tracing::info!(
                         collection = %name,
-                        lsn = current_lsn,
+                        lsn = snapshot_lsn,
                         "background snapshot completed"
                     );
                 }
@@ -171,6 +165,25 @@ pub async fn start_snapshot_scheduler(
     }
 }
 
+/// Force a synchronous snapshot of a single collection. Resolves the
+/// collection directory from the storage manager and delegates to
+/// `snapshot_collection`. Returns the embedded LSN on success.
+///
+/// This is the entry point for the `POST /collections/{name}/snapshot`
+/// REST endpoint and its matching gRPC RPC. Callers should not hold any
+/// per-collection lock when invoking it; the snapshot path takes its own
+/// per-collection read and write locks in sequence.
+pub fn force_snapshot_collection(state: &AppState, name: &str) -> Result<u64, String> {
+    let collection_dir = {
+        let cm = state.collection_manager.read();
+        let coll = cm
+            .get_collection(name)
+            .map_err(|e| format!("collection '{}' not found: {}", name, e))?;
+        coll.collection_dir().to_path_buf()
+    };
+    snapshot_collection(name, state, &collection_dir)
+}
+
 /// Snapshot a single collection's HNSW topology and virtual graph to base files.
 ///
 /// Steps:
@@ -179,18 +192,41 @@ pub async fn start_snapshot_scheduler(
 /// 3. Take and reset delta writers (HNSW + graph)
 /// 4. Update wal_meta.json with last_snapshot_lsn
 /// 5. Prune old WAL files
+///
+/// Returns the LSN that was embedded into the snapshot.
 fn snapshot_collection(
     name: &str,
     state: &AppState,
     collection_dir: &Path,
-    current_lsn: u64,
-) -> Result<(), String> {
-    // 1. Snapshot HNSW topology under a read lock.
+) -> Result<u64, String> {
+    // 1. Read current_lsn BEFORE taking the snapshot. This is the "safe
+    //    understatement" direction: the embedded LSN may be slightly lower
+    //    than the highest LSN actually captured in the snapshot (any insert
+    //    that races between the LSN read and the snapshot's internal
+    //    inner.read() acquisition lands in both the snapshot AND the delta
+    //    tail). On replay, those entries get re-applied from the delta;
+    //    making AddNode idempotent at the index layer is the correctness
+    //    closer and lives outside this initiative. Reversing the order
+    //    would OVERSTATE LSN coverage and silently lose inserts that
+    //    committed after the snapshot, which is the worse failure mode.
+    let current_lsn = {
+        let cm = state.collection_manager.read();
+        match cm.get_collection(name) {
+            Ok(coll) => coll.current_lsn(),
+            Err(e) => return Err(format!("cannot resolve current_lsn for '{}': {}", name, e)),
+        }
+    };
+
+    // atomic_write_with_callback writes to .tmp, fsyncs, then renames.
+    // A crash mid-write leaves the previous hnsw.base intact; recovery
+    // never observes a torn snapshot. Per-collection read lock keeps the
+    // scheduler concurrent with searches on the same collection and with
+    // mutation work on other collections.
     {
-        let collections = state.collections.read();
-        let coll_state = collections
-            .get(name)
+        let handle = state
+            .collection_handle(name)
             .ok_or_else(|| format!("collection '{}' not found", name))?;
+        let coll_state = metered_read(&handle);
 
         let snapshot = coll_state.index.snapshot_topology(current_lsn);
         let hnsw_path = collection_dir.join("hnsw.base");
@@ -205,14 +241,18 @@ fn snapshot_collection(
             Ok(())
         })
         .map_err(|e| format!("HNSW snapshot write failed: {}", e))?;
+
+        // Release the per-node neighbor clones the snapshot held before the
+        // next scheduler tick allocates its own.
+        drop(snapshot);
     }
 
-    // 2. Serialize virtual graph under a read lock (only if not deferred).
+    // 2. Serialize virtual graph under a per-collection read lock (only if not deferred).
     {
-        let collections = state.collections.read();
-        let coll_state = collections
-            .get(name)
+        let handle = state
+            .collection_handle(name)
             .ok_or_else(|| format!("collection '{}' not found", name))?;
+        let coll_state = metered_read(&handle);
 
         let graph_deferred = coll_state.deferred_graph.load(Ordering::Acquire);
         if !graph_deferred {
@@ -231,13 +271,15 @@ fn snapshot_collection(
         }
     }
 
-    // 3. Reset delta writers under a write lock.
+    // 3. Reset delta writers under a per-collection write lock.
     //    Take existing writers, create fresh ones, and set them back.
+    //    Per-collection (not map) write lock keeps the rest of the server
+    //    responsive to mutations on other collections.
     {
-        let mut collections = state.collections.write();
-        let coll_state = collections
-            .get_mut(name)
+        let handle = state
+            .collection_handle(name)
             .ok_or_else(|| format!("collection '{}' not found", name))?;
+        let mut coll_state = metered_write(&handle);
 
         // Reset HNSW delta writer.
         let _old_hnsw_delta = coll_state.index.take_delta_writer();
@@ -273,10 +315,16 @@ fn snapshot_collection(
     }
 
     // 4. Update wal_meta.json with last_snapshot_lsn.
+    //    next_lsn is bumped to current_lsn so a crash right after this point
+    //    leaves wal_meta in sync with the snapshot envelope. save_wal_meta
+    //    uses atomic_write under the hood, so a torn write is impossible.
     {
         let mut meta = vf_storage::wal::load_wal_meta(collection_dir)
             .map_err(|e| format!("failed to load wal_meta: {}", e))?;
         meta.last_snapshot_lsn = current_lsn;
+        if meta.next_lsn < current_lsn {
+            meta.next_lsn = current_lsn;
+        }
         vf_storage::wal::save_wal_meta(collection_dir, &meta)
             .map_err(|e| format!("failed to save wal_meta: {}", e))?;
     }
@@ -292,15 +340,13 @@ fn snapshot_collection(
     }
 
     // 6. Reset dirty flag and mutation count.
-    {
-        let collections = state.collections.read();
-        if let Some(coll_state) = collections.get(name) {
-            coll_state.dirty.store(false, Ordering::Release);
-            coll_state.mutation_count.store(0, Ordering::Release);
-        }
+    if let Some(handle) = state.collection_handle(name) {
+        let coll_state = metered_read(&handle);
+        coll_state.dirty.store(false, Ordering::Release);
+        coll_state.mutation_count.store(0, Ordering::Release);
     }
 
-    Ok(())
+    Ok(current_lsn)
 }
 
 /// Prune old WAL files after a successful snapshot.

@@ -13,10 +13,10 @@ That is it. No compiler, no build tools, no extra dependencies.
 
 ## Installation
 
-### Pull the image from GHCR
+### Pull the image from Docker Hub
 
 ```bash
-docker pull ghcr.io/sarthiai/swarndb:latest
+docker pull sarthiai/swarndb:latest
 ```
 
 ### Run SwarnDB
@@ -26,7 +26,7 @@ docker run -d --name swarndb \
   -p 8080:8080 \
   -p 50051:50051 \
   -v swarndb_data:/data \
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 This starts SwarnDB in the background with:
@@ -54,7 +54,7 @@ For a more manageable setup, create a `docker-compose.yml` file:
 ```yaml
 services:
   swarndb:
-    image: ghcr.io/sarthiai/swarndb:latest
+    image: sarthiai/swarndb:latest
     ports:
       - "8080:8080"
       - "50051:50051"

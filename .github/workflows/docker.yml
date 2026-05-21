@@ -2,8 +2,10 @@ name: Docker
 
 on:
   push:
-    branches: [main, docker]
     tags: ["v*"]
+
+permissions:
+  contents: read
 
 jobs:
   build-and-push:
@@ -30,8 +32,7 @@ jobs:
         with:
           images: sarthiai/swarndb
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=test,enable=${{ github.ref == 'refs/heads/docker' }}
+            type=raw,value=latest
             type=semver,pattern={{version}}
 
       - name: Build and push

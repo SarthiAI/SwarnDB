@@ -25,33 +25,53 @@ _sym_db = _symbol_database.Default()
 from . import common_pb2 as swarndb_dot_v1_dot_common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1bswarndb/v1/collection.proto\x12\nswarndb.v1\x1a\x17swarndb/v1/common.proto\":\n\x12ScalarQuantization\x12\x10\n\x08quantile\x18\x01 \x01(\x02\x12\x12\n\nalways_ram\x18\x02 \x01(\x08\"P\n\x12QuantizationConfig\x12\x30\n\x06scalar\x18\x01 \x01(\x0b\x32\x1e.swarndb.v1.ScalarQuantizationH\x00\x42\x08\n\x06method\"\xb9\x01\n\x17\x43reateCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x04 \x01(\x02\x12\x13\n\x0bmax_vectors\x18\x05 \x01(\x04\x12\x34\n\x0cquantization\x18\x06 \x01(\x0b\x32\x1e.swarndb.v1.QuantizationConfig\"9\n\x18\x43reateCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0f\n\x07success\x18\x02 \x01(\x08\"\'\n\x17\x44\x65leteCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"+\n\x18\x44\x65leteCollectionResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"$\n\x14GetCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"\xad\x01\n\x15GetCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x14\n\x0cvector_count\x18\x04 \x01(\x04\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x05 \x01(\x02\x12\x0e\n\x06status\x18\x06 \x01(\t\x12\x19\n\x11quantization_type\x18\x07 \x01(\t\"\x18\n\x16ListCollectionsRequest\"Q\n\x17ListCollectionsResponse\x12\x36\n\x0b\x63ollections\x18\x01 \x03(\x0b\x32!.swarndb.v1.GetCollectionResponse2\x83\x03\n\x11\x43ollectionService\x12]\n\x10\x43reateCollection\x12#.swarndb.v1.CreateCollectionRequest\x1a$.swarndb.v1.CreateCollectionResponse\x12]\n\x10\x44\x65leteCollection\x12#.swarndb.v1.DeleteCollectionRequest\x1a$.swarndb.v1.DeleteCollectionResponse\x12T\n\rGetCollection\x12 .swarndb.v1.GetCollectionRequest\x1a!.swarndb.v1.GetCollectionResponse\x12Z\n\x0fListCollections\x12\".swarndb.v1.ListCollectionsRequest\x1a#.swarndb.v1.ListCollectionsResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1bswarndb/v1/collection.proto\x12\nswarndb.v1\x1a\x17swarndb/v1/common.proto\":\n\x12ScalarQuantization\x12\x10\n\x08quantile\x18\x01 \x01(\x02\x12\x12\n\nalways_ram\x18\x02 \x01(\x08\"P\n\x12QuantizationConfig\x12\x30\n\x06scalar\x18\x01 \x01(\x0b\x32\x1e.swarndb.v1.ScalarQuantizationH\x00\x42\x08\n\x06method\"\x81\x02\n\x17\x43reateCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x04 \x01(\x02\x12\x13\n\x0bmax_vectors\x18\x05 \x01(\x04\x12\x34\n\x0cquantization\x18\x06 \x01(\x0b\x32\x1e.swarndb.v1.QuantizationConfig\x12\x0e\n\x01m\x18\x07 \x01(\rH\x00\x88\x01\x01\x12\x1c\n\x0f\x65\x66_construction\x18\x08 \x01(\rH\x01\x88\x01\x01\x42\x04\n\x02_mB\x12\n\x10_ef_construction\"9\n\x18\x43reateCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0f\n\x07success\x18\x02 \x01(\x08\"\'\n\x17\x44\x65leteCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"+\n\x18\x44\x65leteCollectionResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"$\n\x14GetCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"\xad\x01\n\x15GetCollectionResponse\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x17\n\x0f\x64istance_metric\x18\x03 \x01(\t\x12\x14\n\x0cvector_count\x18\x04 \x01(\x04\x12\x19\n\x11\x64\x65\x66\x61ult_threshold\x18\x05 \x01(\x02\x12\x0e\n\x06status\x18\x06 \x01(\t\x12\x19\n\x11quantization_type\x18\x07 \x01(\t\"\x18\n\x16ListCollectionsRequest\"Q\n\x17ListCollectionsResponse\x12\x36\n\x0b\x63ollections\x18\x01 \x03(\x0b\x32!.swarndb.v1.GetCollectionResponse\"\x1a\n\x18GetRecoveryStatusRequest\"O\n\x17\x43ollectionRecoveryEntry\x12\x0c\n\x04name\x18\x01 \x01(\t\x12&\n\x04path\x18\x02 \x01(\x0e\x32\x18.swarndb.v1.RecoveryPath\"\x93\x01\n\x19GetRecoveryStatusResponse\x12\x14\n\x0c\x65lapsed_secs\x18\x01 \x01(\x04\x12\x38\n\x0b\x63ollections\x18\x02 \x03(\x0b\x32#.swarndb.v1.CollectionRecoveryEntry\x12&\n\x04path\x18\x03 \x01(\x0e\x32\x18.swarndb.v1.RecoveryPath\")\n\x19SnapshotCollectionRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"7\n\x1aSnapshotCollectionResponse\x12\x19\n\x11last_snapshot_lsn\x18\x01 \x01(\x04\"+\n\x1bGetPersistenceStatusRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"`\n\x1cGetPersistenceStatusResponse\x12\x19\n\x11last_snapshot_lsn\x18\x01 \x01(\x04\x12\x13\n\x0b\x63urrent_lsn\x18\x02 \x01(\x04\x12\x10\n\x08next_lsn\x18\x03 \x01(\x04\"+\n\x1bGetCollectionMetricsRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"\xae\x01\n\x1cGetCollectionMetricsResponse\x12\x1d\n\x15map_lock_acquisitions\x18\x01 \x01(\x04\x12$\n\x1c\x63ollection_read_acquisitions\x18\x02 \x01(\x04\x12%\n\x1d\x63ollection_write_acquisitions\x18\x03 \x01(\x04\x12\"\n\x1atotal_blocked_microseconds\x18\x04 \x01(\x04*}\n\x0cRecoveryPath\x12\x14\n\x10RECOVERY_UNKNOWN\x10\x00\x12\x1b\n\x17RECOVERY_CLEAN_SHUTDOWN\x10\x01\x12\x1f\n\x1bRECOVERY_INCREMENTAL_REPLAY\x10\x02\x12\x19\n\x15RECOVERY_FULL_REBUILD\x10\x03\x32\xa0\x06\n\x11\x43ollectionService\x12]\n\x10\x43reateCollection\x12#.swarndb.v1.CreateCollectionRequest\x1a$.swarndb.v1.CreateCollectionResponse\x12]\n\x10\x44\x65leteCollection\x12#.swarndb.v1.DeleteCollectionRequest\x1a$.swarndb.v1.DeleteCollectionResponse\x12T\n\rGetCollection\x12 .swarndb.v1.GetCollectionRequest\x1a!.swarndb.v1.GetCollectionResponse\x12Z\n\x0fListCollections\x12\".swarndb.v1.ListCollectionsRequest\x1a#.swarndb.v1.ListCollectionsResponse\x12`\n\x11GetRecoveryStatus\x12$.swarndb.v1.GetRecoveryStatusRequest\x1a%.swarndb.v1.GetRecoveryStatusResponse\x12\x63\n\x12SnapshotCollection\x12%.swarndb.v1.SnapshotCollectionRequest\x1a&.swarndb.v1.SnapshotCollectionResponse\x12i\n\x14GetPersistenceStatus\x12\'.swarndb.v1.GetPersistenceStatusRequest\x1a(.swarndb.v1.GetPersistenceStatusResponse\x12i\n\x14GetCollectionMetrics\x12\'.swarndb.v1.GetCollectionMetricsRequest\x1a(.swarndb.v1.GetCollectionMetricsResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'swarndb.v1.collection_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
+  _globals['_RECOVERYPATH']._serialized_start=1662
+  _globals['_RECOVERYPATH']._serialized_end=1787
   _globals['_SCALARQUANTIZATION']._serialized_start=68
   _globals['_SCALARQUANTIZATION']._serialized_end=126
   _globals['_QUANTIZATIONCONFIG']._serialized_start=128
   _globals['_QUANTIZATIONCONFIG']._serialized_end=208
   _globals['_CREATECOLLECTIONREQUEST']._serialized_start=211
-  _globals['_CREATECOLLECTIONREQUEST']._serialized_end=396
-  _globals['_CREATECOLLECTIONRESPONSE']._serialized_start=398
-  _globals['_CREATECOLLECTIONRESPONSE']._serialized_end=455
-  _globals['_DELETECOLLECTIONREQUEST']._serialized_start=457
-  _globals['_DELETECOLLECTIONREQUEST']._serialized_end=496
-  _globals['_DELETECOLLECTIONRESPONSE']._serialized_start=498
-  _globals['_DELETECOLLECTIONRESPONSE']._serialized_end=541
-  _globals['_GETCOLLECTIONREQUEST']._serialized_start=543
-  _globals['_GETCOLLECTIONREQUEST']._serialized_end=579
-  _globals['_GETCOLLECTIONRESPONSE']._serialized_start=582
-  _globals['_GETCOLLECTIONRESPONSE']._serialized_end=755
-  _globals['_LISTCOLLECTIONSREQUEST']._serialized_start=757
-  _globals['_LISTCOLLECTIONSREQUEST']._serialized_end=781
-  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_start=783
-  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_end=864
-  _globals['_COLLECTIONSERVICE']._serialized_start=867
-  _globals['_COLLECTIONSERVICE']._serialized_end=1254
+  _globals['_CREATECOLLECTIONREQUEST']._serialized_end=468
+  _globals['_CREATECOLLECTIONRESPONSE']._serialized_start=470
+  _globals['_CREATECOLLECTIONRESPONSE']._serialized_end=527
+  _globals['_DELETECOLLECTIONREQUEST']._serialized_start=529
+  _globals['_DELETECOLLECTIONREQUEST']._serialized_end=568
+  _globals['_DELETECOLLECTIONRESPONSE']._serialized_start=570
+  _globals['_DELETECOLLECTIONRESPONSE']._serialized_end=613
+  _globals['_GETCOLLECTIONREQUEST']._serialized_start=615
+  _globals['_GETCOLLECTIONREQUEST']._serialized_end=651
+  _globals['_GETCOLLECTIONRESPONSE']._serialized_start=654
+  _globals['_GETCOLLECTIONRESPONSE']._serialized_end=827
+  _globals['_LISTCOLLECTIONSREQUEST']._serialized_start=829
+  _globals['_LISTCOLLECTIONSREQUEST']._serialized_end=853
+  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_start=855
+  _globals['_LISTCOLLECTIONSRESPONSE']._serialized_end=936
+  _globals['_GETRECOVERYSTATUSREQUEST']._serialized_start=938
+  _globals['_GETRECOVERYSTATUSREQUEST']._serialized_end=964
+  _globals['_COLLECTIONRECOVERYENTRY']._serialized_start=966
+  _globals['_COLLECTIONRECOVERYENTRY']._serialized_end=1045
+  _globals['_GETRECOVERYSTATUSRESPONSE']._serialized_start=1048
+  _globals['_GETRECOVERYSTATUSRESPONSE']._serialized_end=1195
+  _globals['_SNAPSHOTCOLLECTIONREQUEST']._serialized_start=1197
+  _globals['_SNAPSHOTCOLLECTIONREQUEST']._serialized_end=1238
+  _globals['_SNAPSHOTCOLLECTIONRESPONSE']._serialized_start=1240
+  _globals['_SNAPSHOTCOLLECTIONRESPONSE']._serialized_end=1295
+  _globals['_GETPERSISTENCESTATUSREQUEST']._serialized_start=1297
+  _globals['_GETPERSISTENCESTATUSREQUEST']._serialized_end=1340
+  _globals['_GETPERSISTENCESTATUSRESPONSE']._serialized_start=1342
+  _globals['_GETPERSISTENCESTATUSRESPONSE']._serialized_end=1438
+  _globals['_GETCOLLECTIONMETRICSREQUEST']._serialized_start=1440
+  _globals['_GETCOLLECTIONMETRICSREQUEST']._serialized_end=1483
+  _globals['_GETCOLLECTIONMETRICSRESPONSE']._serialized_start=1486
+  _globals['_GETCOLLECTIONMETRICSRESPONSE']._serialized_end=1660
+  _globals['_COLLECTIONSERVICE']._serialized_start=1790
+  _globals['_COLLECTIONSERVICE']._serialized_end=2590
 # @@protoc_insertion_point(module_scope)

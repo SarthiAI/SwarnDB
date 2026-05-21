@@ -6,16 +6,16 @@ This guide covers all the ways to deploy SwarnDB in production, from a single Do
 
 Docker is the primary and simplest way to run SwarnDB.
 
-### Pulling from GHCR
+### Pulling from Docker Hub
 
 ```bash
-docker pull ghcr.io/sarthiai/swarndb:latest
+docker pull sarthiai/swarndb:latest
 ```
 
 To pin a specific version:
 
 ```bash
-docker pull ghcr.io/sarthiai/swarndb:v1.0.0
+docker pull sarthiai/swarndb:v1.0.0
 ```
 
 ### Running with environment variables
@@ -31,7 +31,7 @@ docker run -d --name swarndb \
   -e SWARNDB_API_KEYS=your-secret-key-here \
   -e SWARNDB_MAX_CONNECTIONS=1000 \
   -e SWARNDB_REQUEST_TIMEOUT_MS=30000 \  # default is 10000ms; 30000ms is a production override
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 Key environment variables:
@@ -56,7 +56,7 @@ Always use a Docker volume or bind mount for the `/data` directory. Without pers
 ```bash
 docker run -d --name swarndb \
   -v swarndb_data:/data \
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 **Bind mount** (for direct filesystem access):
@@ -64,7 +64,7 @@ docker run -d --name swarndb \
 ```bash
 docker run -d --name swarndb \
   -v /path/on/host/swarndb-data:/data \
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 ### Resource limits
@@ -78,7 +78,7 @@ docker run -d --name swarndb \
   -p 8080:8080 \
   -p 50051:50051 \
   -v swarndb_data:/data \
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 **Sizing guidelines:**
@@ -101,13 +101,15 @@ docker run -d --name swarndb \
   -p 8080:8080 \
   -p 50051:50051 \
   -v swarndb_data:/data \
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 Available health endpoints:
 
-- `GET /health`: Basic health check. Returns 200 if the server is running.
-- `GET /ready`: Readiness check. Returns 200 when the server is ready to accept requests.
+- `GET /health`: Liveness probe. Returns 200 as soon as the server process is up, even while collections are still recovering. The body carries `{"status":"ok"}` when fully initialized and `{"status":"recovering","collections_loaded":N,"collections_total":M,"in_progress":[...]}` while recovery is in flight.
+- `GET /readyz`: Readiness probe. Returns 503 while any collection is still recovering; returns 200 only after every persisted collection is loaded and the server is ready to accept production traffic.
+
+Use `/health` for Docker container healthchecks and Kubernetes liveness probes. Use `/readyz` for Kubernetes readiness probes and external load balancer health gates: it is the signal that traffic can be routed without retrying through a recovering collection.
 
 ### Security: non-root user, read-only filesystem
 
@@ -123,7 +125,7 @@ docker run -d --name swarndb \
   -p 50051:50051 \
   -v swarndb_data:/data \
   -e SWARNDB_DATA_DIR=/data \
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 This configuration:
@@ -142,7 +144,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   swarndb:
-    image: ghcr.io/sarthiai/swarndb:latest
+    image: sarthiai/swarndb:latest
     container_name: swarndb
     ports:
       - "8080:8080"
@@ -301,7 +303,7 @@ The deployment includes three types of probes:
 
 - **Startup probe**: Waits for SwarnDB to initialize (checks `/health`, allows up to 60 seconds)
 - **Liveness probe**: Restarts the pod if SwarnDB becomes unresponsive (checks `/health` every 15 seconds)
-- **Readiness probe**: Removes the pod from the service if it is not ready to handle requests (checks `/ready` every 10 seconds)
+- **Readiness probe**: Removes the pod from the service if it is not ready to handle requests (checks `/readyz` every 10 seconds; returns 503 while collections are recovering after an unclean shutdown)
 
 ## Helm
 
@@ -327,7 +329,7 @@ Override default values by creating a custom `values.yaml`:
 replicaCount: 3
 
 image:
-  repository: ghcr.io/sarthiai/swarndb
+  repository: sarthiai/swarndb
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -379,7 +381,7 @@ helm install swarndb helm/swarndb -f values.yaml
 | Value | Default | Description |
 |-------|---------|-------------|
 | `replicaCount` | `1` | Number of SwarnDB replicas |
-| `image.repository` | `ghcr.io/sarthiai/swarndb` | Container image |
+| `image.repository` | `sarthiai/swarndb` | Container image |
 | `image.tag` | `latest` | Image tag |
 | `resources.limits.memory` | `4Gi` | Memory limit |
 | `resources.limits.cpu` | `2` | CPU limit |

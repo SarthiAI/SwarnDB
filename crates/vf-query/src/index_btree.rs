@@ -176,4 +176,10 @@ impl BTreeIndex {
     pub fn is_empty(&self) -> bool {
         self.id_to_key.is_empty()
     }
+
+    /// Release excess capacity in the id-to-key map. The BTreeMap itself does
+    /// not expose shrink_to_fit; its node-based layout has minimal slack.
+    pub fn compact(&mut self) {
+        self.id_to_key.shrink_to_fit();
+    }
 }

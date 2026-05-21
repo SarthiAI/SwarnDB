@@ -19,7 +19,7 @@ use vf_server::grpc_graph::GraphServiceImpl;
 use vf_server::grpc_search::SearchServiceImpl;
 use vf_server::grpc_vector::VectorServiceImpl;
 use vf_server::grpc_vector_math::VectorMathServiceImpl;
-use vf_server::health::{health_router, ServerStatus};
+use vf_server::health::health_router;
 use vf_server::logging::init_logging;
 use vf_server::metrics::{metrics_handler, setup_metrics};
 use vf_server::proto::swarndb::v1::collection_service_server::CollectionServiceServer;
@@ -58,8 +58,13 @@ async fn main() {
     // 4. Initialize Prometheus metrics
     let metrics_handle = setup_metrics();
 
-    // 5. Create application state
-    let state = AppState::new(
+    // 5. Build the application state SKELETON. This step opens the data
+    //    directory, scans for persisted collections, and records the set of
+    //    names that will be recovered, but does NOT load any collection. The
+    //    actual recovery runs on a background task after the listeners are
+    //    bound so that docker start always brings the ports up within seconds
+    //    even on a 1M-vector cold boot.
+    let state = AppState::new_empty(
         Path::new(&config.data_dir),
         config.max_ef_search,
         config.max_batch_lock_size,
@@ -67,11 +72,16 @@ async fn main() {
         config.max_ef_construction,
         config.clone(),
     ).unwrap_or_else(|e| {
-        tracing::error!("failed to initialize AppState: {}", e);
+        tracing::error!("failed to initialize AppState skeleton: {}", e);
         std::process::exit(1);
     });
 
-    // 5. Build gRPC server
+    // The shared status flag and loading-state view live on `state` itself
+    // from now on. Health and probe handlers read it via the AppState clone.
+    let server_status = state.server_status.clone();
+
+    // 6. Build gRPC server (spawned BEFORE recovery so the port is reachable
+    //    immediately).
     let grpc_addr: SocketAddr = config
         .grpc_addr()
         .parse()
@@ -111,14 +121,11 @@ async fn main() {
         }
     });
 
-    // 6. Build REST server
+    // 7. Build REST server (also spawned BEFORE recovery).
     let rest_addr: SocketAddr = config
         .rest_addr()
         .parse()
         .expect("invalid REST bind address");
-
-    let server_status = ServerStatus::new();
-    let server_status_clone = server_status.clone();
 
     // Build REST router with optional auth (applied only to API routes)
     let api_router = if !config.api_keys.is_empty() {
@@ -133,8 +140,8 @@ async fn main() {
         rest_router(state.clone())
     };
 
-    // Health and metrics routes are NOT behind auth
-    let health_routes = health_router(state.clone(), server_status_clone);
+    // Health and metrics routes are NOT behind auth.
+    let health_routes = health_router(state.clone(), server_status.clone());
     let metrics_route = Router::new()
         .route("/metrics", get(metrics_handler))
         .with_state(metrics_handle);
@@ -153,11 +160,29 @@ async fn main() {
         }
     });
 
-    // Mark server as fully initialized
-    server_status.mark_initialized();
-    tracing::info!("SwarnDB server fully initialized and ready");
+    // 8. Kick off background recovery. The listeners are already bound at
+    //    this point so /health, /readyz, and every guarded handler can serve
+    //    503s with a meaningful body until each collection finishes loading.
+    //    The recovery runs on a dedicated rayon pool inside `recover_collections`;
+    //    we move the call into a tokio blocking task so the async runtime is
+    //    free to handle the freshly bound traffic.
+    let recovery_state = state.clone();
+    let recovery_status = server_status.clone();
+    let _recovery_handle = tokio::task::spawn_blocking(move || {
+        // Outer catch_unwind guards setup paths (rayon pool builder, pool.install)
+        // that sit outside the per-collection AssertUnwindSafe in recover_collections.
+        // On panic, /health surfaces failure via is_initialized() staying false.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recovery_state.recover_collections();
+            recovery_status.mark_initialized();
+            tracing::info!("SwarnDB server fully initialized and ready");
+        }));
+        if let Err(payload) = result {
+            tracing::error!("server recovery task panicked: {:?}", payload);
+        }
+    });
 
-    // 7. Start background snapshot scheduler
+    // 9. Start background snapshot scheduler
     let shutdown_signal = ShutdownSignal::new();
     let snapshot_shutdown_rx = shutdown_signal.subscribe();
     let snapshot_config = SnapshotConfig::from_env(
@@ -170,7 +195,7 @@ async fn main() {
         start_snapshot_scheduler(snapshot_state, snapshot_shutdown_rx, snapshot_config).await;
     });
 
-    // 8. Start background WAL pruner
+    // 10. Start background WAL pruner
     let wal_prune_interval = config.wal_prune_interval_secs;
     let wal_prune_handle = if wal_prune_interval > 0 {
         let wal_prune_state = std::sync::Arc::new(state.clone());
@@ -185,7 +210,9 @@ async fn main() {
                         return;
                     }
                 }
-                // Prune WAL for all collections.
+                // Prune WAL for all collections. Brief map read lock just to
+                // snapshot the name list; the actual prune work runs without
+                // holding the map lock.
                 let collection_names: Vec<String> = {
                     let collections = wal_prune_state.collections.read();
                     collections.keys().cloned().collect()
@@ -206,10 +233,10 @@ async fn main() {
         None
     };
 
-    // 9. Wait for shutdown signal
+    // 11. Wait for shutdown signal
     wait_for_shutdown().await;
 
-    // 10. Graceful shutdown
+    // 12. Graceful shutdown
     tracing::info!("shutdown signal received, stopping servers...");
 
     // Signal background tasks to stop
@@ -220,6 +247,7 @@ async fn main() {
     }
 
     // Abort server tasks
+    // Note: recovery handle is dropped on shutdown; partial loads are discarded.
     grpc_handle.abort();
     rest_handle.abort();
 

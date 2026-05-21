@@ -13,8 +13,10 @@ from ._proto import collection_pb2, vector_pb2
 from .exceptions import CollectionNotFoundError
 from .types import (
     CollectionInfo,
+    CollectionMetrics,
     CompactResult,
     OptimizeResult,
+    PersistenceStatus,
     PruneWALResult,
     QuantizationConfig,
     ScalarQuantizationConfig,
@@ -41,6 +43,8 @@ class CollectionAPI:
         default_threshold: float = 0.0,
         max_vectors: int = 0,
         quantization: Optional[QuantizationConfig] = None,
+        m: Optional[int] = None,
+        ef_construction: Optional[int] = None,
     ) -> CollectionInfo:
         """Create a new collection.
 
@@ -51,6 +55,10 @@ class CollectionAPI:
             default_threshold: Default similarity threshold for searches.
             max_vectors: Maximum number of vectors (0 = unlimited).
             quantization: Optional quantization configuration (e.g. SQ8).
+            m: Optional HNSW M parameter override. When None, the server
+                uses its default.
+            ef_construction: Optional HNSW ef_construction override. When
+                None, the server uses its default.
 
         Returns:
             CollectionInfo with the created collection's metadata.
@@ -73,6 +81,10 @@ class CollectionAPI:
                     always_ram=sq.always_ram,
                 )
                 request.quantization.scalar.CopyFrom(proto_sq)
+        if m is not None:
+            request.m = m
+        if ef_construction is not None:
+            request.ef_construction = ef_construction
         self._client._call(
             self._client._collection_stub.CreateCollection, request
         )
@@ -227,6 +239,46 @@ class CollectionAPI:
             vectors_written=response.vectors_written,
             vectors_removed=response.vectors_removed,
             duration_ms=response.duration_ms,
+        )
+
+    def snapshot(self, name: str) -> int:
+        """Force a synchronous snapshot for a collection.
+
+        Args:
+            name: Collection name.
+
+        Returns:
+            The LSN of the snapshot just written.
+        """
+        request = collection_pb2.SnapshotCollectionRequest(name=name)
+        response = self._client._call(
+            self._client._collection_stub.SnapshotCollection, request
+        )
+        return int(response.last_snapshot_lsn)
+
+    def persistence_status(self, name: str) -> PersistenceStatus:
+        """Return the snapshot and WAL LSN state for a collection."""
+        request = collection_pb2.GetPersistenceStatusRequest(name=name)
+        response = self._client._call(
+            self._client._collection_stub.GetPersistenceStatus, request
+        )
+        return PersistenceStatus(
+            last_snapshot_lsn=int(response.last_snapshot_lsn),
+            current_lsn=int(response.current_lsn),
+            next_lsn=int(response.next_lsn),
+        )
+
+    def metrics(self, name: str) -> CollectionMetrics:
+        """Return per-collection lock-contention counters."""
+        request = collection_pb2.GetCollectionMetricsRequest(name=name)
+        response = self._client._call(
+            self._client._collection_stub.GetCollectionMetrics, request
+        )
+        return CollectionMetrics(
+            map_lock_acquisitions=int(response.map_lock_acquisitions),
+            collection_read_acquisitions=int(response.collection_read_acquisitions),
+            collection_write_acquisitions=int(response.collection_write_acquisitions),
+            total_blocked_microseconds=int(response.total_blocked_microseconds),
         )
 
     def get_status(self, collection: str) -> str:

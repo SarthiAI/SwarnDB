@@ -7,20 +7,37 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::convert::{distance_metric_to_string, parse_distance_metric};
+use crate::convert::{build_hnsw_params, distance_metric_to_string, parse_distance_metric};
 use crate::proto::swarndb::v1::collection_service_server::CollectionService;
 use crate::proto::swarndb::v1::{
-    CreateCollectionRequest, CreateCollectionResponse, DeleteCollectionRequest,
-    DeleteCollectionResponse, GetCollectionRequest, GetCollectionResponse,
-    ListCollectionsRequest, ListCollectionsResponse,
+    CollectionRecoveryEntry, CreateCollectionRequest, CreateCollectionResponse,
+    DeleteCollectionRequest, DeleteCollectionResponse, GetCollectionMetricsRequest,
+    GetCollectionMetricsResponse, GetCollectionRequest, GetCollectionResponse,
+    GetPersistenceStatusRequest, GetPersistenceStatusResponse, GetRecoveryStatusRequest,
+    GetRecoveryStatusResponse, ListCollectionsRequest, ListCollectionsResponse, RecoveryPath,
+    SnapshotCollectionRequest, SnapshotCollectionResponse,
 };
-use crate::state::{AppState, CollectionState, MetadataCache};
+use crate::snapshot::force_snapshot_collection;
+use crate::state::{
+    metered_read, AppState, CollectionAvailability, CollectionState, MetadataCache, RecoveryStatus,
+};
+
+/// Convert a `CollectionAvailability` returned by the readiness guard into a
+/// `tonic::Status`. Recovering collections become `Unavailable` (503-equivalent
+/// in gRPC) with a retry-after hint embedded in the message; missing
+/// collections become `NotFound`.
+fn status_from_availability(avail: CollectionAvailability) -> Status {
+    match avail {
+        CollectionAvailability::Recovering { .. } => Status::unavailable(avail.user_message()),
+        CollectionAvailability::NotFound { .. } => Status::not_found(avail.user_message()),
+    }
+}
 use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{
     CollectionConfig, DataTypeConfig, QuantizationConfig, ScalarQuantizationConfig,
 };
 use vf_graph::VirtualGraph;
-use vf_index::hnsw::{HnswIndex, HnswParams};
+use vf_index::hnsw::HnswIndex;
 use vf_index::quantized_hnsw::QuantizedHnswIndex;
 use vf_query::IndexManager;
 
@@ -108,13 +125,17 @@ impl CollectionService for CollectionServiceImpl {
             }
         }
 
+        // Optional HNSW build parameters from the request; omitted fields fall
+        // through to the server defaults via build_hnsw_params.
+        let hnsw_params = build_hnsw_params(req.m, req.ef_construction);
+
         let store = InMemoryVectorStore::new(dimension);
         let index: Box<dyn vf_index::traits::PersistableIndex> = match &config.quantization_config {
             Some(QuantizationConfig::Scalar(sq_config)) => {
                 let q_index = QuantizedHnswIndex::new(
                     dimension,
                     distance_metric,
-                    HnswParams::default(),
+                    hnsw_params.clone(),
                     sq_config.clone(),
                 );
                 // Set data_dir so post_optimize() can train the quantizer.
@@ -129,7 +150,7 @@ impl CollectionService for CollectionServiceImpl {
                 }
                 Box::new(q_index)
             }
-            None => Box::new(HnswIndex::with_defaults(dimension, distance_metric)),
+            None => Box::new(HnswIndex::new(dimension, distance_metric, hnsw_params)),
         };
 
         // Attach a fresh hnsw.delta writer so first inserts are recorded for
@@ -172,10 +193,19 @@ impl CollectionService for CollectionServiceImpl {
             deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mutation_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            collection_read_acquisitions: std::sync::atomic::AtomicU64::new(0),
+            collection_write_acquisitions: std::sync::atomic::AtomicU64::new(0),
+            total_blocked_microseconds: std::sync::atomic::AtomicU64::new(0),
         };
 
+        // Map write lock is required to insert a new collection entry. The
+        // CollectionState is wrapped in a per-collection RwLock so all later
+        // mutation paths can run under the per-collection lock alone.
         let mut collections = self.state.collections.write();
-        collections.insert(req.name.clone(), collection_state);
+        collections.insert(
+            req.name.clone(),
+            std::sync::Arc::new(parking_lot::RwLock::new(collection_state)),
+        );
 
         Ok(Response::new(CreateCollectionResponse {
             name: req.name,
@@ -189,6 +219,12 @@ impl CollectionService for CollectionServiceImpl {
     ) -> Result<Response<DeleteCollectionResponse>, Status> {
         let req = request.into_inner();
 
+        tracing::info!(target: "vf_server::audit", collection = %req.name, "audit: collection delete requested via gRPC");
+
+        self.state
+            .require_collection_ready(&req.name)
+            .map_err(status_from_availability)?;
+
         // Remove from storage layer
         {
             let mut cm = self.state.collection_manager.write();
@@ -197,6 +233,9 @@ impl CollectionService for CollectionServiceImpl {
             }
         }
 
+        // Map write lock to evict the entry. In-flight handlers that hold an
+        // Arc<RwLock<CollectionState>> from a previous lookup complete normally
+        // and the inner state is dropped once the last Arc handle is released.
         let mut collections = self.state.collections.write();
         if collections.remove(&req.name).is_none() {
             return Err(Status::not_found(format!(
@@ -204,6 +243,9 @@ impl CollectionService for CollectionServiceImpl {
                 req.name
             )));
         }
+        // Drop any recovery_paths entry so the recovery_status surface does
+        // not retain a stale entry for a deleted collection.
+        self.state.recovery_paths.write().remove(&req.name);
 
         Ok(Response::new(DeleteCollectionResponse { success: true }))
     }
@@ -214,10 +256,14 @@ impl CollectionService for CollectionServiceImpl {
     ) -> Result<Response<GetCollectionResponse>, Status> {
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let coll = collections.get(&req.name).ok_or_else(|| {
+        self.state
+            .require_collection_ready(&req.name)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.name).ok_or_else(|| {
             Status::not_found(format!("collection '{}' not found", req.name))
         })?;
+        let coll = metered_read(&coll_handle);
 
         let status_str = coll.status.read().unwrap().as_str().to_string();
         let quantization_type = match &coll.config.quantization_config {
@@ -239,11 +285,18 @@ impl CollectionService for CollectionServiceImpl {
         &self,
         _request: Request<ListCollectionsRequest>,
     ) -> Result<Response<ListCollectionsResponse>, Status> {
-        let collections = self.state.collections.read();
+        // Snapshot the handle list under a short map read lock, then release
+        // the map lock before per-collection reads to avoid map-level contention
+        // with create/delete during listing.
+        let handles: Vec<std::sync::Arc<parking_lot::RwLock<crate::state::CollectionState>>> = {
+            let collections = self.state.collections.read();
+            collections.values().cloned().collect()
+        };
 
-        let list: Vec<GetCollectionResponse> = collections
-            .values()
-            .map(|coll| {
+        let list: Vec<GetCollectionResponse> = handles
+            .iter()
+            .map(|h| {
+                let coll = metered_read(h);
                 let status_str = coll.status.read().unwrap().as_str().to_string();
                 let quantization_type = match &coll.config.quantization_config {
                     Some(QuantizationConfig::Scalar(_)) => "scalar".to_string(),
@@ -264,5 +317,94 @@ impl CollectionService for CollectionServiceImpl {
         Ok(Response::new(ListCollectionsResponse {
             collections: list,
         }))
+    }
+
+    async fn get_recovery_status(
+        &self,
+        _request: Request<GetRecoveryStatusRequest>,
+    ) -> Result<Response<GetRecoveryStatusResponse>, Status> {
+        let snap = self.state.recovery_status_snapshot();
+        let mut entries: Vec<CollectionRecoveryEntry> = snap
+            .paths
+            .iter()
+            .map(|(name, p)| CollectionRecoveryEntry {
+                name: name.clone(),
+                path: recovery_status_to_proto(*p) as i32,
+            })
+            .collect();
+        // Stable ordering keeps the response deterministic for clients.
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Response::new(GetRecoveryStatusResponse {
+            elapsed_secs: snap.elapsed_secs,
+            collections: entries,
+            path: recovery_status_to_proto(snap.path) as i32,
+        }))
+    }
+
+    async fn snapshot_collection(
+        &self,
+        request: Request<SnapshotCollectionRequest>,
+    ) -> Result<Response<SnapshotCollectionResponse>, Status> {
+        let req = request.into_inner();
+        self.state
+            .require_collection_ready(&req.name)
+            .map_err(status_from_availability)?;
+        let lsn = force_snapshot_collection(&self.state, &req.name)
+            .map_err(Status::internal)?;
+        Ok(Response::new(SnapshotCollectionResponse {
+            last_snapshot_lsn: lsn,
+        }))
+    }
+
+    async fn get_persistence_status(
+        &self,
+        request: Request<GetPersistenceStatusRequest>,
+    ) -> Result<Response<GetPersistenceStatusResponse>, Status> {
+        let req = request.into_inner();
+        self.state
+            .require_collection_ready(&req.name)
+            .map_err(status_from_availability)?;
+        let p = self
+            .state
+            .persistence_status(&req.name)
+            .map_err(Status::internal)?;
+        Ok(Response::new(GetPersistenceStatusResponse {
+            last_snapshot_lsn: p.last_snapshot_lsn,
+            current_lsn: p.current_lsn,
+            next_lsn: p.next_lsn,
+        }))
+    }
+
+    async fn get_collection_metrics(
+        &self,
+        request: Request<GetCollectionMetricsRequest>,
+    ) -> Result<Response<GetCollectionMetricsResponse>, Status> {
+        let req = request.into_inner();
+        self.state
+            .require_collection_ready(&req.name)
+            .map_err(status_from_availability)?;
+        let m = self
+            .state
+            .collection_metrics(&req.name)
+            .map_err(Status::internal)?;
+        Ok(Response::new(GetCollectionMetricsResponse {
+            map_lock_acquisitions: m.map_lock_acquisitions,
+            collection_read_acquisitions: m.collection_read_acquisitions,
+            collection_write_acquisitions: m.collection_write_acquisitions,
+            total_blocked_microseconds: m.total_blocked_microseconds,
+        }))
+    }
+}
+
+/// Map the in-memory recovery enum onto the wire enum. Prost generates
+/// `RecoveryPath` variants by converting the proto SCREAMING_SNAKE_CASE
+/// names (e.g. `RECOVERY_UNKNOWN`) to upper-camel-case (`RecoveryUnknown`)
+/// without stripping the shared prefix.
+fn recovery_status_to_proto(s: RecoveryStatus) -> RecoveryPath {
+    match s {
+        RecoveryStatus::Unknown => RecoveryPath::RecoveryUnknown,
+        RecoveryStatus::CleanShutdown => RecoveryPath::RecoveryCleanShutdown,
+        RecoveryStatus::IncrementalReplay => RecoveryPath::RecoveryIncrementalReplay,
+        RecoveryStatus::FullRebuild => RecoveryPath::RecoveryFullRebuild,
     }
 }

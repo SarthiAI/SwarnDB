@@ -3,12 +3,15 @@
 // Change Date: 2030-03-06
 // Change License: MIT
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use dashmap::DashMap;
 use ordered_float::OrderedFloat;
 use parking_lot::{Mutex, RwLock};
 use rand::rngs::StdRng;
@@ -78,6 +81,55 @@ struct HnswInner {
     /// Automatically invalidated (set to `None`) on any graph mutation (add/remove).
     flat_adj: Option<FlatAdjacencyList>,
 }
+
+// In-flight new row used by bulk_add_from_slice_iter. The `vector` field
+// borrows directly from caller-owned memory (typically an mmap'd file)
+// for the duration of the call; no per-row Vec<f32> allocation is made.
+// See ADR-001 Decision 3.b.
+struct NewRowState<'mmap> {
+    vector: &'mmap [f32],
+    level: usize,
+    neighbors: Vec<Mutex<Vec<VectorId>>>,
+}
+
+// Per-worker scratch buffers reused across searches in the bulk-insert parallel phase.
+// Each rayon worker allocates these once and clears them between calls, eliminating
+// per-call HashSet and BinaryHeap allocations.
+thread_local! {
+    static SCRATCH_VISITED: RefCell<HashSet<VectorId>> = RefCell::new(HashSet::new());
+    static SCRATCH_CANDIDATES: RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, VectorId)>>> =
+        RefCell::new(BinaryHeap::new());
+    static SCRATCH_RESULTS: RefCell<BinaryHeap<(OrderedFloat<f32>, VectorId)>> =
+        RefCell::new(BinaryHeap::new());
+}
+
+// Dedicated scratch buffers for the runtime search path, isolated from the bulk-insert slots
+// above to prevent any re-entrant RefCell borrow across concurrent search and bulk insert.
+thread_local! {
+    static SCRATCH_SEARCH_VISITED: RefCell<HashSet<VectorId>> = RefCell::new(HashSet::new());
+    static SCRATCH_SEARCH_CANDIDATES: RefCell<BinaryHeap<Reverse<(OrderedFloat<f32>, VectorId)>>> =
+        RefCell::new(BinaryHeap::new());
+    static SCRATCH_SEARCH_RESULTS: RefCell<BinaryHeap<(OrderedFloat<f32>, VectorId)>> =
+        RefCell::new(BinaryHeap::new());
+}
+
+// Ask glibc to return freed per-batch scratch back to the OS. Cheap on glibc
+// (a single allocator state walk, sub-millisecond); a no-op everywhere else.
+// Re-exported at the crate root as `vf_index::release_to_os` so chunked
+// ingest paths outside this crate can call it between batches.
+#[inline]
+#[cfg(target_env = "gnu")]
+pub fn release_to_os() {
+    // SAFETY: malloc_trim is thread-safe and reads only allocator-internal
+    // state; it does not touch any live allocation owned by us.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[inline]
+#[cfg(not(target_env = "gnu"))]
+pub fn release_to_os() {}
 
 pub struct HnswIndex {
     inner: RwLock<HnswInner>,
@@ -348,73 +400,108 @@ impl HnswIndex {
         ef: usize,
         layer: usize,
     ) -> Vec<(OrderedFloat<f32>, VectorId)> {
-        let mut visited: HashSet<VectorId> = HashSet::new();
-        let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, VectorId)>> = BinaryHeap::new();
-        let mut results: BinaryHeap<(OrderedFloat<f32>, VectorId)> = BinaryHeap::new();
+        // Reuse per-worker scratch buffers; clear and refill on each call.
+        SCRATCH_SEARCH_VISITED.with(|v_cell| {
+            SCRATCH_SEARCH_CANDIDATES.with(|c_cell| {
+                SCRATCH_SEARCH_RESULTS.with(|r_cell| {
+                    let mut visited = v_cell.borrow_mut();
+                    let mut candidates = c_cell.borrow_mut();
+                    let mut results = r_cell.borrow_mut();
+                    visited.clear();
+                    candidates.clear();
+                    results.clear();
 
-        for &ep in entry_points {
-            if let Some(node) = inner.nodes.get(&ep) {
-                visited.insert(ep);
-                let dist = OrderedFloat(self.distance(query, inner.vectors.get(node.vector_slot)));
-                candidates.push(Reverse((dist, ep)));
-                results.push((dist, ep));
-            }
-        }
-
-        while let Some(Reverse((c_dist, c_id))) = candidates.pop() {
-            let furthest_result = results.peek().map(|r| r.0).unwrap_or(OrderedFloat(f32::MAX));
-            if c_dist > furthest_result {
-                break;
-            }
-
-            // Prefetch the next candidate's data if available, so the CPU can
-            // start fetching while we process the current candidate.
-            if let Some(&Reverse((_, next_id))) = candidates.peek() {
-                if let Some(next_node) = inner.nodes.get(&next_id) {
-                    prefetch_vector(inner.vectors.get(next_node.vector_slot));
-                    if layer < next_node.neighbors.len() {
-                        prefetch_neighbors(&next_node.neighbors[layer]);
+                    for &ep in entry_points {
+                        if let Some(node) = inner.nodes.get(&ep) {
+                            visited.insert(ep);
+                            let dist = OrderedFloat(self.distance(query, inner.vectors.get(node.vector_slot)));
+                            candidates.push(Reverse((dist, ep)));
+                            results.push((dist, ep));
+                        }
                     }
-                }
-            }
 
-            // Retrieve neighbors by reference: prefer flat adjacency list if available.
-            // We borrow the neighbor slice directly to avoid allocating a Vec on every iteration.
-            let flat_neighbors: Option<&[VectorId]> = inner.flat_adj.as_ref()
-                .and_then(|flat| flat.get_neighbors(c_id, layer));
-            let node_ref = if flat_neighbors.is_none() {
-                inner.nodes.get(&c_id)
-            } else {
-                None
-            };
-            let neighbors: Option<&[VectorId]> = flat_neighbors.or_else(|| {
-                node_ref.and_then(|node| {
-                    if layer < node.neighbors.len() {
-                        Some(node.neighbors[layer].as_slice())
-                    } else {
-                        None
-                    }
-                })
-            });
+                    while let Some(Reverse((c_dist, c_id))) = candidates.pop() {
+                        let furthest_result = results.peek().map(|r| r.0).unwrap_or(OrderedFloat(f32::MAX));
+                        if c_dist > furthest_result {
+                            break;
+                        }
 
-            if let Some(neighbors) = neighbors {
-                // Collect unvisited neighbors into a batch for cache-friendly
-                // distance computation: the query vector stays in L1 while we
-                // iterate over all target vectors.
-                const BATCH_CAP: usize = 64;
-                let mut batch_ids: [VectorId; BATCH_CAP] = [0u64; BATCH_CAP];
-                let mut batch_vecs: [&[f32]; BATCH_CAP] = [&[]; BATCH_CAP];
-                let mut batch_len: usize = 0;
+                        // Prefetch the next candidate's data if available, so the CPU can
+                        // start fetching while we process the current candidate.
+                        if let Some(&Reverse((_, next_id))) = candidates.peek() {
+                            if let Some(next_node) = inner.nodes.get(&next_id) {
+                                prefetch_vector(inner.vectors.get(next_node.vector_slot));
+                                if layer < next_node.neighbors.len() {
+                                    prefetch_neighbors(&next_node.neighbors[layer]);
+                                }
+                            }
+                        }
 
-                for &neighbor_id in neighbors.iter() {
-                    if visited.insert(neighbor_id) {
-                        if let Some(neighbor_node) = inner.nodes.get(&neighbor_id) {
-                            batch_ids[batch_len] = neighbor_id;
-                            batch_vecs[batch_len] = inner.vectors.get(neighbor_node.vector_slot);
-                            batch_len += 1;
+                        // Retrieve neighbors by reference: prefer flat adjacency list if available.
+                        // We borrow the neighbor slice directly to avoid allocating a Vec on every iteration.
+                        let flat_neighbors: Option<&[VectorId]> = inner.flat_adj.as_ref()
+                            .and_then(|flat| flat.get_neighbors(c_id, layer));
+                        let node_ref = if flat_neighbors.is_none() {
+                            inner.nodes.get(&c_id)
+                        } else {
+                            None
+                        };
+                        let neighbors: Option<&[VectorId]> = flat_neighbors.or_else(|| {
+                            node_ref.and_then(|node| {
+                                if layer < node.neighbors.len() {
+                                    Some(node.neighbors[layer].as_slice())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
 
-                            // Flush when batch is full
-                            if batch_len == BATCH_CAP {
+                        if let Some(neighbors) = neighbors {
+                            // Collect unvisited neighbors into a batch for cache-friendly
+                            // distance computation: the query vector stays in L1 while we
+                            // iterate over all target vectors.
+                            const BATCH_CAP: usize = 64;
+                            let mut batch_ids: [VectorId; BATCH_CAP] = [0u64; BATCH_CAP];
+                            let mut batch_vecs: [&[f32]; BATCH_CAP] = [&[]; BATCH_CAP];
+                            let mut batch_len: usize = 0;
+
+                            for &neighbor_id in neighbors.iter() {
+                                if visited.insert(neighbor_id) {
+                                    if let Some(neighbor_node) = inner.nodes.get(&neighbor_id) {
+                                        batch_ids[batch_len] = neighbor_id;
+                                        batch_vecs[batch_len] = inner.vectors.get(neighbor_node.vector_slot);
+                                        batch_len += 1;
+
+                                        // Flush when batch is full
+                                        if batch_len == BATCH_CAP {
+                                            let mut dists = [0.0f32; BATCH_CAP];
+                                            self.distance_fn.compute_batch(
+                                                query,
+                                                &batch_vecs[..batch_len],
+                                                &mut dists[..batch_len],
+                                            );
+                                            for j in 0..batch_len {
+                                                let dist = OrderedFloat(dists[j]);
+                                                let furthest = results
+                                                    .peek()
+                                                    .map(|r| r.0)
+                                                    .unwrap_or(OrderedFloat(f32::MAX));
+                                                if results.len() < ef || dist < furthest {
+                                                    candidates.push(Reverse((dist, batch_ids[j])));
+                                                    results.push((dist, batch_ids[j]));
+                                                    if results.len() > ef {
+                                                        results.pop();
+                                                    }
+                                                }
+                                            }
+                                            batch_len = 0;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Flush remaining batch
+                            if batch_len > 0 {
                                 let mut dists = [0.0f32; BATCH_CAP];
                                 self.distance_fn.compute_batch(
                                     query,
@@ -435,39 +522,15 @@ impl HnswIndex {
                                         }
                                     }
                                 }
-                                batch_len = 0;
                             }
                         }
                     }
-                }
 
-                // Flush remaining batch
-                if batch_len > 0 {
-                    let mut dists = [0.0f32; BATCH_CAP];
-                    self.distance_fn.compute_batch(
-                        query,
-                        &batch_vecs[..batch_len],
-                        &mut dists[..batch_len],
-                    );
-                    for j in 0..batch_len {
-                        let dist = OrderedFloat(dists[j]);
-                        let furthest = results
-                            .peek()
-                            .map(|r| r.0)
-                            .unwrap_or(OrderedFloat(f32::MAX));
-                        if results.len() < ef || dist < furthest {
-                            candidates.push(Reverse((dist, batch_ids[j])));
-                            results.push((dist, batch_ids[j]));
-                            if results.len() > ef {
-                                results.pop();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        results.into_iter().collect()
+                    // Drain results into an owned Vec so the scratch heap can be reused on the next call.
+                    results.drain().collect::<Vec<_>>()
+                })
+            })
+        })
     }
 
     /// Algorithm 4: select neighbors with diversity heuristic.
@@ -1246,6 +1309,1224 @@ impl HnswIndex {
         Ok(())
     }
 
+    /// Parallel bulk insert that also emits one delta entry per item, in input order.
+    //
+    // Result is deterministic per (initial graph state, input slice). Not serial-equivalent:
+    // within one batch, items do not see each other as candidate neighbors. Outside a batch
+    // (across batches or across single-item adds), the existing serial-equivalence contract
+    // still holds.
+    pub fn bulk_add_with_lsn(
+        &self,
+        items: &[(VectorId, Arc<Vec<f32>>, u64)],
+    ) -> Result<(), IndexError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        // Validate dimensions up front.
+        for (_id, vector, _lsn) in items {
+            if vector.len() != self.dimension {
+                return Err(IndexError::DimensionMismatch {
+                    expected: self.dimension,
+                    actual: vector.len(),
+                });
+            }
+        }
+
+        // Reject duplicate ids within the batch and ids that already exist in the index.
+        {
+            let inner = self.inner.read();
+            let mut seen = HashSet::with_capacity(items.len());
+            for (id, _, _) in items {
+                if inner.nodes.contains_key(id) || !seen.insert(*id) {
+                    return Err(IndexError::AlreadyExists(*id));
+                }
+            }
+        }
+
+        // Pre-compute levels sequentially under the write lock. RNG access only.
+        let levels: Vec<usize> = {
+            let mut inner = self.inner.write();
+            items
+                .iter()
+                .map(|_| Self::random_level(&mut inner, &self.params))
+                .collect()
+        };
+
+        // Concurrent node map: vectors are wrapped in Arc so cloning during the
+        // parallel phase costs an atomic increment rather than a full Vec copy.
+        // After the rayon phase ends, dropping all_nodes drops the Arcs and the
+        // memory is reclaimed in one shot instead of lingering for the lifetime
+        // of the bulk_insert call.
+        struct ConcurrentNode {
+            vector: Arc<Vec<f32>>,
+            neighbors: Vec<Mutex<Vec<VectorId>>>,
+            // True if this node was modified during the batch (bidirectional edge added or pruned).
+            modified: std::sync::atomic::AtomicBool,
+        }
+
+        let mut all_nodes: HashMap<VectorId, ConcurrentNode> = HashMap::with_capacity(
+            items.len() + self.inner.read().nodes.len(),
+        );
+
+        // Snapshot existing nodes into the concurrent map. The vector data is
+        // copied out of the arena exactly once into a heap allocation owned by
+        // an Arc; the rayon phase reads through the Arc without further copies.
+        {
+            let inner = self.inner.read();
+            for (&id, node) in &inner.nodes {
+                let neighbors = node
+                    .neighbors
+                    .iter()
+                    .map(|layer| Mutex::new(layer.clone()))
+                    .collect();
+                let vec_owned: Vec<f32> = inner.vectors.get(node.vector_slot).to_vec();
+                all_nodes.insert(
+                    id,
+                    ConcurrentNode {
+                        vector: Arc::new(vec_owned),
+                        neighbors,
+                        modified: std::sync::atomic::AtomicBool::new(false),
+                    },
+                );
+            }
+        }
+
+        // Add the new items into the concurrent map. Input vectors arrive as
+        // Arc<Vec<f32>> from the handler; clone the Arc (refcount bump only).
+        for ((id, vector, _lsn), &level) in items.iter().zip(levels.iter()) {
+            let neighbors = (0..=level).map(|_| Mutex::new(Vec::new())).collect();
+            all_nodes.insert(
+                *id,
+                ConcurrentNode {
+                    vector: Arc::clone(vector),
+                    neighbors,
+                    modified: std::sync::atomic::AtomicBool::new(false),
+                },
+            );
+        }
+
+        // Determine the starting entry point and max level once, before the parallel phase.
+        let (initial_ep, initial_max_level) = {
+            let inner = self.inner.read();
+            (inner.entry_point, inner.max_level)
+        };
+
+        // If the index is empty, seed the entry point with the first new item.
+        let seed_ep = initial_ep.unwrap_or(items[0].0);
+        let seed_max = if initial_ep.is_none() { levels[0] } else { initial_max_level };
+        let entry_point_atomic = AtomicU64::new(seed_ep);
+        let max_level_atomic = AtomicUsize::new(seed_max);
+
+        // Concurrent search inside the local node map: lock-free vector reads, brief per-layer lock for neighbor clone.
+        let search_layer_concurrent = |query: &[f32],
+                                        entry_points: &[VectorId],
+                                        ef: usize,
+                                        layer: usize|
+         -> Vec<(OrderedFloat<f32>, VectorId)> {
+            // Reuse per-worker scratch buffers; clear and refill on each call.
+            SCRATCH_VISITED.with(|v_cell| {
+                SCRATCH_CANDIDATES.with(|c_cell| {
+                    SCRATCH_RESULTS.with(|r_cell| {
+                        let mut visited = v_cell.borrow_mut();
+                        let mut candidates = c_cell.borrow_mut();
+                        let mut results = r_cell.borrow_mut();
+                        visited.clear();
+                        candidates.clear();
+                        results.clear();
+
+                        for &ep in entry_points {
+                            if let Some(node) = all_nodes.get(&ep) {
+                                visited.insert(ep);
+                                let dist = OrderedFloat(self.distance(query, node.vector.as_slice()));
+                                candidates.push(Reverse((dist, ep)));
+                                results.push((dist, ep));
+                            }
+                        }
+
+                        while let Some(Reverse((c_dist, c_id))) = candidates.pop() {
+                            let furthest_result = results.peek().map(|r| r.0).unwrap_or(OrderedFloat(f32::MAX));
+                            if c_dist > furthest_result {
+                                break;
+                            }
+
+                            let neighbor_ids: Option<Vec<VectorId>> =
+                                all_nodes.get(&c_id).and_then(|node| {
+                                    if layer < node.neighbors.len() {
+                                        Some(node.neighbors[layer].lock().clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                            if let Some(neighbors) = neighbor_ids {
+                                for &neighbor_id in &neighbors {
+                                    if visited.insert(neighbor_id) {
+                                        if let Some(neighbor_node) = all_nodes.get(&neighbor_id) {
+                                            let dist = OrderedFloat(self.distance(query, neighbor_node.vector.as_slice()));
+                                            let furthest = results.peek().map(|r| r.0).unwrap_or(OrderedFloat(f32::MAX));
+                                            if results.len() < ef || dist < furthest {
+                                                candidates.push(Reverse((dist, neighbor_id)));
+                                                results.push((dist, neighbor_id));
+                                                if results.len() > ef {
+                                                    results.pop();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Drain results into an owned Vec so the scratch heap can be reused on the next call.
+                        results.drain().collect()
+                    })
+                })
+            })
+        };
+
+        // Diversity heuristic over the concurrent map.
+        let select_neighbors_concurrent =
+            |_query: &[f32], candidates: &[(OrderedFloat<f32>, VectorId)], m: usize| -> Vec<VectorId> {
+                if candidates.len() <= m {
+                    return candidates.iter().map(|&(_, id)| id).collect();
+                }
+
+                let mut sorted: Vec<(OrderedFloat<f32>, VectorId)> = candidates.to_vec();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+                let mut result: Vec<(OrderedFloat<f32>, VectorId)> = Vec::with_capacity(m);
+                for &(dist_to_query, candidate_id) in &sorted {
+                    if result.len() >= m {
+                        break;
+                    }
+                    let candidate_vec: &[f32] = match all_nodes.get(&candidate_id) {
+                        Some(node) => node.vector.as_slice(),
+                        None => continue,
+                    };
+                    let is_diverse = result.iter().all(|&(_, existing_id)| {
+                        let existing_vec: &[f32] = match all_nodes.get(&existing_id) {
+                            Some(node) => node.vector.as_slice(),
+                            None => return true,
+                        };
+                        let dist_between = OrderedFloat(self.distance(candidate_vec, existing_vec));
+                        dist_to_query < dist_between
+                    });
+                    if is_diverse {
+                        result.push((dist_to_query, candidate_id));
+                    }
+                }
+
+                if result.len() < m {
+                    let selected: HashSet<VectorId> = result.iter().map(|&(_, id)| id).collect();
+                    for &(dist, id) in &sorted {
+                        if result.len() >= m {
+                            break;
+                        }
+                        if !selected.contains(&id) {
+                            result.push((dist, id));
+                        }
+                    }
+                }
+
+                result.iter().map(|&(_, id)| id).collect()
+            };
+
+        // Parallel insert. If the index was empty, the first item seeds the entry point and skips connection work.
+        let start_idx = if initial_ep.is_none() { 1 } else { 0 };
+
+        items[start_idx..]
+            .par_iter()
+            .zip(levels[start_idx..].par_iter())
+            .for_each(|((id, vector, _lsn), &new_level)| {
+                let cur_ep = entry_point_atomic.load(Ordering::Acquire);
+                let cur_max = max_level_atomic.load(Ordering::Acquire);
+                let mut current_ep = cur_ep;
+                let query: &[f32] = vector.as_slice();
+
+                if cur_max > new_level {
+                    for layer in (new_level + 1..=cur_max).rev() {
+                        let results = search_layer_concurrent(query, &[current_ep], 1, layer);
+                        if let Some(&(_, closest)) = results.iter().min_by_key(|&&(d, _)| d) {
+                            current_ep = closest;
+                        }
+                    }
+                }
+
+                let start_layer = new_level.min(cur_max);
+                for layer in (0..=start_layer).rev() {
+                    let results = search_layer_concurrent(
+                        query,
+                        &[current_ep],
+                        self.params.ef_construction,
+                        layer,
+                    );
+
+                    if let Some(&(_, closest)) = results.iter().min_by_key(|&&(d, _)| d) {
+                        current_ep = closest;
+                    }
+
+                    let m = self.max_connections(layer);
+                    let neighbors = select_neighbors_concurrent(query, &results, m);
+
+                    if let Some(node) = all_nodes.get(id) {
+                        if layer < node.neighbors.len() {
+                            *node.neighbors[layer].lock() = neighbors.clone();
+                        }
+                    }
+
+                    let max_conn = self.max_connections(layer);
+                    for &neighbor_id in &neighbors {
+                        if let Some(neighbor_node) = all_nodes.get(&neighbor_id) {
+                            if layer < neighbor_node.neighbors.len() {
+                                let mut neighbor_list = neighbor_node.neighbors[layer].lock();
+                                neighbor_list.push(*id);
+                                neighbor_node.modified.store(true, Ordering::Relaxed);
+
+                                if neighbor_list.len() > max_conn {
+                                    let neighbor_vec: &[f32] = neighbor_node.vector.as_slice();
+                                    let scored: Vec<(OrderedFloat<f32>, VectorId)> = neighbor_list
+                                        .iter()
+                                        .filter_map(|&nid| {
+                                            all_nodes.get(&nid).map(|n| {
+                                                (OrderedFloat(self.distance(neighbor_vec, n.vector.as_slice())), nid)
+                                            })
+                                        })
+                                        .collect();
+                                    let pruned = select_neighbors_concurrent(neighbor_vec, &scored, max_conn);
+                                    *neighbor_list = pruned;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                loop {
+                    let old_max = max_level_atomic.load(Ordering::Relaxed);
+                    if new_level <= old_max {
+                        break;
+                    }
+                    if max_level_atomic
+                        .compare_exchange_weak(old_max, new_level, Ordering::Release, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        entry_point_atomic.store(*id, Ordering::Release);
+                        break;
+                    }
+                }
+            });
+
+        // Phase 3: transfer back into HnswInner. Preserve existing arena slots; append new vectors.
+        // Track final post-batch state for delta emission and flat_adj maintenance.
+        let mut new_node_slots: HashMap<VectorId, usize> = HashMap::with_capacity(items.len());
+        let mut modified_existing: Vec<VectorId> = Vec::new();
+
+        {
+            let mut inner = self.inner.write();
+
+            // Drain the concurrent map. To keep vector_slot assignment deterministic,
+            // push new vectors into the arena in input order; existing nodes are processed afterwards
+            // since their slot is already stable.
+            let mut drained: HashMap<VectorId, ConcurrentNode> = all_nodes;
+
+            // Pass 1: new nodes in input order. Read the vector through the Arc
+            // (deref to &[f32]); the arena copies it into its flat buffer.
+            for (id, _vec, _lsn) in items {
+                if let Some(cnode) = drained.remove(id) {
+                    // Reclaim Vec slack from parallel-phase push doublings.
+                    let neighbors: Vec<Vec<VectorId>> = cnode
+                        .neighbors
+                        .into_iter()
+                        .map(|m| {
+                            let mut v = m.into_inner();
+                            v.shrink_to_fit();
+                            v
+                        })
+                        .collect();
+                    let slot = inner.vectors.push(cnode.vector.as_slice());
+                    new_node_slots.insert(*id, slot);
+                    inner.nodes.insert(
+                        *id,
+                        HnswNode {
+                            vector_slot: slot,
+                            neighbors,
+                        },
+                    );
+                }
+            }
+
+            // Pass 2: existing nodes. Only touch nodes flagged modified; iteration order is irrelevant
+            // since slots are preserved and we only mutate the neighbor lists.
+            for (id, cnode) in drained.into_iter() {
+                if !cnode.modified.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Reclaim Vec slack from parallel-phase push doublings.
+                let neighbors: Vec<Vec<VectorId>> = cnode
+                    .neighbors
+                    .into_iter()
+                    .map(|m| {
+                        let mut v = m.into_inner();
+                        v.shrink_to_fit();
+                        v
+                    })
+                    .collect();
+                if let Some(node) = inner.nodes.get_mut(&id) {
+                    node.neighbors = neighbors;
+                    modified_existing.push(id);
+                }
+            }
+
+            // Recompute definitive entry_point and max_level from the final node set.
+            // This mirrors build_parallel and avoids races from the atomic hints.
+            let (final_ep, final_max) = inner
+                .nodes
+                .iter()
+                .map(|(&id, node)| (id, node.max_level()))
+                .max_by_key(|&(_, level)| level)
+                .unwrap_or((entry_point_atomic.load(Ordering::Acquire), 0));
+            inner.entry_point = Some(final_ep);
+            inner.max_level = final_max;
+
+            // The concurrent map is fully consumed by the for loop above; iterator drop releases it.
+
+            // Return capacity ratchet from the arena to the allocator now that
+            // the bulk write burst is done.
+            inner.vectors.compact();
+
+            // Incrementally update flat_adj for every touched node, mirroring insert_node.
+            if inner.flat_adj.is_some() {
+                // Two passes: re-insert new nodes, then re-insert modified existing nodes.
+                let touched: Vec<VectorId> = items
+                    .iter()
+                    .map(|(id, _, _)| *id)
+                    .chain(modified_existing.iter().copied())
+                    .collect();
+                let mut dedup: HashSet<VectorId> = HashSet::with_capacity(touched.len());
+                let mut touched_unique: Vec<VectorId> = Vec::with_capacity(touched.len());
+                for id in touched {
+                    if dedup.insert(id) {
+                        touched_unique.push(id);
+                    }
+                }
+                // Snapshot per-node neighbor layers before borrowing flat_adj mutably.
+                let snapshots: Vec<(VectorId, Vec<Vec<VectorId>>)> = touched_unique
+                    .iter()
+                    .filter_map(|id| inner.nodes.get(id).map(|n| (*id, n.neighbors.clone())))
+                    .collect();
+                if let Some(ref mut flat) = inner.flat_adj {
+                    for (id, layers) in &snapshots {
+                        let layer_refs: Vec<&[VectorId]> = layers.iter().map(|l| l.as_slice()).collect();
+                        flat.insert_node(*id, &layer_refs);
+                    }
+                    flat.maybe_compact();
+                }
+            }
+        }
+
+        // Emit deltas in input order, after the inner write lock is released.
+        let mut dw = self.delta_writer.lock();
+        if let Some(ref mut writer) = *dw {
+            let inner = self.inner.read();
+            for (id, _vector, lsn) in items {
+                if let Some(node) = inner.nodes.get(id) {
+                    let neighbors_per_layer: Vec<Vec<VectorId>> = node.neighbors.clone();
+                    let entry = HnswDeltaEntry {
+                        lsn: *lsn,
+                        op: HnswDeltaOp::AddNode {
+                            id: *id,
+                            level: node.max_level() as u32,
+                            vector_slot: node.vector_slot as u64,
+                            neighbors_per_layer,
+                        },
+                    };
+                    if let Err(e) = writer.append(&entry) {
+                        log::warn!("delta write failed for AddNode id={}: {}", id, e);
+                    }
+                }
+            }
+
+            // Emit SetEntryPoint once at the highest LSN if the entry point moved.
+            if inner.entry_point != initial_ep {
+                if let Some(ep_id) = inner.entry_point {
+                    let max_lsn = items.iter().map(|(_, _, lsn)| *lsn).max().unwrap_or(0);
+                    let entry = HnswDeltaEntry {
+                        lsn: max_lsn,
+                        op: HnswDeltaOp::SetEntryPoint {
+                            id: ep_id,
+                            level: inner.max_level as u32,
+                        },
+                    };
+                    if let Err(e) = writer.append(&entry) {
+                        log::warn!("delta write failed for SetEntryPoint: {}", e);
+                    }
+                }
+            }
+
+            // Flush and rebuild the BufWriter so the internal buffer capacity
+            // that grew during the burst is returned to the allocator.
+            if let Err(e) = writer.sync() {
+                log::warn!("delta sync after bulk_add_with_lsn failed: {}", e);
+            }
+            if let Err(e) = writer.reset_buffer() {
+                log::warn!("delta reset_buffer after bulk_add_with_lsn failed: {}", e);
+            }
+        }
+
+        // Return freed per-batch scratch to the OS so peak RSS tracks live data.
+        release_to_os();
+
+        // Silence unused warning if the field is only consulted on the slow path.
+        let _ = new_node_slots;
+        Ok(())
+    }
+
+    /// Bulk insert path that borrows vector slices directly from caller-owned
+    /// memory (typically an mmap'd file) and avoids snapshotting existing
+    /// nodes. Phase 2 reads existing nodes through `self.inner.read()` and
+    /// keeps in-flight new rows in a DashMap; Phase 3 takes the write lock
+    /// once and applies the drained results. See ADR-001 (memory-peak
+    /// reduction) Decision 3 for the full algorithmic contract.
+    pub fn bulk_add_from_slice_iter<'mmap>(
+        &self,
+        items: &[(VectorId, &'mmap [f32], u64)],
+        total_count_hint: usize,
+    ) -> Result<(), IndexError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        // Decision 6.a + P01: pre-reserve every N-sized container in the HNSW
+        // path from the caller-supplied hint. reserve takes &mut self, so the
+        // write lock is required here. We expand the arena's flat vector
+        // buffer, the per-id nodes HashMap, and the free-slot tracker so the
+        // bulk path never trips a doubling reallocation.
+        //
+        // FREE_SLOTS_RESERVE_DIVISOR: empirical 10 percent anticipated
+        // deletion rate during a large load. Underrun is harmless (slack
+        // returned via VectorArena::compact at end of Phase 3); overrun
+        // falls back to the normal doubling for the small remainder.
+        const FREE_SLOTS_RESERVE_DIVISOR: usize = 10;
+
+        if total_count_hint > 0 {
+            let mut w = self.inner.write();
+            let current_vectors = w.vectors.active_count();
+            if total_count_hint > current_vectors {
+                w.vectors.reserve(total_count_hint - current_vectors);
+            }
+            let current_nodes = w.nodes.len();
+            if total_count_hint > current_nodes {
+                w.nodes.reserve(total_count_hint - current_nodes);
+            }
+            w.vectors
+                .reserve_free_slots(total_count_hint / FREE_SLOTS_RESERVE_DIVISOR);
+        }
+
+        // Validate dimensions and detect duplicate / already-present ids
+        // before any write-lock work. Mirrors bulk_add_with_lsn taxonomy.
+        for (_id, vector, _lsn) in items {
+            if vector.len() != self.dimension {
+                return Err(IndexError::DimensionMismatch {
+                    expected: self.dimension,
+                    actual: vector.len(),
+                });
+            }
+        }
+        {
+            let inner = self.inner.read();
+            let mut seen = HashSet::with_capacity(items.len());
+            for (id, _, _) in items {
+                if inner.nodes.contains_key(id) || !seen.insert(*id) {
+                    return Err(IndexError::AlreadyExists(*id));
+                }
+            }
+        }
+
+        // Decision 3.a: Phase 1. Brief write lock to draw deterministic
+        // random levels via the RwLock-protected RNG.
+        let levels: Vec<usize> = {
+            let mut inner = self.inner.write();
+            items
+                .iter()
+                .map(|_| Self::random_level(&mut inner, &self.params))
+                .collect()
+        };
+
+        // Decision 3.b: in-flight new rows live in a DashMap keyed by id.
+        // Each NewRowState borrows its vector slice from the caller-held mmap
+        // for the duration of this call; no per-row Vec<f32> allocation.
+        let new_rows: Arc<DashMap<VectorId, NewRowState<'mmap>>> =
+            Arc::new(DashMap::with_capacity(items.len()));
+        for ((id, vector_slice, _lsn), &level) in items.iter().zip(levels.iter()) {
+            let neighbors: Vec<Mutex<Vec<VectorId>>> =
+                (0..=level).map(|_| Mutex::new(Vec::new())).collect();
+            new_rows.insert(
+                *id,
+                NewRowState {
+                    vector: *vector_slice,
+                    level,
+                    neighbors,
+                },
+            );
+        }
+
+        // Decision 3.c: deferred bidirectional edges for existing nodes.
+        // Phase 2 cannot mutate existing nodes (read-lock only), so neighbor
+        // appends targeting existing nodes are queued here and drained in
+        // Phase 3 under the write lock.
+        let existing_edge_updates: Arc<
+            DashMap<VectorId, Mutex<Vec<(usize, VectorId)>>>,
+        > = Arc::new(DashMap::new());
+
+        // Take the read lock and hold it across the entire par_iter. Existing
+        // node vector data and neighbor lists are read directly through this
+        // guard with zero copy.
+        let inner_guard = self.inner.read();
+
+        let (initial_ep, initial_max_level) =
+            (inner_guard.entry_point, inner_guard.max_level);
+
+        // If the index is empty, seed the entry point with the first new
+        // item. The first item connects no neighbors; subsequent items see
+        // it through the unified candidate lookup.
+        let seed_ep = initial_ep.unwrap_or(items[0].0);
+        let seed_max = if initial_ep.is_none() { levels[0] } else { initial_max_level };
+        let entry_point_atomic = AtomicU64::new(seed_ep);
+        let max_level_atomic = AtomicUsize::new(seed_max);
+
+        let start_idx = if initial_ep.is_none() { 1 } else { 0 };
+
+        // Decision 3.e: Phase 2 parallel insert.
+        items[start_idx..]
+            .par_iter()
+            .zip(levels[start_idx..].par_iter())
+            .for_each(|((id, vector_slice, _lsn), &new_level)| {
+                let cur_max = max_level_atomic.load(Ordering::Acquire);
+                let mut current_ep = entry_point_atomic.load(Ordering::Acquire);
+                let query: &[f32] = *vector_slice;
+
+                // Top-down greedy descent for layers above new_level, ef=1.
+                if cur_max > new_level {
+                    for layer in (new_level + 1..=cur_max).rev() {
+                        let results = self.search_layer_unified(
+                            &inner_guard,
+                            &new_rows,
+                            query,
+                            &[current_ep],
+                            1,
+                            layer,
+                        );
+                        if let Some(&(_, closest)) =
+                            results.iter().min_by_key(|&&(d, _)| d)
+                        {
+                            current_ep = closest;
+                        }
+                    }
+                }
+
+                // Layer-by-layer connect with ef=ef_construction.
+                let start_layer = new_level.min(cur_max);
+                for layer in (0..=start_layer).rev() {
+                    let results = self.search_layer_unified(
+                        &inner_guard,
+                        &new_rows,
+                        query,
+                        &[current_ep],
+                        self.params.ef_construction,
+                        layer,
+                    );
+                    if let Some(&(_, closest)) =
+                        results.iter().min_by_key(|&&(d, _)| d)
+                    {
+                        current_ep = closest;
+                    }
+
+                    let m = self.max_connections(layer);
+                    let neighbors = self.select_neighbors_unified(
+                        &inner_guard,
+                        &new_rows,
+                        query,
+                        &results,
+                        m,
+                    );
+
+                    // Outbound edges on the new row itself. Decision 3.h:
+                    // snapshot length only; the DashMap guard is dropped
+                    // before the neighbor mutex is taken below.
+                    let self_neighbor_layer_count: Option<usize> = {
+                        let guard = new_rows.get(id);
+                        guard.as_ref().map(|state| state.neighbors.len())
+                    };
+                    if let Some(layer_count) = self_neighbor_layer_count {
+                        if layer < layer_count {
+                            if let Some(state) = new_rows.get(id) {
+                                *state.neighbors[layer].lock() = neighbors.clone();
+                            }
+                        }
+                    }
+
+                    // Bidirectional edges. For each chosen neighbor: if it
+                    // is itself an in-flight new row, mutate its per-layer
+                    // mutex; otherwise defer the edge for Phase 3.
+                    for &neighbor_id in &neighbors {
+                        // Probe whether the neighbor is in-flight without
+                        // holding the DashMap guard across the distance
+                        // work that may follow.
+                        let neighbor_layer_count: Option<usize> = {
+                            let guard = new_rows.get(&neighbor_id);
+                            guard.as_ref().map(|s| s.neighbors.len())
+                        };
+                        if let Some(layer_count) = neighbor_layer_count {
+                            if layer >= layer_count {
+                                continue;
+                            }
+                            // Re-fetch and lock. The DashMap guard is held
+                            // only across the neighbor Mutex acquisition,
+                            // not across any distance computation outside
+                            // of prune_neighbors_unified (which itself
+                            // does NOT acquire neighbor mutexes; see
+                            // Decision 3.f.1).
+                            if let Some(neighbor_state) = new_rows.get(&neighbor_id) {
+                                let mut nlist = neighbor_state.neighbors[layer].lock();
+                                nlist.push(*id);
+                                let cap = self.max_connections(layer);
+                                if nlist.len() > cap {
+                                    let neighbor_vec: &[f32] = neighbor_state.vector;
+                                    let pruned = self.prune_neighbors_unified(
+                                        &inner_guard,
+                                        &new_rows,
+                                        neighbor_vec,
+                                        &nlist,
+                                        cap,
+                                    );
+                                    *nlist = pruned;
+                                }
+                            }
+                        } else {
+                            // Existing node: queue the edge for Phase 3.
+                            existing_edge_updates
+                                .entry(neighbor_id)
+                                .or_insert_with(|| Mutex::new(Vec::new()))
+                                .lock()
+                                .push((layer, *id));
+                        }
+                    }
+                }
+
+                // Promote entry point if this row's level exceeds current
+                // max. Standard CAS loop matching bulk_add_with_lsn.
+                loop {
+                    let old_max = max_level_atomic.load(Ordering::Relaxed);
+                    if new_level <= old_max {
+                        break;
+                    }
+                    if max_level_atomic
+                        .compare_exchange_weak(
+                            old_max,
+                            new_level,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        entry_point_atomic.store(*id, Ordering::Release);
+                        break;
+                    }
+                }
+            });
+
+        // Release the read guard before taking the write lock for Phase 3.
+        drop(inner_guard);
+
+        // Decision 3.i: Phase 3 drain under a single write lock.
+        let mut new_node_slots: HashMap<VectorId, usize> = HashMap::with_capacity(items.len());
+        let mut modified_existing: Vec<VectorId> = Vec::new();
+
+        {
+            let mut inner = self.inner.write();
+
+            // Pass 1: new rows in input order so vector_slot assignment is
+            // deterministic. extend the arena from the borrowed mmap slice
+            // exactly once per row.
+            for (id, _vec, _lsn) in items {
+                if let Some((_k, state)) = new_rows.remove(id) {
+                    debug_assert_eq!(
+                        state.neighbors.len(),
+                        state.level + 1,
+                        "NewRowState level / neighbors-layer-count invariant broken for VectorId={}",
+                        id
+                    );
+                    let neighbors: Vec<Vec<VectorId>> = state
+                        .neighbors
+                        .into_iter()
+                        .map(|m| {
+                            let mut v = m.into_inner();
+                            v.shrink_to_fit();
+                            v
+                        })
+                        .collect();
+                    let slot = inner.vectors.push(state.vector);
+                    new_node_slots.insert(*id, slot);
+                    inner.nodes.insert(
+                        *id,
+                        HnswNode {
+                            vector_slot: slot,
+                            neighbors,
+                        },
+                    );
+                }
+            }
+
+            // Pass 2: drain deferred existing-node edges. For each affected
+            // node, append the queued (layer, new_id) edges; prune any
+            // layer that overflows max_connections using the same diversity
+            // heuristic the legacy path uses.
+            let pending_updates: Vec<(VectorId, Vec<(usize, VectorId)>)> = {
+                let mut collected: Vec<(VectorId, Vec<(usize, VectorId)>)> =
+                    Vec::with_capacity(existing_edge_updates.len());
+                for entry in existing_edge_updates.iter() {
+                    let key = *entry.key();
+                    let updates = entry.value().lock().clone();
+                    collected.push((key, updates));
+                }
+                collected
+            };
+
+            for (existing_id, updates) in pending_updates {
+                if !inner.nodes.contains_key(&existing_id) {
+                    continue;
+                }
+                // Append edges.
+                if let Some(node) = inner.nodes.get_mut(&existing_id) {
+                    for (layer, new_id) in &updates {
+                        if *layer < node.neighbors.len() {
+                            node.neighbors[*layer].push(*new_id);
+                        }
+                    }
+                }
+                // Per-layer prune. Score candidates against the existing
+                // node's own vector, then run the diversity heuristic.
+                // Done in a separate scope so we can borrow inner.vectors
+                // immutably while node.neighbors is consulted.
+                let layer_count = inner
+                    .nodes
+                    .get(&existing_id)
+                    .map(|n| n.neighbors.len())
+                    .unwrap_or(0);
+                for layer in 0..layer_count {
+                    let cap = self.max_connections(layer);
+                    let current_len = inner
+                        .nodes
+                        .get(&existing_id)
+                        .map(|n| n.neighbors[layer].len())
+                        .unwrap_or(0);
+                    if current_len <= cap {
+                        continue;
+                    }
+                    // Snapshot candidates and the anchor vector.
+                    let (anchor_vec_owned, candidates): (Vec<f32>, Vec<VectorId>) = {
+                        let node = inner.nodes.get(&existing_id).expect("node present");
+                        let anchor: Vec<f32> = inner.vectors.get(node.vector_slot).to_vec();
+                        let cands = node.neighbors[layer].clone();
+                        (anchor, cands)
+                    };
+                    // Pass 1 drained every new row into inner.nodes, so the
+                    // new_rows DashMap is empty by the time Pass 2 runs. The
+                    // sole lookup we need here is inner.nodes; an unresolved
+                    // candidate is a stale edge against a removed node and
+                    // is dropped from the scored set.
+                    let scored: Vec<(OrderedFloat<f32>, VectorId)> = candidates
+                        .iter()
+                        .filter_map(|&nid| {
+                            inner.nodes.get(&nid).map(|node| {
+                                let v = inner.vectors.get(node.vector_slot);
+                                (OrderedFloat(self.distance(&anchor_vec_owned, v)), nid)
+                            })
+                        })
+                        .collect();
+                    let pruned = self.select_neighbors_unified(
+                        &inner,
+                        &new_rows,
+                        &anchor_vec_owned,
+                        &scored,
+                        cap,
+                    );
+                    if let Some(node) = inner.nodes.get_mut(&existing_id) {
+                        node.neighbors[layer] = pruned;
+                    }
+                }
+                modified_existing.push(existing_id);
+            }
+
+            // Recompute definitive entry_point / max_level from the final
+            // node set, matching bulk_add_with_lsn.
+            let (final_ep, final_max) = inner
+                .nodes
+                .iter()
+                .map(|(&id, node)| (id, node.max_level()))
+                .max_by_key(|&(_, level)| level)
+                .unwrap_or((entry_point_atomic.load(Ordering::Acquire), 0));
+            inner.entry_point = Some(final_ep);
+            inner.max_level = final_max;
+
+            // Return arena capacity slack to the allocator.
+            inner.vectors.compact();
+
+            // Incrementally update flat_adj for every touched node.
+            if inner.flat_adj.is_some() {
+                let touched: Vec<VectorId> = items
+                    .iter()
+                    .map(|(id, _, _)| *id)
+                    .chain(modified_existing.iter().copied())
+                    .collect();
+                let mut dedup: HashSet<VectorId> = HashSet::with_capacity(touched.len());
+                let mut touched_unique: Vec<VectorId> = Vec::with_capacity(touched.len());
+                for id in touched {
+                    if dedup.insert(id) {
+                        touched_unique.push(id);
+                    }
+                }
+                let snapshots: Vec<(VectorId, Vec<Vec<VectorId>>)> = touched_unique
+                    .iter()
+                    .filter_map(|id| inner.nodes.get(id).map(|n| (*id, n.neighbors.clone())))
+                    .collect();
+                if let Some(ref mut flat) = inner.flat_adj {
+                    for (id, layers) in &snapshots {
+                        let layer_refs: Vec<&[VectorId]> =
+                            layers.iter().map(|l| l.as_slice()).collect();
+                        flat.insert_node(*id, &layer_refs);
+                    }
+                    flat.maybe_compact();
+                }
+            }
+        }
+
+        // Emit deltas in input order, mirroring bulk_add_with_lsn.
+        let mut dw = self.delta_writer.lock();
+        if let Some(ref mut writer) = *dw {
+            let inner = self.inner.read();
+            for (id, _vector, lsn) in items {
+                if let Some(node) = inner.nodes.get(id) {
+                    let neighbors_per_layer: Vec<Vec<VectorId>> = node.neighbors.clone();
+                    let entry = HnswDeltaEntry {
+                        lsn: *lsn,
+                        op: HnswDeltaOp::AddNode {
+                            id: *id,
+                            level: node.max_level() as u32,
+                            vector_slot: node.vector_slot as u64,
+                            neighbors_per_layer,
+                        },
+                    };
+                    if let Err(e) = writer.append(&entry) {
+                        log::warn!("delta write failed for AddNode id={}: {}", id, e);
+                    }
+                }
+            }
+
+            if inner.entry_point != initial_ep {
+                if let Some(ep_id) = inner.entry_point {
+                    let max_lsn = items.iter().map(|(_, _, lsn)| *lsn).max().unwrap_or(0);
+                    let entry = HnswDeltaEntry {
+                        lsn: max_lsn,
+                        op: HnswDeltaOp::SetEntryPoint {
+                            id: ep_id,
+                            level: inner.max_level as u32,
+                        },
+                    };
+                    if let Err(e) = writer.append(&entry) {
+                        log::warn!("delta write failed for SetEntryPoint: {}", e);
+                    }
+                }
+            }
+
+            if let Err(e) = writer.sync() {
+                log::warn!("delta sync after bulk_add_from_slice_iter failed: {}", e);
+            }
+            if let Err(e) = writer.reset_buffer() {
+                log::warn!(
+                    "delta reset_buffer after bulk_add_from_slice_iter failed: {}",
+                    e
+                );
+            }
+        }
+
+        // Return freed per-batch scratch to the OS so peak RSS tracks live data.
+        release_to_os();
+
+        let _ = new_node_slots;
+        Ok(())
+    }
+
+    // ── Unified search/select/prune helpers (no-snapshot bulk insert) ──
+    //
+    // These three helpers back bulk_add_from_slice_iter. They consult both
+    // the existing index (via the HnswInner read guard) and the in-flight
+    // new rows (via the DashMap of NewRowState). Decision 3.h: DashMap
+    // shard guards are released before any distance computation; cloned
+    // neighbor lists and the &'mmap [f32] slice headers carry the data out.
+
+    /// Greedy beam search in a single layer that consults both existing
+    /// nodes and in-flight new rows. Mirrors the legacy
+    /// `search_layer_concurrent` closure body in `bulk_add_with_lsn`.
+    fn search_layer_unified<'inner, 'mmap>(
+        &self,
+        inner: &'inner HnswInner,
+        new_rows: &DashMap<VectorId, NewRowState<'mmap>>,
+        query: &[f32],
+        entry_points: &[VectorId],
+        ef: usize,
+        layer: usize,
+    ) -> Vec<(OrderedFloat<f32>, VectorId)>
+    where
+        'mmap: 'inner,
+    {
+        SCRATCH_VISITED.with(|v_cell| {
+            SCRATCH_CANDIDATES.with(|c_cell| {
+                SCRATCH_RESULTS.with(|r_cell| {
+                    let mut visited = v_cell.borrow_mut();
+                    let mut candidates = c_cell.borrow_mut();
+                    let mut results = r_cell.borrow_mut();
+                    visited.clear();
+                    candidates.clear();
+                    results.clear();
+
+                    for &ep in entry_points {
+                        if visited.contains(&ep) {
+                            continue;
+                        }
+                        // Look up the entry-point vector. Decision 3.h: if
+                        // it lives in new_rows, copy the slice header into
+                        // a local and drop the DashMap guard before the
+                        // distance call.
+                        let ep_vec_opt: Option<&[f32]> = if let Some(node) = inner.nodes.get(&ep) {
+                            Some(inner.vectors.get(node.vector_slot))
+                        } else if let Some(state) = new_rows.get(&ep) {
+                            let v: &[f32] = state.vector;
+                            drop(state);
+                            Some(v)
+                        } else {
+                            None
+                        };
+                        if let Some(ep_vec) = ep_vec_opt {
+                            visited.insert(ep);
+                            let dist = OrderedFloat(self.distance(query, ep_vec));
+                            candidates.push(Reverse((dist, ep)));
+                            results.push((dist, ep));
+                        }
+                    }
+
+                    while let Some(Reverse((c_dist, c_id))) = candidates.pop() {
+                        let furthest_result =
+                            results.peek().map(|r| r.0).unwrap_or(OrderedFloat(f32::MAX));
+                        if c_dist > furthest_result {
+                            break;
+                        }
+
+                        // Fetch the neighbor list for c_id at `layer`.
+                        // Drop the DashMap guard immediately after cloning.
+                        let neighbor_ids: Option<Vec<VectorId>> =
+                            if let Some(node) = inner.nodes.get(&c_id) {
+                                if layer < node.neighbors.len() {
+                                    Some(node.neighbors[layer].clone())
+                                } else {
+                                    None
+                                }
+                            } else if let Some(state) = new_rows.get(&c_id) {
+                                if layer < state.neighbors.len() {
+                                    let cloned = state.neighbors[layer].lock().clone();
+                                    drop(state);
+                                    Some(cloned)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                        if let Some(neighbors) = neighbor_ids {
+                            for &neighbor_id in &neighbors {
+                                if !visited.insert(neighbor_id) {
+                                    continue;
+                                }
+                                // Look up the neighbor's vector slice;
+                                // again, drop the DashMap guard before the
+                                // distance call.
+                                let n_vec_opt: Option<&[f32]> =
+                                    if let Some(node) = inner.nodes.get(&neighbor_id) {
+                                        Some(inner.vectors.get(node.vector_slot))
+                                    } else if let Some(state) = new_rows.get(&neighbor_id) {
+                                        let v: &[f32] = state.vector;
+                                        drop(state);
+                                        Some(v)
+                                    } else {
+                                        None
+                                    };
+                                if let Some(n_vec) = n_vec_opt {
+                                    let dist = OrderedFloat(self.distance(query, n_vec));
+                                    let furthest = results
+                                        .peek()
+                                        .map(|r| r.0)
+                                        .unwrap_or(OrderedFloat(f32::MAX));
+                                    if results.len() < ef || dist < furthest {
+                                        candidates.push(Reverse((dist, neighbor_id)));
+                                        results.push((dist, neighbor_id));
+                                        if results.len() > ef {
+                                            results.pop();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    results.drain().collect()
+                })
+            })
+        })
+    }
+
+    /// Diversity heuristic over a candidate set. Mirrors the legacy
+    /// `select_neighbors_concurrent` closure body. Unified across existing
+    /// nodes and in-flight new rows.
+    fn select_neighbors_unified<'inner, 'mmap>(
+        &self,
+        inner: &'inner HnswInner,
+        new_rows: &DashMap<VectorId, NewRowState<'mmap>>,
+        _query: &[f32],
+        candidates: &[(OrderedFloat<f32>, VectorId)],
+        m: usize,
+    ) -> Vec<VectorId>
+    where
+        'mmap: 'inner,
+    {
+        if candidates.len() <= m {
+            return candidates.iter().map(|&(_, id)| id).collect();
+        }
+
+        let mut sorted: Vec<(OrderedFloat<f32>, VectorId)> = candidates.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut result: Vec<(OrderedFloat<f32>, VectorId)> = Vec::with_capacity(m);
+        for &(dist_to_query, candidate_id) in &sorted {
+            if result.len() >= m {
+                break;
+            }
+            // Capture the candidate vector by copying the slice header.
+            // Decision 3.h: drop the DashMap guard before the inner loop
+            // below computes pairwise distances.
+            let candidate_vec: &[f32] = if let Some(node) = inner.nodes.get(&candidate_id) {
+                inner.vectors.get(node.vector_slot)
+            } else if let Some(state) = new_rows.get(&candidate_id) {
+                let v: &[f32] = state.vector;
+                drop(state);
+                v
+            } else {
+                continue;
+            };
+            let is_diverse = result.iter().all(|&(_, existing_id)| {
+                let existing_vec: &[f32] = if let Some(node) = inner.nodes.get(&existing_id) {
+                    inner.vectors.get(node.vector_slot)
+                } else if let Some(state) = new_rows.get(&existing_id) {
+                    let v: &[f32] = state.vector;
+                    drop(state);
+                    v
+                } else {
+                    return true;
+                };
+                let dist_between = OrderedFloat(self.distance(candidate_vec, existing_vec));
+                dist_to_query < dist_between
+            });
+            if is_diverse {
+                result.push((dist_to_query, candidate_id));
+            }
+        }
+
+        if result.len() < m {
+            let selected: HashSet<VectorId> = result.iter().map(|&(_, id)| id).collect();
+            for &(dist, id) in &sorted {
+                if result.len() >= m {
+                    break;
+                }
+                if !selected.contains(&id) {
+                    result.push((dist, id));
+                }
+            }
+        }
+
+        result.iter().map(|&(_, id)| id).collect()
+    }
+
+    // Decision 3.f.1: prune_neighbors_unified reads ONLY candidate vectors,
+    // NEVER candidate neighbor lists. This invariant eliminates the AB-BA
+    // deadlock risk when pruning is invoked under one new row's per-layer
+    // neighbor Mutex. Do NOT add neighbor-list reads here without first
+    // establishing a lock-ordering protocol and a superseding ADR.
+    fn prune_neighbors_unified<'inner, 'mmap>(
+        &self,
+        inner: &'inner HnswInner,
+        new_rows: &DashMap<VectorId, NewRowState<'mmap>>,
+        query_vec: &[f32],
+        candidates: &[VectorId],
+        max_keep: usize,
+    ) -> Vec<VectorId>
+    where
+        'mmap: 'inner,
+    {
+        // Score each candidate against query_vec. Vector lookup ONLY; no
+        // neighbor-list reads. DashMap guards are dropped before any
+        // distance call.
+        let mut scored: Vec<(OrderedFloat<f32>, VectorId)> = candidates
+            .iter()
+            .filter_map(|&id| {
+                let v: &[f32] = if let Some(node) = inner.nodes.get(&id) {
+                    inner.vectors.get(node.vector_slot)
+                } else if let Some(state) = new_rows.get(&id) {
+                    let v: &[f32] = state.vector;
+                    drop(state);
+                    v
+                } else {
+                    return None;
+                };
+                Some((OrderedFloat(self.distance(query_vec, v)), id))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut kept: Vec<(OrderedFloat<f32>, VectorId)> = Vec::with_capacity(max_keep);
+        for &(c_dist, c_id) in &scored {
+            if kept.len() >= max_keep {
+                break;
+            }
+            let c_vec: &[f32] = if let Some(node) = inner.nodes.get(&c_id) {
+                inner.vectors.get(node.vector_slot)
+            } else if let Some(state) = new_rows.get(&c_id) {
+                let v: &[f32] = state.vector;
+                drop(state);
+                v
+            } else {
+                continue;
+            };
+            let diverse = kept.iter().all(|&(_, k_id)| {
+                let k_vec: &[f32] = if let Some(node) = inner.nodes.get(&k_id) {
+                    inner.vectors.get(node.vector_slot)
+                } else if let Some(state) = new_rows.get(&k_id) {
+                    let v: &[f32] = state.vector;
+                    drop(state);
+                    v
+                } else {
+                    return true;
+                };
+                c_dist < OrderedFloat(self.distance(c_vec, k_vec))
+            });
+            if diverse {
+                kept.push((c_dist, c_id));
+            }
+        }
+
+        kept.into_iter().map(|(_, id)| id).collect()
+    }
+
     // ── Optimization: Flat Adjacency Compaction ────────────────────────
 
     /// Compacts the HNSW graph's adjacency data into a flat, contiguous buffer
@@ -1260,7 +2541,17 @@ impl HnswIndex {
     /// This is an optional optimization; the index works correctly without it.
     pub fn compact(&self) {
         let mut inner = self.inner.write();
-        let flat = FlatAdjacencyList::from_hnsw_nodes(&inner.nodes);
+        // Pre-size the flat adjacency buffer and per-node index from the known
+        // node count to avoid Vec/HashMap doubling reallocations during the
+        // post-insert compact step at 1M-node scale.
+        let node_count = inner.nodes.len();
+        let max_neighbors_per_node = self.params.m0;
+        let mut flat = FlatAdjacencyList::with_capacity(node_count, max_neighbors_per_node);
+        for (&id, node) in &inner.nodes {
+            let layer_refs: Vec<&[VectorId]> =
+                node.neighbors.iter().map(|layer| layer.as_slice()).collect();
+            flat.insert_node(id, &layer_refs);
+        }
         inner.flat_adj = Some(flat);
     }
 
@@ -1702,6 +2993,22 @@ impl VectorIndex for HnswIndex {
 impl PersistableIndex for HnswIndex {
     fn add_with_lsn(&self, id: VectorId, vector: &[f32], lsn: u64) -> Result<(), IndexError> {
         self.add_with_lsn(id, vector, lsn)
+    }
+
+    // Route trait dispatch to the parallel concrete implementation.
+    fn bulk_add_with_lsn(
+        &self,
+        items: &[(VectorId, Arc<Vec<f32>>, u64)],
+    ) -> Result<(), IndexError> {
+        self.bulk_add_with_lsn(items)
+    }
+
+    fn bulk_add_from_slice_iter<'mmap>(
+        &self,
+        items: &[(VectorId, &'mmap [f32], u64)],
+        total_count_hint: usize,
+    ) -> Result<(), IndexError> {
+        self.bulk_add_from_slice_iter(items, total_count_hint)
     }
 
     fn remove_with_lsn(&self, id: VectorId, lsn: u64) -> Result<(), IndexError> {

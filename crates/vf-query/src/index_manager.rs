@@ -403,6 +403,25 @@ impl IndexManager {
         }
     }
 
+    /// Release excess capacity in all internal maps after a bulk insert.
+    /// Walks each per-field index and asks it to shrink, then trims the
+    /// manager-owned records and field_stats HashMaps.
+    pub fn compact(&mut self) {
+        for index in self.indexes.values_mut() {
+            match index {
+                MetadataIndex::BTree(idx) => idx.compact(),
+                MetadataIndex::Hash(idx) => idx.compact(),
+                MetadataIndex::Bitmap(idx) => idx.compact(),
+            }
+        }
+        self.indexes.shrink_to_fit();
+        self.field_stats.shrink_to_fit();
+        self.records.shrink_to_fit();
+        for fields in self.records.values_mut() {
+            fields.shrink_to_fit();
+        }
+    }
+
     fn select_index_type(&self, unique_values: usize) -> IndexType {
         if unique_values <= self.config.bitmap_cardinality_threshold {
             IndexType::Bitmap

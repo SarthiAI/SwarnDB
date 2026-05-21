@@ -14,7 +14,14 @@ use vf_query::vector_math::*;
 use crate::convert::parse_distance_metric;
 use crate::proto::swarndb::v1 as proto;
 use crate::proto::swarndb::v1::vector_math_service_server::VectorMathService;
-use crate::state::AppState;
+use crate::state::{metered_read, AppState, CollectionAvailability};
+
+fn status_from_availability(avail: CollectionAvailability) -> Status {
+    match avail {
+        CollectionAvailability::Recovering { .. } => Status::unavailable(avail.user_message()),
+        CollectionAvailability::NotFound { .. } => Status::not_found(avail.user_message()),
+    }
+}
 
 pub struct VectorMathServiceImpl {
     state: AppState,
@@ -65,10 +72,14 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let owned_vectors = get_vectors_from_index(&*collection.index, &[]);
         let vectors: Vec<(VectorId, &[f32])> = owned_vectors
@@ -117,10 +128,14 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let direction = req
             .direction
@@ -158,10 +173,14 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let owned_vectors = get_vectors_from_index(&*collection.index, &req.vector_ids);
         let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
@@ -240,10 +259,14 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let owned_w1 = get_vectors_from_index(&*collection.index, &req.window1_ids);
         let owned_w2 = get_vectors_from_index(&*collection.index, &req.window2_ids);
@@ -283,10 +306,14 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let owned_vectors = get_vectors_from_index(&*collection.index, &[]);
         let vectors: Vec<(VectorId, &[f32])> = owned_vectors
@@ -331,10 +358,14 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let owned_vectors = get_vectors_from_index(&*collection.index, &req.vector_ids);
         let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
@@ -430,10 +461,14 @@ impl VectorMathService for VectorMathServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let query = req
             .query

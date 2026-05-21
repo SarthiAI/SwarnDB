@@ -13,8 +13,6 @@ use std::collections::HashMap;
 use log;
 use vf_core::types::VectorId;
 
-use crate::hnsw_types::HnswNode;
-
 /// Controls when compaction is performed after fragmentation exceeds the threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionMode {
@@ -91,6 +89,23 @@ impl FlatAdjacencyList {
         Self {
             data: Vec::new(),
             index: HashMap::new(),
+            active_count: 0,
+            wasted_slots: 0,
+            fragmentation_threshold: DEFAULT_FRAGMENTATION_THRESHOLD,
+            compaction_mode: CompactionMode::Inline,
+            needs_compaction: false,
+        }
+    }
+
+    /// Creates a new empty flat adjacency list pre-sized for `node_count` nodes
+    /// each holding up to `max_neighbors_per_node` neighbors total across layers.
+    ///
+    /// Pre-allocating the contiguous buffer and the per-node index up front avoids
+    /// `Vec` / `HashMap` doubling reallocations during bulk insert at scale.
+    pub fn with_capacity(node_count: usize, max_neighbors_per_node: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(node_count.saturating_mul(max_neighbors_per_node)),
+            index: HashMap::with_capacity(node_count),
             active_count: 0,
             wasted_slots: 0,
             fragmentation_threshold: DEFAULT_FRAGMENTATION_THRESHOLD,
@@ -386,25 +401,6 @@ impl FlatAdjacencyList {
             reclaimed,
             old_ratio * 100.0,
         );
-    }
-
-    /// Builds a `FlatAdjacencyList` from existing HNSW node data.
-    ///
-    /// Iterates all nodes and flattens their `Vec<Vec<VectorId>>` neighbor lists
-    /// into the contiguous buffer.
-    pub(crate) fn from_hnsw_nodes(nodes: &HashMap<VectorId, HnswNode>) -> Self {
-        let mut flat = Self::new();
-        // Pre-allocate a reasonable buffer size.
-        flat.data.reserve(nodes.len() * 32);
-
-        for (&id, node) in nodes {
-            let neighbors = &node.neighbors;
-            let layer_refs: Vec<&[VectorId]> =
-                neighbors.iter().map(|layer| layer.as_slice()).collect();
-            flat.insert_node(id, &layer_refs);
-        }
-
-        flat
     }
 
     /// Returns the total capacity of the underlying data buffer.

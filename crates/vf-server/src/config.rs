@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Configuration for the SwarnDB server.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +115,14 @@ pub struct ServerConfig {
     /// are small.
     #[serde(default = "default_max_concurrent_collection_loads")]
     pub max_concurrent_collection_loads: usize,
+
+    /// Allow-list of absolute filesystem roots under which `BulkInsertFromPath`
+    /// may read input files. Defaults to a single-entry list containing
+    /// `data_dir` when unset. Operators override via the
+    /// `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` env var as a comma-separated list of
+    /// absolute paths.
+    #[serde(default)]
+    pub bulk_insert_allowed_roots: Vec<PathBuf>,
 }
 
 fn default_host() -> String {
@@ -185,12 +193,14 @@ fn default_snapshot_check_interval_secs() -> u64 {
     30
 }
 
+// Defaults sized for 60s recovery SLA at 1M scale. Tighter than legacy 50k/900s
+// so worst-case delta replay stays bounded (~25k entries / ~120s of activity).
 fn default_snapshot_mutation_threshold() -> u64 {
-    50_000
+    25_000
 }
 
 fn default_snapshot_interval_secs() -> u64 {
-    900
+    120
 }
 
 fn default_wal_prune_interval_secs() -> u64 {
@@ -243,6 +253,7 @@ impl Default for ServerConfig {
             auto_compact_after_optimize: default_auto_compact_after_optimize(),
             compaction_min_segments: default_compaction_min_segments(),
             max_concurrent_collection_loads: default_max_concurrent_collection_loads(),
+            bulk_insert_allowed_roots: Vec::new(),
         }
     }
 }
@@ -308,6 +319,11 @@ impl ServerConfig {
     /// - `SWARNDB_AUTO_COMPACT_AFTER_OPTIMIZE` -> auto_compact_after_optimize
     /// - `SWARNDB_COMPACTION_MIN_SEGMENTS` -> compaction_min_segments
     /// - `SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS` -> max_concurrent_collection_loads
+    /// - `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` -> bulk_insert_allowed_roots (comma-separated absolute paths)
+    /// - `SWARNDB_WAL_FSYNC_MODE` -> WAL fsync mode (read at WAL construction time, not stored in Config):
+    ///   - `per_write` (default): fsync every WAL append. Maximum durability.
+    ///   - `per_batch:N`: fsync every N appends. Trades durability for throughput on slow disks.
+    ///   - `none`: no automatic fsync. WAL rotate/close still fsyncs. Use only for ephemeral workloads.
     pub fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("SWARNDB_HOST") {
             self.host = val;
@@ -496,6 +512,40 @@ impl ServerConfig {
                 tracing::warn!("Invalid SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS value: {}", val);
             }
         }
+
+        // SWARNDB_BULK_INSERT_ALLOWED_ROOTS: comma-separated list of absolute
+        // filesystem roots that `BulkInsertFromPath` may read from. Unset or
+        // empty falls back to data_dir alone. Relative paths are rejected hard
+        // at startup so a misconfiguration cannot silently widen the surface.
+        match env::var("SWARNDB_BULK_INSERT_ALLOWED_ROOTS") {
+            Ok(val) => {
+                let mut roots: Vec<PathBuf> = Vec::new();
+                for raw in val.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let p = PathBuf::from(trimmed);
+                    if !p.is_absolute() {
+                        panic!(
+                            "SWARNDB_BULK_INSERT_ALLOWED_ROOTS entry '{}' is not an absolute path",
+                            trimmed
+                        );
+                    }
+                    roots.push(p);
+                }
+                if roots.is_empty() {
+                    self.bulk_insert_allowed_roots = vec![PathBuf::from(&self.data_dir)];
+                } else {
+                    self.bulk_insert_allowed_roots = roots;
+                }
+            }
+            Err(_) => {
+                if self.bulk_insert_allowed_roots.is_empty() {
+                    self.bulk_insert_allowed_roots = vec![PathBuf::from(&self.data_dir)];
+                }
+            }
+        }
     }
 
     /// Returns the gRPC socket address string (e.g., "0.0.0.0:50051").
@@ -546,8 +596,8 @@ mod tests {
         assert_eq!(config.max_wal_flush_interval, 100_000);
         assert_eq!(config.max_ef_construction, 2000);
         assert_eq!(config.snapshot_check_interval_secs, 30);
-        assert_eq!(config.snapshot_mutation_threshold, 50_000);
-        assert_eq!(config.snapshot_interval_secs, 900);
+        assert_eq!(config.snapshot_mutation_threshold, 25_000);
+        assert_eq!(config.snapshot_interval_secs, 120);
         assert_eq!(config.wal_prune_interval_secs, 300);
         assert_eq!(config.wal_prune_after_optimize, true);
         assert_eq!(config.auto_compact_after_optimize, true);

@@ -60,182 +60,192 @@ fn scalar_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_dot_product(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let n = a.len();
-    let chunks = n / 8;
-    let remainder = n % 8;
+        let n = a.len();
+        let chunks = n / 8;
+        let remainder = n % 8;
 
-    let mut sum = _mm256_setzero_ps();
+        let mut sum = _mm256_setzero_ps();
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 8;
-        let va = _mm256_loadu_ps(a_ptr.add(offset));
-        let vb = _mm256_loadu_ps(b_ptr.add(offset));
-        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
-    }
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vb = _mm256_loadu_ps(b_ptr.add(offset));
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
+        }
 
-    // Horizontal sum of 256-bit register
-    let hi = _mm256_extractf128_ps(sum, 1);
-    let lo = _mm256_castps256_ps128(sum);
-    let sum128 = _mm_add_ps(lo, hi);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let result = _mm_add_ss(sums, shuf2);
-    let mut total = _mm_cvtss_f32(result);
-
-    // Scalar tail
-    let tail_start = chunks * 8;
-    for i in 0..remainder {
-        total += a[tail_start + i] * b[tail_start + i];
-    }
-
-    total
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn avx2_squared_l2(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
-    let n = a.len();
-    let chunks = n / 8;
-    let remainder = n % 8;
-
-    let mut sum = _mm256_setzero_ps();
-
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-
-    for i in 0..chunks {
-        let offset = i * 8;
-        let va = _mm256_loadu_ps(a_ptr.add(offset));
-        let vb = _mm256_loadu_ps(b_ptr.add(offset));
-        let diff = _mm256_sub_ps(va, vb);
-        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
-    }
-
-    // Horizontal sum
-    let hi = _mm256_extractf128_ps(sum, 1);
-    let lo = _mm256_castps256_ps128(sum);
-    let sum128 = _mm_add_ps(lo, hi);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let result = _mm_add_ss(sums, shuf2);
-    let mut total = _mm_cvtss_f32(result);
-
-    // Scalar tail
-    let tail_start = chunks * 8;
-    for i in 0..remainder {
-        let diff = a[tail_start + i] - b[tail_start + i];
-        total += diff * diff;
-    }
-
-    total
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn avx2_manhattan(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
-    let n = a.len();
-    let chunks = n / 8;
-    let remainder = n % 8;
-
-    // Sign mask to compute absolute value: clear the sign bit
-    let sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFu32 as i32));
-    let mut sum = _mm256_setzero_ps();
-
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-
-    for i in 0..chunks {
-        let offset = i * 8;
-        let va = _mm256_loadu_ps(a_ptr.add(offset));
-        let vb = _mm256_loadu_ps(b_ptr.add(offset));
-        let diff = _mm256_sub_ps(va, vb);
-        let abs_diff = _mm256_and_ps(diff, sign_mask);
-        sum = _mm256_add_ps(sum, abs_diff);
-    }
-
-    // Horizontal sum
-    let hi = _mm256_extractf128_ps(sum, 1);
-    let lo = _mm256_castps256_ps128(sum);
-    let sum128 = _mm_add_ps(lo, hi);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let result = _mm_add_ss(sums, shuf2);
-    let mut total = _mm_cvtss_f32(result);
-
-    // Scalar tail
-    let tail_start = chunks * 8;
-    for i in 0..remainder {
-        total += (a[tail_start + i] - b[tail_start + i]).abs();
-    }
-
-    total
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn avx2_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
-    use std::arch::x86_64::*;
-
-    let n = a.len();
-    let chunks = n / 8;
-    let remainder = n % 8;
-
-    let mut sum_dot = _mm256_setzero_ps();
-    let mut sum_na = _mm256_setzero_ps();
-    let mut sum_nb = _mm256_setzero_ps();
-
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-
-    for i in 0..chunks {
-        let offset = i * 8;
-        let va = _mm256_loadu_ps(a_ptr.add(offset));
-        let vb = _mm256_loadu_ps(b_ptr.add(offset));
-        sum_dot = _mm256_add_ps(sum_dot, _mm256_mul_ps(va, vb));
-        sum_na = _mm256_add_ps(sum_na, _mm256_mul_ps(va, va));
-        sum_nb = _mm256_add_ps(sum_nb, _mm256_mul_ps(vb, vb));
-    }
-
-    // Horizontal sum helper
-    #[inline(always)]
-    unsafe fn hsum256(v: __m256) -> f32 {
-        let hi = _mm256_extractf128_ps(v, 1);
-        let lo = _mm256_castps256_ps128(v);
+        // Horizontal sum of 256-bit register
+        let hi = _mm256_extractf128_ps(sum, 1);
+        let lo = _mm256_castps256_ps128(sum);
         let sum128 = _mm_add_ps(lo, hi);
         let shuf = _mm_movehdup_ps(sum128);
         let sums = _mm_add_ps(sum128, shuf);
         let shuf2 = _mm_movehl_ps(sums, sums);
         let result = _mm_add_ss(sums, shuf2);
-        _mm_cvtss_f32(result)
+        let mut total = _mm_cvtss_f32(result);
+
+        // Scalar tail
+        let tail_start = chunks * 8;
+        for i in 0..remainder {
+            total += a[tail_start + i] * b[tail_start + i];
+        }
+
+        total
     }
+}
 
-    let mut dot = hsum256(sum_dot);
-    let mut norm_a = hsum256(sum_na);
-    let mut norm_b = hsum256(sum_nb);
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_squared_l2(a: &[f32], b: &[f32]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    // Scalar tail
-    let tail_start = chunks * 8;
-    for i in 0..remainder {
-        let ai = a[tail_start + i];
-        let bi = b[tail_start + i];
-        dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
+        let n = a.len();
+        let chunks = n / 8;
+        let remainder = n % 8;
+
+        let mut sum = _mm256_setzero_ps();
+
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vb = _mm256_loadu_ps(b_ptr.add(offset));
+            let diff = _mm256_sub_ps(va, vb);
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+        }
+
+        // Horizontal sum
+        let hi = _mm256_extractf128_ps(sum, 1);
+        let lo = _mm256_castps256_ps128(sum);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        let mut total = _mm_cvtss_f32(result);
+
+        // Scalar tail
+        let tail_start = chunks * 8;
+        for i in 0..remainder {
+            let diff = a[tail_start + i] - b[tail_start + i];
+            total += diff * diff;
+        }
+
+        total
     }
+}
 
-    (dot, norm_a, norm_b)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_manhattan(a: &[f32], b: &[f32]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = a.len();
+        let chunks = n / 8;
+        let remainder = n % 8;
+
+        // Sign mask to compute absolute value: clear the sign bit
+        let sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFu32 as i32));
+        let mut sum = _mm256_setzero_ps();
+
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vb = _mm256_loadu_ps(b_ptr.add(offset));
+            let diff = _mm256_sub_ps(va, vb);
+            let abs_diff = _mm256_and_ps(diff, sign_mask);
+            sum = _mm256_add_ps(sum, abs_diff);
+        }
+
+        // Horizontal sum
+        let hi = _mm256_extractf128_ps(sum, 1);
+        let lo = _mm256_castps256_ps128(sum);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        let mut total = _mm_cvtss_f32(result);
+
+        // Scalar tail
+        let tail_start = chunks * 8;
+        for i in 0..remainder {
+            total += (a[tail_start + i] - b[tail_start + i]).abs();
+        }
+
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = a.len();
+        let chunks = n / 8;
+        let remainder = n % 8;
+
+        let mut sum_dot = _mm256_setzero_ps();
+        let mut sum_na = _mm256_setzero_ps();
+        let mut sum_nb = _mm256_setzero_ps();
+
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vb = _mm256_loadu_ps(b_ptr.add(offset));
+            sum_dot = _mm256_add_ps(sum_dot, _mm256_mul_ps(va, vb));
+            sum_na = _mm256_add_ps(sum_na, _mm256_mul_ps(va, va));
+            sum_nb = _mm256_add_ps(sum_nb, _mm256_mul_ps(vb, vb));
+        }
+
+        // Horizontal sum helper
+        #[inline(always)]
+        unsafe fn hsum256(v: __m256) -> f32 {
+            unsafe {
+                let hi = _mm256_extractf128_ps(v, 1);
+                let lo = _mm256_castps256_ps128(v);
+                let sum128 = _mm_add_ps(lo, hi);
+                let shuf = _mm_movehdup_ps(sum128);
+                let sums = _mm_add_ps(sum128, shuf);
+                let shuf2 = _mm_movehl_ps(sums, sums);
+                let result = _mm_add_ss(sums, shuf2);
+                _mm_cvtss_f32(result)
+            }
+        }
+
+        let mut dot = hsum256(sum_dot);
+        let mut norm_a = hsum256(sum_na);
+        let mut norm_b = hsum256(sum_nb);
+
+        // Scalar tail
+        let tail_start = chunks * 8;
+        for i in 0..remainder {
+            let ai = a[tail_start + i];
+            let bi = b[tail_start + i];
+            dot += ai * bi;
+            norm_a += ai * ai;
+            norm_b += bi * bi;
+        }
+
+        (dot, norm_a, norm_b)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,169 +255,179 @@ unsafe fn avx2_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn sse41_dot_product(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let mut sum = _mm_setzero_ps();
+        let mut sum = _mm_setzero_ps();
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        let va = _mm_loadu_ps(a_ptr.add(offset));
-        let vb = _mm_loadu_ps(b_ptr.add(offset));
-        sum = _mm_add_ps(sum, _mm_mul_ps(va, vb));
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = _mm_loadu_ps(a_ptr.add(offset));
+            let vb = _mm_loadu_ps(b_ptr.add(offset));
+            sum = _mm_add_ps(sum, _mm_mul_ps(va, vb));
+        }
+
+        // Horizontal sum of 128-bit register
+        let shuf = _mm_movehdup_ps(sum);
+        let sums = _mm_add_ps(sum, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        let mut total = _mm_cvtss_f32(result);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            total += a[tail_start + i] * b[tail_start + i];
+        }
+
+        total
     }
-
-    // Horizontal sum of 128-bit register
-    let shuf = _mm_movehdup_ps(sum);
-    let sums = _mm_add_ps(sum, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let result = _mm_add_ss(sums, shuf2);
-    let mut total = _mm_cvtss_f32(result);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        total += a[tail_start + i] * b[tail_start + i];
-    }
-
-    total
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn sse41_squared_l2(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let mut sum = _mm_setzero_ps();
+        let mut sum = _mm_setzero_ps();
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        let va = _mm_loadu_ps(a_ptr.add(offset));
-        let vb = _mm_loadu_ps(b_ptr.add(offset));
-        let diff = _mm_sub_ps(va, vb);
-        sum = _mm_add_ps(sum, _mm_mul_ps(diff, diff));
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = _mm_loadu_ps(a_ptr.add(offset));
+            let vb = _mm_loadu_ps(b_ptr.add(offset));
+            let diff = _mm_sub_ps(va, vb);
+            sum = _mm_add_ps(sum, _mm_mul_ps(diff, diff));
+        }
+
+        // Horizontal sum
+        let shuf = _mm_movehdup_ps(sum);
+        let sums = _mm_add_ps(sum, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        let mut total = _mm_cvtss_f32(result);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            let diff = a[tail_start + i] - b[tail_start + i];
+            total += diff * diff;
+        }
+
+        total
     }
-
-    // Horizontal sum
-    let shuf = _mm_movehdup_ps(sum);
-    let sums = _mm_add_ps(sum, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let result = _mm_add_ss(sums, shuf2);
-    let mut total = _mm_cvtss_f32(result);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        let diff = a[tail_start + i] - b[tail_start + i];
-        total += diff * diff;
-    }
-
-    total
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn sse41_manhattan(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFF_FFFFu32 as i32));
-    let mut sum = _mm_setzero_ps();
+        let sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFF_FFFFu32 as i32));
+        let mut sum = _mm_setzero_ps();
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        let va = _mm_loadu_ps(a_ptr.add(offset));
-        let vb = _mm_loadu_ps(b_ptr.add(offset));
-        let diff = _mm_sub_ps(va, vb);
-        let abs_diff = _mm_and_ps(diff, sign_mask);
-        sum = _mm_add_ps(sum, abs_diff);
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = _mm_loadu_ps(a_ptr.add(offset));
+            let vb = _mm_loadu_ps(b_ptr.add(offset));
+            let diff = _mm_sub_ps(va, vb);
+            let abs_diff = _mm_and_ps(diff, sign_mask);
+            sum = _mm_add_ps(sum, abs_diff);
+        }
+
+        // Horizontal sum
+        let shuf = _mm_movehdup_ps(sum);
+        let sums = _mm_add_ps(sum, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        let mut total = _mm_cvtss_f32(result);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            total += (a[tail_start + i] - b[tail_start + i]).abs();
+        }
+
+        total
     }
-
-    // Horizontal sum
-    let shuf = _mm_movehdup_ps(sum);
-    let sums = _mm_add_ps(sum, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let result = _mm_add_ss(sums, shuf2);
-    let mut total = _mm_cvtss_f32(result);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        total += (a[tail_start + i] - b[tail_start + i]).abs();
-    }
-
-    total
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn sse41_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let mut sum_dot = _mm_setzero_ps();
-    let mut sum_na = _mm_setzero_ps();
-    let mut sum_nb = _mm_setzero_ps();
+        let mut sum_dot = _mm_setzero_ps();
+        let mut sum_na = _mm_setzero_ps();
+        let mut sum_nb = _mm_setzero_ps();
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        let va = _mm_loadu_ps(a_ptr.add(offset));
-        let vb = _mm_loadu_ps(b_ptr.add(offset));
-        sum_dot = _mm_add_ps(sum_dot, _mm_mul_ps(va, vb));
-        sum_na = _mm_add_ps(sum_na, _mm_mul_ps(va, va));
-        sum_nb = _mm_add_ps(sum_nb, _mm_mul_ps(vb, vb));
+        for i in 0..chunks {
+            let offset = i * 4;
+            let va = _mm_loadu_ps(a_ptr.add(offset));
+            let vb = _mm_loadu_ps(b_ptr.add(offset));
+            sum_dot = _mm_add_ps(sum_dot, _mm_mul_ps(va, vb));
+            sum_na = _mm_add_ps(sum_na, _mm_mul_ps(va, va));
+            sum_nb = _mm_add_ps(sum_nb, _mm_mul_ps(vb, vb));
+        }
+
+        // Horizontal sum helper
+        #[inline(always)]
+        unsafe fn hsum128(v: __m128) -> f32 {
+            unsafe {
+                let shuf = _mm_movehdup_ps(v);
+                let sums = _mm_add_ps(v, shuf);
+                let shuf2 = _mm_movehl_ps(sums, sums);
+                let result = _mm_add_ss(sums, shuf2);
+                _mm_cvtss_f32(result)
+            }
+        }
+
+        let mut dot = hsum128(sum_dot);
+        let mut norm_a = hsum128(sum_na);
+        let mut norm_b = hsum128(sum_nb);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            let ai = a[tail_start + i];
+            let bi = b[tail_start + i];
+            dot += ai * bi;
+            norm_a += ai * ai;
+            norm_b += bi * bi;
+        }
+
+        (dot, norm_a, norm_b)
     }
-
-    // Horizontal sum helper
-    #[inline(always)]
-    unsafe fn hsum128(v: __m128) -> f32 {
-        let shuf = _mm_movehdup_ps(v);
-        let sums = _mm_add_ps(v, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        let result = _mm_add_ss(sums, shuf2);
-        _mm_cvtss_f32(result)
-    }
-
-    let mut dot = hsum128(sum_dot);
-    let mut norm_a = hsum128(sum_na);
-    let mut norm_b = hsum128(sum_nb);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        let ai = a[tail_start + i];
-        let bi = b[tail_start + i];
-        dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
-    }
-
-    (dot, norm_a, norm_b)
 }
 
 // ---------------------------------------------------------------------------
@@ -417,152 +437,152 @@ unsafe fn sse41_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn neon_dot_product(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let mut sum = vdupq_n_f32(0.0);
+        let mut sum = vdupq_n_f32(0.0);
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        unsafe {
+        for i in 0..chunks {
+            let offset = i * 4;
             let va = vld1q_f32(a_ptr.add(offset));
             let vb = vld1q_f32(b_ptr.add(offset));
             sum = vfmaq_f32(sum, va, vb);
         }
+
+        // Horizontal sum: add pairwise then extract
+        let mut total = vaddvq_f32(sum);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            total += a[tail_start + i] * b[tail_start + i];
+        }
+
+        total
     }
-
-    // Horizontal sum: add pairwise then extract
-    let mut total = vaddvq_f32(sum);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        total += a[tail_start + i] * b[tail_start + i];
-    }
-
-    total
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn neon_squared_l2(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let mut sum = vdupq_n_f32(0.0);
+        let mut sum = vdupq_n_f32(0.0);
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        unsafe {
+        for i in 0..chunks {
+            let offset = i * 4;
             let va = vld1q_f32(a_ptr.add(offset));
             let vb = vld1q_f32(b_ptr.add(offset));
             let diff = vsubq_f32(va, vb);
             sum = vfmaq_f32(sum, diff, diff);
         }
+
+        let mut total = vaddvq_f32(sum);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            let diff = a[tail_start + i] - b[tail_start + i];
+            total += diff * diff;
+        }
+
+        total
     }
-
-    let mut total = vaddvq_f32(sum);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        let diff = a[tail_start + i] - b[tail_start + i];
-        total += diff * diff;
-    }
-
-    total
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn neon_manhattan(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let mut sum = vdupq_n_f32(0.0);
+        let mut sum = vdupq_n_f32(0.0);
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        unsafe {
+        for i in 0..chunks {
+            let offset = i * 4;
             let va = vld1q_f32(a_ptr.add(offset));
             let vb = vld1q_f32(b_ptr.add(offset));
             let diff = vsubq_f32(va, vb);
             let abs_diff = vabsq_f32(diff);
             sum = vaddq_f32(sum, abs_diff);
         }
+
+        let mut total = vaddvq_f32(sum);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            total += (a[tail_start + i] - b[tail_start + i]).abs();
+        }
+
+        total
     }
-
-    let mut total = vaddvq_f32(sum);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        total += (a[tail_start + i] - b[tail_start + i]).abs();
-    }
-
-    total
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn neon_fused_cosine(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let n = a.len();
-    let chunks = n / 4;
-    let remainder = n % 4;
+        let n = a.len();
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-    let mut sum_dot = vdupq_n_f32(0.0);
-    let mut sum_na = vdupq_n_f32(0.0);
-    let mut sum_nb = vdupq_n_f32(0.0);
+        let mut sum_dot = vdupq_n_f32(0.0);
+        let mut sum_na = vdupq_n_f32(0.0);
+        let mut sum_nb = vdupq_n_f32(0.0);
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
 
-    for i in 0..chunks {
-        let offset = i * 4;
-        unsafe {
+        for i in 0..chunks {
+            let offset = i * 4;
             let va = vld1q_f32(a_ptr.add(offset));
             let vb = vld1q_f32(b_ptr.add(offset));
             sum_dot = vfmaq_f32(sum_dot, va, vb);
             sum_na = vfmaq_f32(sum_na, va, va);
             sum_nb = vfmaq_f32(sum_nb, vb, vb);
         }
+
+        let mut dot = vaddvq_f32(sum_dot);
+        let mut norm_a = vaddvq_f32(sum_na);
+        let mut norm_b = vaddvq_f32(sum_nb);
+
+        // Scalar tail
+        let tail_start = chunks * 4;
+        for i in 0..remainder {
+            let ai = a[tail_start + i];
+            let bi = b[tail_start + i];
+            dot += ai * bi;
+            norm_a += ai * ai;
+            norm_b += bi * bi;
+        }
+
+        (dot, norm_a, norm_b)
     }
-
-    let mut dot = vaddvq_f32(sum_dot);
-    let mut norm_a = vaddvq_f32(sum_na);
-    let mut norm_b = vaddvq_f32(sum_nb);
-
-    // Scalar tail
-    let tail_start = chunks * 4;
-    for i in 0..remainder {
-        let ai = a[tail_start + i];
-        let bi = b[tail_start + i];
-        dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
-    }
-
-    (dot, norm_a, norm_b)
 }
 
 // ---------------------------------------------------------------------------

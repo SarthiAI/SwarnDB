@@ -63,6 +63,50 @@ pub enum FsyncMode {
     None,
 }
 
+impl FsyncMode {
+    /// Resolve fsync mode from the `SWARNDB_WAL_FSYNC_MODE` env var.
+    ///
+    /// Accepted values:
+    /// - `per_write` (default): fsync after every WAL append. Maximum durability.
+    /// - `per_batch:N`: fsync after every N appends. Trades durability for throughput.
+    /// - `none`: skip automatic fsync. Caller (or rotate/close) handles durability.
+    ///
+    /// Any unset or malformed value falls back to `PerWrite` and logs a warning.
+    pub fn from_env() -> Self {
+        let raw = match std::env::var("SWARNDB_WAL_FSYNC_MODE") {
+            Ok(v) => v,
+            Err(_) => return FsyncMode::PerWrite,
+        };
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("per_write") || trimmed.eq_ignore_ascii_case("perwrite") {
+            return FsyncMode::PerWrite;
+        }
+        if trimmed.eq_ignore_ascii_case("none") {
+            return FsyncMode::None;
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("per_batch:")
+            .or_else(|| trimmed.strip_prefix("PerBatch:"))
+        {
+            match rest.parse::<u64>() {
+                Ok(n) if n > 0 => return FsyncMode::PerBatch(n),
+                _ => {
+                    log::warn!(
+                        "invalid per_batch count in SWARNDB_WAL_FSYNC_MODE={:?}, falling back to PerWrite",
+                        trimmed
+                    );
+                    return FsyncMode::PerWrite;
+                }
+            }
+        }
+        log::warn!(
+            "unknown SWARNDB_WAL_FSYNC_MODE={:?}, falling back to PerWrite",
+            trimmed
+        );
+        FsyncMode::PerWrite
+    }
+}
+
 // ── WalEntry ────────────────────────────────────────────────────────────────
 
 /// A single deserialized WAL entry (returned by [`WalReader`]).

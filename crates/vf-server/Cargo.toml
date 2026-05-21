@@ -26,8 +26,14 @@ rayon = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+dashmap = { workspace = true }
+npyz = { workspace = true }
+bytemuck = { workspace = true }
+nix = { workspace = true }
+memmap2 = { workspace = true }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+base64 = "0.22"
 
 [build-dependencies]
 tonic-build = { workspace = true }

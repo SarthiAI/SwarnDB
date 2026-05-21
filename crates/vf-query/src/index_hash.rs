@@ -119,6 +119,12 @@ impl HashIndex {
         self.id_to_key.is_empty()
     }
 
+    /// Release excess capacity in the internal maps.
+    pub fn compact(&mut self) {
+        self.map.shrink_to_fit();
+        self.id_to_key.shrink_to_fit();
+    }
+
     /// IN query: union of multiple eq_lookups.
     pub fn in_lookup(&self, values: &[MetadataValue]) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();

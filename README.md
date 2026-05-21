@@ -41,19 +41,30 @@ SwarnDB is a high-performance vector database written in Rust that combines HNSW
 - **Dual API: gRPC + REST.**
   High-throughput gRPC for production pipelines. REST for rapid prototyping, debugging, and curl-friendly workflows.
 
+- **File-based bulk ingestion for large loads.**
+  Stage vectors as a `.npy` or flat `.f32` file on a path the server can read, then call `bulk_insert_from_path`. The server reads the file via memory mapping, so working memory during the load is bounded by the index being built rather than by the input file size.
+
+- **Fast restart and transparent crash recovery.**
+  Plain HNSW collections become queryable within seconds of the server opening its ports. Multi-collection databases load collections in parallel during startup. Crash recovery via incremental delta replay or full write-ahead log replay happens automatically, and is observable through dedicated readiness, recovery, and persistence endpoints suited to Kubernetes orchestration.
+
 ---
 
 ## Performance
 
-| ef_search | QPS | Recall@10 | p50 (ms) | p95 (ms) | p99 (ms) |
-|-----------|------|-----------|----------|----------|----------|
-| 50 | 1,563 | 98.8% | 4.76 | 7.62 | 9.35 |
-| 100 | 1,271 | 99.0% | 5.74 | 10.93 | 14.06 |
-| 200 | 984 | 99.2% | 7.55 | 13.33 | 18.17 |
-| 400 | 666 | 99.5% | 11.41 | 19.29 | 23.56 |
-| 800 | 388 | 99.8% | 19.64 | 33.54 | 41.25 |
+Search throughput, recall, and latency on **DBpedia 1M (1536 dim float32)** with cosine distance and default HNSW parameters (`M=16`, `ef_construction=200`), measured on a **32-core, 64 GB host** with **8 concurrent searcher threads**, 1,000 queries per `ef_search` setting averaged across 3 iterations:
 
-*DBpedia 1M (1536-dim) on a 32-core, 64 GB RAM system.*
+| ef_search | QPS   | Recall@10 | p50 (ms) | p95 (ms) | p99 (ms) |
+|-----------|-------|-----------|----------|----------|----------|
+| 25        | 2,398 | 0.9816    | 3.16     | 4.91     | 6.06     |
+| 50        | 2,214 | 0.9894    | 3.33     | 5.26     | 6.77     |
+| 100       | 1,801 | 0.9921    | 4.16     | 6.85     | 8.02     |
+| 200       | 1,233 | 0.9935    | 6.18     | 10.19    | 12.26    |
+| 400       |   760 | 0.9960    | 10.00    | 16.83    | 20.48    |
+| 800       |   437 | 0.9974    | 17.42    | 30.43    | 35.90    |
+
+Reproduce with `python benchmark/qps_vs_recall.py --workers 8 --n-queries 1000 --iterations 3 --ef-search-list 25,50,100,200,400,800`.
+
+For the full benchmark page (worker saturation, ingestion via `bulk_insert_from_path`, restart and recovery timings, memory behavior, reproduction recipes), see [Benchmarks](docs/benchmarks.md).
 
 ---
 
@@ -174,6 +185,21 @@ SwarnDB is organized as seven Rust crates with clean dependency boundaries:
 
 ## Key Capabilities
 
+### Ingestion
+
+- **Single insert** for one-at-a-time writes via gRPC or REST
+- **Streaming bulk insert** with batched gRPC streams, configurable batch lock size, write-ahead log flush interval, and optional parallel HNSW construction
+- **File-based bulk insert** via `bulk_insert_from_path`: the server reads a `.npy` or flat `.f32` file from a configured allowed root and ingests directly from the kernel page cache, without copying the payload through gRPC
+- **Deferred indexing** during bulk loads, finalized by a single `optimize()` call that rebuilds the HNSW index and the metadata index, with the virtual graph rebuilt on the same call when `rebuild_graph=true` is passed
+- **Bulk insert checkpoints and resume** via per-batch checkpoints and an opaque `resume_token` returned in the bulk-insert response, so interrupted loads can pick up from the last committed batch
+
+### Restart and Recovery
+
+- **Fast restart** for plain HNSW collections, queryable within seconds of the server opening its ports
+- **Parallel collection load** at startup, so a database with many collections comes up in parallel rather than serially
+- **Incremental delta replay or full write-ahead log replay** on unclean shutdown, applied transparently before traffic resumes
+- **Operational endpoints** for orchestration: Kubernetes-style `/healthz`, `/readyz`, `/startupz`; a global `/recovery_status`; a per-collection `GET /api/v1/collections/{collection}/persistence_status`; and Prometheus metrics at `/metrics`
+
 ### Vector Operations
 
 - **HNSW index** with configurable `ef_construction`, `ef_search`, and `M` parameters
@@ -270,6 +296,7 @@ For complete API documentation, see [API Reference](docs/api-reference.md).
 | [Docker Guide](docs/docker.md) | Docker setup, persistence, Compose, and building from source |
 | [Configuration](docs/configuration.md) | Environment variables and tuning guide |
 | [Deployment](docs/deployment.md) | Docker, Kubernetes, and Helm deployment |
+| [Benchmarks](docs/benchmarks.md) | Reference workloads, hardware, measured numbers, reproduction recipes |
 
 ---
 

@@ -54,6 +54,11 @@ impl VectorRecord {
 ///
 /// All mutation methods take `&self` instead of `&mut self`, enabling
 /// concurrent reads and writes without external locking.
+///
+/// Memory note: this is the authoritative metadata-bearing record set, not a
+/// cache. DashMap shard buckets grow with the working set by design; there is
+/// no compact path because the data is the workload. Growth ratchet here is
+/// expected and not a leak.
 pub struct InMemoryVectorStore {
     vectors: DashMap<VectorId, VectorRecord>,
     dimension: usize,

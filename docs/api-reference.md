@@ -17,6 +17,7 @@ All REST endpoints return JSON. All request bodies are JSON (`Content-Type: appl
 - [Health and Readiness](#health-and-readiness)
 - [Collections](#collections)
 - [Vectors](#vectors)
+- [Storage Operations](#storage-operations)
 - [Search](#search)
 - [Filter Expressions](#filter-expressions)
 - [Graph](#graph)
@@ -140,6 +141,33 @@ Returns Prometheus-format metrics for monitoring. No authentication required.
 
 ```bash
 curl http://localhost:8080/metrics
+```
+
+### GET /recovery_status
+
+Returns the server's boot-recovery snapshot: the overall recovery path taken at startup, the elapsed time since recovery began, and the recovery path for each collection. Useful for orchestrators that need to gate traffic until recovery completes.
+
+**Response:**
+
+| Field          | Type   | Description                                                                                  |
+|----------------|--------|----------------------------------------------------------------------------------------------|
+| path           | string | Recovery path taken at boot: `"none"`, `"snapshot_only"`, `"snapshot_plus_wal"`, or `"full_wal_replay"` |
+| elapsed_secs   | uint64 | Seconds since recovery began                                                                  |
+| collections    | object | Map of collection name to its recovery path (same set of strings)                             |
+
+```bash
+curl http://localhost:8080/recovery_status
+```
+
+```json
+{
+  "path": "snapshot_plus_wal",
+  "elapsed_secs": 3,
+  "collections": {
+    "docs": "snapshot_plus_wal",
+    "images": "snapshot_only"
+  }
+}
 ```
 
 ---
@@ -504,6 +532,8 @@ Inserts multiple vectors in a single request with configurable performance optio
 | index_mode          | string  | No       | `"immediate"` | `"immediate"` indexes vectors during insert. `"deferred"` indexes later via `optimize()`. |
 | skip_metadata_index | bool    | No       | `false`       | Skip per-vector metadata indexing. Rebuild later via `optimize()`.          |
 | parallel_build      | bool    | No       | `false`       | Use parallel HNSW construction. Only effective with `index_mode: "deferred"`. |
+| checkpoint_every    | uint32  | No       | `0`           | Write a resume checkpoint every N batches. 0 disables checkpointing. When non-zero, a failed bulk insert returns a `resume_token` that lets a subsequent call pick up from the next batch. |
+| resume_token        | string  | No       | `""`          | Opaque token from a prior partial bulk insert response. When set, the server resumes ingestion from the next batch after the one referenced by the token; vectors from the already-committed prefix are not re-inserted. |
 
 Each vector object in the `vectors` array:
 
@@ -515,10 +545,14 @@ Each vector object in the `vectors` array:
 
 **Response:**
 
-| Field          | Type         | Description                     |
-|----------------|--------------|---------------------------------|
-| inserted_count | uint64       | Number of successfully inserted vectors |
-| errors         | string array | List of error messages for failed inserts |
+| Field                       | Type         | Description                                                                                                          |
+|-----------------------------|--------------|----------------------------------------------------------------------------------------------------------------------|
+| inserted_count              | uint64       | Number of successfully inserted vectors                                                                              |
+| errors                      | string array | One error message per failed row, empty on full success                                                              |
+| last_completed_batch_idx    | uint64       | Index of the last batch fully committed before a partial failure (0 on full success or non-batched inserts)          |
+| last_committed_lsn          | uint64       | LSN of the last committed write in this operation                                                                    |
+| resume_token                | string       | Opaque token for resuming this bulk insert from the next batch (empty on full success or non-resumable failures)     |
+| assigned_ids                | uint64 array | IDs assigned to inserted vectors, in input order                                                                     |
 
 **Status Codes:** 200 (success, possibly partial), 400 (invalid options), 404 (collection not found), 500 (storage error)
 
@@ -542,7 +576,74 @@ curl -X POST http://localhost:8080/api/v1/collections/documents/vectors/bulk \
 ```json
 {
   "inserted_count": 3,
-  "errors": []
+  "errors": [],
+  "last_completed_batch_idx": 0,
+  "last_committed_lsn": 42,
+  "resume_token": "",
+  "assigned_ids": [1, 2, 3]
+}
+```
+
+### Bulk Insert From Path
+
+```text
+POST /api/v1/collections/{collection}/vectors/bulk-from-path
+```
+
+Ingests vectors from a `.npy` or flat `.f32` file on the server's local filesystem. The server reads the file via memory mapping, so the working memory for the load is bounded by the index being built rather than by the input file size. Suited to large loads where staging the data as a file is acceptable.
+
+**Path Parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| collection | string | Collection name |
+
+**Request Body:**
+
+| Parameter             | Type   | Required | Default       | Description                                                                                                                                                                                                                  |
+|-----------------------|--------|----------|---------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| path                  | string | Yes      |               | Absolute path to the vector file on the server's filesystem. Must sit inside one of the directories listed in `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` (which defaults to `SWARNDB_DATA_DIR`). Symlinks and `..` traversal are rejected. |
+| dim                   | uint32 | No       | `0`           | Vector dimensionality. `0` defers to the collection's configured dimension.                                                                                                                                                  |
+| expected_count        | uint64 | No       | `0`           | Expected number of vectors. `0` lets the server infer from file size.                                                                                                                                                        |
+| total_count_hint      | uint64 | No       | `0`           | Hint for the total vector count across multiple bulk inserts; used for arena capacity planning.                                                                                                                              |
+| id_start              | uint64 | No       | `1`           | Starting ID for auto-assigned IDs.                                                                                                                                                                                           |
+| ids_path              | string | No       | `""`          | Optional path to a sidecar file containing explicit IDs (one per vector). Empty string uses auto-assigned IDs starting at `id_start`. Same allowed-roots rules apply.                                                       |
+| skip_metadata_index   | bool   | No       | `false`       | Skip metadata indexing during insert. Rebuild later via `optimize()`.                                                                                                                                                        |
+| index_mode            | string | No       | `"immediate"` | `"immediate"` builds the index during insert. `"deferred"` builds it after, via `optimize()`.                                                                                                                                |
+| ef_construction       | uint32 | No       | `0`           | HNSW `ef_construction` override for this batch. `0` uses the collection default.                                                                                                                                             |
+| chunk_size            | uint32 | No       | `0`           | `0` loads the file in a single pass. A positive value processes the load in chunks of that many rows, snapshotting and releasing scratch memory between chunks; trades wall-clock for a lower peak resident memory footprint. |
+
+**Supported wire formats:**
+
+- `.npy`: auto-detected via the NumPy magic bytes (`\x93NUMPY`).
+- Flat little-endian `float32` (`.f32`): the file is `expected_count * dim * 4` bytes.
+
+**Response:** same fields as the bulk insert response (`inserted_count`, `errors`, `last_completed_batch_idx`, `last_committed_lsn`, `resume_token`, `assigned_ids`).
+
+**Status Codes:** 200 (success, possibly partial), 400 (invalid options, dimension mismatch, file size mismatch), 403 (path outside allowed roots, symlink, traversal), 404 (collection not found, file not found), 500 (storage error)
+
+Resume mid-call is not supported for `bulk-from-path`; on failure, restart the full call. For resumable bulk loads, use streaming `BulkInsertWithOptions` with `checkpoint_every` and `resume_token`.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/docs/vectors/bulk-from-path \
+  -H "Content-Type: application/json" \
+  -d '{
+    "path": "/data/ingest/embeddings.npy",
+    "dim": 1536,
+    "expected_count": 1000000,
+    "total_count_hint": 1000000,
+    "index_mode": "immediate"
+  }'
+```
+
+```json
+{
+  "inserted_count": 1000000,
+  "errors": [],
+  "last_completed_batch_idx": 0,
+  "last_committed_lsn": 1000000,
+  "resume_token": "",
+  "assigned_ids": [1, 2, 3, "... 1000000 ids total"]
 }
 ```
 
@@ -586,6 +687,165 @@ curl -X POST http://localhost:8080/api/v1/collections/documents/optimize \
   "duration_ms": 1250,
   "vectors_processed": 50000
 }
+```
+
+---
+
+## Storage Operations
+
+Operations that act on a collection's on-disk state: forced snapshots, persistence and LSN inspection, write-ahead log pruning, segment compaction, and per-collection lock-contention metrics.
+
+### Force Snapshot
+
+```text
+POST /api/v1/collections/{collection}/snapshot
+```
+
+Forces a synchronous snapshot of the collection and returns the LSN written. Useful before deliberate restarts or for taking snapshots on a schedule outside the server's auto-snapshot policy.
+
+**Path Parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| collection | string | Collection name |
+
+**Response:**
+
+| Field               | Type   | Description                              |
+|---------------------|--------|------------------------------------------|
+| last_snapshot_lsn   | uint64 | LSN of the snapshot just written         |
+
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/docs/snapshot
+```
+
+```json
+{ "last_snapshot_lsn": 1024 }
+```
+
+### Persistence Status
+
+```text
+GET /api/v1/collections/{collection}/persistence_status
+```
+
+Returns the snapshot and WAL LSN state for a single collection. Useful for confirming a write has been durably committed.
+
+**Path Parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| collection | string | Collection name |
+
+**Response:**
+
+| Field              | Type   | Description                                              |
+|--------------------|--------|----------------------------------------------------------|
+| last_snapshot_lsn  | uint64 | LSN of the last persisted snapshot                       |
+| current_lsn        | uint64 | LSN of the most recently durably committed write         |
+| next_lsn           | uint64 | LSN that the next write will receive                     |
+
+```bash
+curl http://localhost:8080/api/v1/collections/docs/persistence_status
+```
+
+```json
+{
+  "last_snapshot_lsn": 1024,
+  "current_lsn": 1040,
+  "next_lsn": 1041
+}
+```
+
+### Prune WAL
+
+```text
+POST /api/v1/collections/{collection}/prune-wal
+```
+
+Deletes write-ahead log segments older than the latest snapshot for the collection, reclaiming disk space.
+
+**Path Parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| collection | string | Collection name |
+
+**Response:**
+
+| Field          | Type   | Description                              |
+|----------------|--------|------------------------------------------|
+| status         | string | Operation status                         |
+| files_deleted  | uint64 | Number of WAL files deleted              |
+| bytes_freed    | uint64 | Bytes reclaimed                          |
+| duration_ms    | uint64 | Duration in milliseconds                 |
+
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/docs/prune-wal
+```
+
+### Compact
+
+```text
+POST /api/v1/collections/{collection}/compact
+```
+
+Merges on-disk segments, optionally removing tombstoned vectors. Reduces the number of segments and reclaims space from deletes.
+
+**Path Parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| collection | string | Collection name |
+
+**Request Body:**
+
+| Parameter      | Type   | Required | Default | Description                                                          |
+|----------------|--------|----------|---------|----------------------------------------------------------------------|
+| min_segments   | uint32 | No       | `4`     | Minimum number of segments to trigger compaction. `0` uses the default. |
+| remove_deleted | bool   | No       | `true`  | Remove deleted vectors during compaction.                            |
+
+**Response:**
+
+| Field            | Type   | Description                                  |
+|------------------|--------|----------------------------------------------|
+| status           | string | Operation status                             |
+| segments_merged  | uint64 | Number of segments merged                    |
+| vectors_written  | uint64 | Number of vectors written to the merged set  |
+| vectors_removed  | uint64 | Number of deleted vectors removed            |
+| duration_ms      | uint64 | Duration in milliseconds                     |
+
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/docs/compact \
+  -H "Content-Type: application/json" \
+  -d '{ "min_segments": 8, "remove_deleted": true }'
+```
+
+### Collection Metrics
+
+```text
+GET /metrics/collection/{collection}
+```
+
+Returns lock-contention counters for a single collection, useful for diagnosing contention under concurrent load.
+
+**Path Parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| collection | string | Collection name |
+
+**Response:**
+
+| Field                              | Type   | Description                                          |
+|------------------------------------|--------|------------------------------------------------------|
+| map_lock_acquisitions              | uint64 | Acquisitions of the collection map read lock         |
+| collection_read_acquisitions       | uint64 | Read-lock acquisitions on this collection            |
+| collection_write_acquisitions      | uint64 | Write-lock acquisitions on this collection           |
+| total_blocked_microseconds         | uint64 | Total time waited for these locks, in microseconds   |
+
+```bash
+curl http://localhost:8080/metrics/collection/docs
 ```
 
 ---
@@ -1633,26 +1893,33 @@ Proto definitions are located at `proto/swarndb/v1/`.
 
 Defined in `proto/swarndb/v1/collection.proto`.
 
-| RPC              | Request                   | Response                   | Description          |
-|------------------|---------------------------|----------------------------|----------------------|
-| CreateCollection | CreateCollectionRequest    | CreateCollectionResponse   | Create a collection  |
-| DeleteCollection | DeleteCollectionRequest    | DeleteCollectionResponse   | Delete a collection  |
-| GetCollection    | GetCollectionRequest       | GetCollectionResponse      | Get collection info  |
-| ListCollections  | ListCollectionsRequest     | ListCollectionsResponse    | List all collections |
+| RPC                  | Request                       | Response                       | Description                                                       |
+|----------------------|-------------------------------|--------------------------------|-------------------------------------------------------------------|
+| CreateCollection     | CreateCollectionRequest        | CreateCollectionResponse       | Create a collection                                               |
+| DeleteCollection     | DeleteCollectionRequest        | DeleteCollectionResponse       | Delete a collection                                               |
+| GetCollection        | GetCollectionRequest           | GetCollectionResponse          | Get collection info                                               |
+| ListCollections      | ListCollectionsRequest         | ListCollectionsResponse        | List all collections                                              |
+| GetRecoveryStatus    | GetRecoveryStatusRequest       | GetRecoveryStatusResponse      | Server boot-recovery snapshot (path, elapsed, per-collection)     |
+| SnapshotCollection   | SnapshotCollectionRequest      | SnapshotCollectionResponse     | Force a synchronous snapshot for a collection                     |
+| GetPersistenceStatus | GetPersistenceStatusRequest    | GetPersistenceStatusResponse   | Per-collection snapshot and WAL LSN state                         |
+| GetCollectionMetrics | GetCollectionMetricsRequest    | GetCollectionMetricsResponse   | Per-collection lock-contention counters                           |
 
 #### VectorService
 
 Defined in `proto/swarndb/v1/vector.proto`.
 
-| RPC                  | Request                      | Response            | Description                          |
-|----------------------|------------------------------|---------------------|--------------------------------------|
-| Insert               | InsertRequest                | InsertResponse      | Insert a single vector               |
-| Get                  | GetVectorRequest             | GetVectorResponse   | Get a vector by ID                   |
-| Update               | UpdateRequest                | UpdateResponse      | Update a vector                      |
-| Delete               | DeleteVectorRequest          | DeleteVectorResponse| Delete a vector                      |
-| BulkInsert           | stream InsertRequest         | BulkInsertResponse  | Stream-based bulk insert             |
-| BulkInsertWithOptions| stream BulkInsertStreamMessage| BulkInsertResponse | Stream-based bulk insert with tuning options (first message is options, rest are vectors) |
-| Optimize             | OptimizeRequest              | OptimizeResponse    | Trigger index/graph rebuild          |
+| RPC                  | Request                       | Response             | Description                                                                                              |
+|----------------------|-------------------------------|----------------------|----------------------------------------------------------------------------------------------------------|
+| Insert               | InsertRequest                  | InsertResponse       | Insert a single vector                                                                                   |
+| Get                  | GetVectorRequest               | GetVectorResponse    | Get a vector by ID                                                                                       |
+| Update               | UpdateRequest                  | UpdateResponse       | Update a vector                                                                                          |
+| Delete               | DeleteVectorRequest            | DeleteVectorResponse | Delete a vector                                                                                          |
+| BulkInsert           | stream InsertRequest           | BulkInsertResponse   | Stream-based bulk insert                                                                                 |
+| BulkInsertWithOptions| stream BulkInsertStreamMessage | BulkInsertResponse   | Stream-based bulk insert with tuning options (first message is options, rest are vectors)                |
+| BulkInsertFromPath   | BulkInsertFromPathRequest      | BulkInsertResponse   | Server-side ingestion from a `.npy` or `.f32` file via memory mapping                                    |
+| Optimize             | OptimizeRequest                | OptimizeResponse     | Trigger index/graph rebuild                                                                              |
+| PruneWAL             | PruneWALRequest                | PruneWALResponse     | Delete WAL segments older than the last snapshot                                                         |
+| Compact              | CompactRequest                 | CompactResponse      | Merge segments and optionally remove deleted vectors                                                     |
 
 #### SearchService
 

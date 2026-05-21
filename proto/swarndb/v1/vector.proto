@@ -10,6 +10,7 @@ service VectorService {
   rpc Delete(DeleteVectorRequest) returns (DeleteVectorResponse);
   rpc BulkInsert(stream InsertRequest) returns (BulkInsertResponse);
   rpc BulkInsertWithOptions(stream BulkInsertStreamMessage) returns (BulkInsertResponse);
+  rpc BulkInsertFromPath(BulkInsertFromPathRequest) returns (BulkInsertResponse);
   rpc Optimize(OptimizeRequest) returns (OptimizeResponse);
   rpc PruneWAL(PruneWALRequest) returns (PruneWALResponse);
   rpc Compact(CompactRequest) returns (CompactResponse);
@@ -61,6 +62,11 @@ message DeleteVectorResponse {
 message BulkInsertResponse {
   uint64 inserted_count = 1;
   repeated string errors = 2;
+  uint64 last_completed_batch_idx = 3;
+  uint64 last_committed_lsn = 4;
+  string resume_token = 5;
+  // Server-assigned vector ids in input order, parallel to the Ok arms of the chunk loop.
+  repeated uint64 assigned_ids = 6;
 }
 
 message BulkInsertOptions {
@@ -71,6 +77,8 @@ message BulkInsertOptions {
   string index_mode = 5;             // "immediate" (default) or "deferred"
   bool skip_metadata_index = 6;      // Skip per-vector metadata indexing, rebuild via optimize()
   bool parallel_build = 7;           // Use parallel HNSW construction (only with index_mode=deferred)
+  uint32 checkpoint_every = 8;       // Write checkpoint every N batches (0 = never)
+  string resume_token = 9;           // Opaque token from a prior partial bulk insert response
 }
 
 message BulkInsertStreamMessage {
@@ -115,4 +123,18 @@ message CompactResponse {
   uint64 vectors_written = 3;
   uint64 vectors_removed = 4;
   uint64 duration_ms = 5;
+}
+
+message BulkInsertFromPathRequest {
+  string collection = 1;
+  string path = 2;
+  uint32 dim = 3;
+  uint64 expected_count = 4;
+  uint64 total_count_hint = 5;
+  uint64 id_start = 6;
+  string ids_path = 7;
+  bool skip_metadata_index = 8;
+  string index_mode = 9;
+  uint32 ef_construction = 10;
+  uint32 chunk_size = 11;
 }

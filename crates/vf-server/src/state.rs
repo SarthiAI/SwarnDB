@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
@@ -28,6 +28,48 @@ impl CollectionStatus {
             CollectionStatus::Ready => "ready",
             CollectionStatus::PendingOptimization => "pending_optimization",
             CollectionStatus::Optimizing => "optimizing",
+        }
+    }
+}
+
+/// Boot-time recovery path taken for a collection. Mirrors the in-memory
+/// strategy chosen by `plan_recovery` (with a fallback Unknown value for
+/// collections still loading or whose path has not been recorded yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum RecoveryStatus {
+    Unknown,
+    CleanShutdown,
+    IncrementalReplay,
+    FullRebuild,
+}
+
+impl RecoveryStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecoveryStatus::Unknown => "Unknown",
+            RecoveryStatus::CleanShutdown => "CleanShutdown",
+            RecoveryStatus::IncrementalReplay => "IncrementalReplay",
+            RecoveryStatus::FullRebuild => "FullRebuild",
+        }
+    }
+
+    /// Convert from the small numeric encoding used in the AtomicU8 holder.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RecoveryStatus::CleanShutdown,
+            2 => RecoveryStatus::IncrementalReplay,
+            3 => RecoveryStatus::FullRebuild,
+            _ => RecoveryStatus::Unknown,
+        }
+    }
+
+    /// Numeric encoding stored in the AtomicU8 holder.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            RecoveryStatus::Unknown => 0,
+            RecoveryStatus::CleanShutdown => 1,
+            RecoveryStatus::IncrementalReplay => 2,
+            RecoveryStatus::FullRebuild => 3,
         }
     }
 }
@@ -68,8 +110,10 @@ impl MetadataCache {
     /// only if the store's generation has changed since the last build.
     /// Uses `iter_metadata` to avoid cloning vector data during rebuild.
     pub fn get_or_rebuild(&self, store: &InMemoryVectorStore) -> Arc<HashMap<VectorId, Metadata>> {
-        let current_gen = store.generation();
         let mut guard = self.cache.lock();
+        // Read generation inside the cache lock so the stored (gen, snapshot) pair
+        // cannot record a pre-bump gen alongside a post-bump iter_metadata view.
+        let current_gen = store.generation();
         if guard.0 != current_gen {
             let metadata_store: HashMap<VectorId, Metadata> =
                 store.iter_metadata().into_iter().collect();
@@ -106,28 +150,211 @@ pub struct CollectionState {
     pub dirty: Arc<AtomicBool>,
     /// Number of mutations since last snapshot.
     pub mutation_count: Arc<AtomicU64>,
+    /// Number of per-collection read-lock acquisitions on this CollectionState.
+    /// Incremented via `metered_read`. Relaxed ordering on the hot path.
+    pub collection_read_acquisitions: AtomicU64,
+    /// Number of per-collection write-lock acquisitions on this CollectionState.
+    /// Incremented via `metered_write`. Relaxed ordering on the hot path.
+    pub collection_write_acquisitions: AtomicU64,
+    /// Coarse running sum of microseconds spent waiting for the per-collection
+    /// lock. Wraps an `Instant::now()` around each acquire site through the
+    /// metered helpers. Relaxed ordering on the hot path.
+    pub total_blocked_microseconds: AtomicU64,
+}
+
+/// Result of `AppState::require_collection_ready` used by REST and gRPC
+/// guards to choose between 503 Service Unavailable and 404 Not Found.
+#[derive(Debug, Clone)]
+pub enum CollectionAvailability {
+    /// Collection exists on disk and is being recovered in the background.
+    /// Callers should respond with 503 (REST) or `Status::unavailable` (gRPC).
+    Recovering {
+        name: String,
+        loaded: usize,
+        total: usize,
+        retry_after_secs: u32,
+    },
+    /// Collection is not present in memory and is not pending recovery.
+    /// Callers should respond with 404 (REST) or `Status::not_found` (gRPC).
+    NotFound { name: String },
+}
+
+impl CollectionAvailability {
+    /// Plain-English message used in error responses.
+    pub fn user_message(&self) -> String {
+        match self {
+            CollectionAvailability::Recovering {
+                name,
+                retry_after_secs,
+                ..
+            } => format!(
+                "collection '{}' is recovering, retry after {} seconds",
+                name, retry_after_secs
+            ),
+            CollectionAvailability::NotFound { name } => {
+                format!("collection '{}' not found", name)
+            }
+        }
+    }
+}
+
+/// Acquire a per-collection read lock and record the acquisition in the
+/// `CollectionState` metrics counters. Times the acquire window with
+/// `Instant::now()` so high-contention waits show up in
+/// `total_blocked_microseconds`. Increments use `Relaxed` ordering to keep
+/// the hot path cheap.
+pub fn metered_read(
+    handle: &Arc<RwLock<CollectionState>>,
+) -> RwLockReadGuard<'_, CollectionState> {
+    let start = Instant::now();
+    let guard = handle.read();
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    guard
+        .collection_read_acquisitions
+        .fetch_add(1, Ordering::Relaxed);
+    guard
+        .total_blocked_microseconds
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+    guard
+}
+
+/// Acquire a per-collection write lock and record the acquisition in the
+/// `CollectionState` metrics counters. Mirrors `metered_read` for the write
+/// side; same hot-path discipline (Relaxed atomics, single Instant::now pair).
+pub fn metered_write(
+    handle: &Arc<RwLock<CollectionState>>,
+) -> RwLockWriteGuard<'_, CollectionState> {
+    let start = Instant::now();
+    let guard = handle.write();
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    guard
+        .collection_write_acquisitions
+        .fetch_add(1, Ordering::Relaxed);
+    guard
+        .total_blocked_microseconds
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+    guard
+}
+
+/// Heuristic retry-after value in seconds. Per-collection load time is not
+/// instrumented in this build, so we report a conservative bound: 30 s while
+/// recovery has just started, scaling to 60 s after the first minute. The
+/// number is advisory; clients are expected to back off and retry, not to
+/// trust the value as a hard SLA.
+fn estimate_retry_after_secs(ls: &LoadingState) -> u32 {
+    let elapsed = ls.started_at.elapsed().as_secs();
+    if elapsed < 30 {
+        30
+    } else if elapsed < 120 {
+        60
+    } else {
+        90
+    }
+}
+
+/// Snapshot of the in-progress recovery, used by /health and the per-endpoint
+/// readiness guard. The recovery task updates this as each collection finishes
+/// loading so callers can tell which collections are still warming up.
+#[derive(Clone)]
+pub struct LoadingState {
+    /// Total number of collections discovered at boot.
+    pub total: usize,
+    /// Names of collections that have NOT yet finished loading.
+    pub in_progress: std::collections::HashSet<String>,
+    /// Wall-clock instant at which recovery started.
+    pub started_at: Instant,
+}
+
+impl LoadingState {
+    pub fn loaded(&self) -> usize {
+        self.total.saturating_sub(self.in_progress.len())
+    }
+
+    pub fn is_loading(&self, name: &str) -> bool {
+        self.in_progress.contains(name)
+    }
 }
 
 /// Global application state shared across all gRPC services.
+///
+/// Locking discipline for `collections`:
+///   1. The map RwLock is the outer lock and is held for the briefest possible
+///      window (look up name -> clone the `Arc<RwLock<CollectionState>>`, then
+///      drop it). Per-collection mutation never holds the map write lock.
+///   2. The per-collection `RwLock<CollectionState>` is the inner lock and is
+///      held for the duration of work against that collection (chunk loop for
+///      bulk insert, search execution for read-side handlers).
+///   3. Lock order is ALWAYS map first, then per-collection. Acquiring the map
+///      lock while holding any per-collection lock is forbidden and will lead
+///      to deadlock under contention.
 #[derive(Clone)]
 pub struct AppState {
-    pub collections: Arc<RwLock<HashMap<String, CollectionState>>>,
+    pub collections: Arc<RwLock<HashMap<String, Arc<RwLock<CollectionState>>>>>,
     pub collection_manager: Arc<RwLock<CollectionManager>>,
     pub config: crate::config::ServerConfig,
     pub max_ef_search: usize,
     pub max_batch_lock_size: u32,
     pub max_wal_flush_interval: u32,
     pub max_ef_construction: u32,
+    /// Tracks which collections are still being recovered in the background.
+    /// Empty `in_progress` means recovery is done.
+    pub loading_state: Arc<RwLock<LoadingState>>,
+    /// Flipped to true by the recovery task once every collection is loaded.
+    /// Shared with the health/probe router so /readyz can gate orchestration
+    /// while /health stays available immediately after the listeners bind.
+    pub server_status: crate::health::ServerStatus,
+    /// Per-collection boot recovery path. Populated once during boot by
+    /// `load_single_collection` and read by the `/recovery_status` endpoint.
+    /// Indexed by collection name; entries are never mutated post-boot.
+    pub recovery_paths: Arc<RwLock<HashMap<String, RecoveryStatus>>>,
+    /// Coarse global summary of the most-recent recovery path. Set by the
+    /// boot task once the parallel recovery loop drains; encoded as the
+    /// numeric form of `RecoveryStatus`.
+    pub recovery_path: Arc<AtomicU8>,
+    /// Wall-clock seconds the global recovery routine spent. Set once
+    /// during boot; readable lock-free from the endpoint handler.
+    pub recovery_elapsed_secs: Arc<AtomicU64>,
+    /// Number of map-level lookups served by `collection_handle`. Acts as a
+    /// proxy for outer-lock pressure on the collections RwLock.
+    pub map_lock_acquisitions: Arc<AtomicU64>,
 }
 
 impl AppState {
     /// Create a new AppState with a CollectionManager rooted at `storage_path`.
     ///
-    /// The CollectionManager will create the directory if it does not exist and
-    /// scan for any previously persisted collections. For each persisted
-    /// collection, the in-memory vector store and HNSW index are rebuilt from
-    /// the stored vectors so that search is immediately available after restart.
+    /// This is the historical synchronous path that blocks until every
+    /// collection on disk has been recovered. It is still used by the inline
+    /// tests in this crate. Production boot goes through `new_empty` plus
+    /// `recover_collections` so the gRPC and REST listeners can bind before
+    /// recovery starts.
     pub fn new(
+        storage_path: &Path,
+        max_ef_search: usize,
+        max_batch_lock_size: u32,
+        max_wal_flush_interval: u32,
+        max_ef_construction: u32,
+        config: crate::config::ServerConfig,
+    ) -> Result<Self, StorageError> {
+        let state = Self::new_empty(
+            storage_path,
+            max_ef_search,
+            max_batch_lock_size,
+            max_wal_flush_interval,
+            max_ef_construction,
+            config,
+        )?;
+        state.recover_collections();
+        state.server_status.mark_initialized();
+        Ok(state)
+    }
+
+    /// Build an AppState skeleton that owns a CollectionManager and the
+    /// `loading_state` describing what is about to be recovered, but does NOT
+    /// load any collections. The returned state can be cloned cheaply (all
+    /// fields are Arc) so the gRPC and REST listeners can be spawned with it
+    /// while a background task drives `recover_collections` against the same
+    /// shared map.
+    pub fn new_empty(
         storage_path: &Path,
         max_ef_search: usize,
         max_batch_lock_size: u32,
@@ -137,95 +364,166 @@ impl AppState {
     ) -> Result<Self, StorageError> {
         let collection_manager = CollectionManager::new(storage_path)?;
 
-        let mut collections = HashMap::new();
-
-        // Snapshot the collection names up front so the parallel loaders can
-        // own their inputs without holding a borrow on the manager keys map.
         let collection_names: Vec<String> = collection_manager
             .list_collections()
             .iter()
             .map(|s| s.to_string())
             .collect();
 
+        let loading_state = LoadingState {
+            total: collection_names.len(),
+            in_progress: collection_names.iter().cloned().collect(),
+            started_at: Instant::now(),
+        };
+
+        Ok(Self {
+            collections: Arc::new(RwLock::new(HashMap::new())),
+            collection_manager: Arc::new(RwLock::new(collection_manager)),
+            config,
+            max_ef_search,
+            max_batch_lock_size,
+            max_wal_flush_interval,
+            max_ef_construction,
+            loading_state: Arc::new(RwLock::new(loading_state)),
+            server_status: crate::health::ServerStatus::new(),
+            recovery_paths: Arc::new(RwLock::new(HashMap::new())),
+            recovery_path: Arc::new(AtomicU8::new(RecoveryStatus::Unknown.to_u8())),
+            recovery_elapsed_secs: Arc::new(AtomicU64::new(0)),
+            map_lock_acquisitions: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Recover every collection discovered at `new_empty` time, in parallel.
+    ///
+    /// As each collection finishes loading, the resulting `CollectionState`
+    /// is inserted into `self.collections` and the name is removed from
+    /// `self.loading_state.in_progress`. This is what the boot-time
+    /// background task on the main thread invokes; it also drives the
+    /// synchronous `new()` path used by inline tests.
+    pub fn recover_collections(&self) {
+        let recovery_start = Instant::now();
+        let collection_names: Vec<String> = {
+            let ls = self.loading_state.read();
+            ls.in_progress.iter().cloned().collect()
+        };
+
         let total_collections = collection_names.len();
-        let configured_max = config.max_concurrent_collection_loads;
+        let configured_max = self.config.max_concurrent_collection_loads;
         let max_concurrent = configured_max.max(1);
 
-        if total_collections > 0 {
-            tracing::info!(
-                total_collections,
-                max_concurrent,
-                "loading collections in parallel"
-            );
-
-            // Dedicated rayon pool so concurrent index builds elsewhere (for
-            // example HNSW parallel build inside a single collection) do not
-            // contend with the boot pool's worker count.
-            let pool = ThreadPoolBuilder::new()
-                .num_threads(max_concurrent)
-                .thread_name(|i| format!("collection-loader-{}", i))
-                .build()
-                .map_err(|e| {
-                    StorageError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to build collection loader pool: {}", e),
-                    ))
-                })?;
-
-            let cm_ref = &collection_manager;
-
-            // Capture the calling thread's tracing dispatcher so per-task
-            // log emissions inside the rayon pool are visible to whatever
-            // subscriber the caller has installed (tests use a thread-local
-            // subscriber via `with_default`; production wires a global one).
-            // Without this, rayon worker threads default to the no-op
-            // dispatcher and the per-collection `recovery plan:` and
-            // `recovered collection with` events are dropped.
-            let parent_dispatch =
-                tracing::dispatcher::get_default(|d| d.clone());
-
-            let loaded: Vec<(String, CollectionState)> = pool.install(|| {
-                collection_names
-                    .into_par_iter()
-                    .filter_map(|name| {
-                        // Catch panics at the per-task boundary so a single
-                        // bad collection cannot poison boot for the rest.
-                        // SAFETY: AssertUnwindSafe is used because the
-                        // borrowed references and the moved `name` are only
-                        // read inside the closure; on a panic we discard
-                        // any partial state for this collection and log.
-                        let panic_name = name.clone();
-                        let dispatch = parent_dispatch.clone();
-                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            tracing::dispatcher::with_default(&dispatch, || {
-                                Self::load_single_collection(name, cm_ref)
-                            })
-                        }));
-                        match result {
-                            Ok(opt) => opt,
-                            Err(_) => {
-                                tracing::dispatcher::with_default(
-                                    &parent_dispatch,
-                                    || {
-                                        tracing::error!(
-                                            collection = %panic_name,
-                                            "collection loader panicked, skipping"
-                                        );
-                                    },
-                                );
-                                None
-                            }
-                        }
-                    })
-                    .collect()
-            });
-
-            for (name, collection_state) in loaded {
-                collections.insert(name, collection_state);
-            }
+        if total_collections == 0 {
+            // No collections to recover; still record the elapsed window so
+            // /recovery_status reports a deterministic value.
+            self.recovery_elapsed_secs
+                .store(recovery_start.elapsed().as_secs(), Ordering::Release);
+            return;
         }
 
-        let recovered_count = collections.len();
+        tracing::info!(
+            total_collections,
+            max_concurrent,
+            "loading collections in parallel"
+        );
+
+        // Dedicated rayon pool so concurrent index builds elsewhere (for
+        // example HNSW parallel build inside a single collection) do not
+        // contend with the boot pool's worker count.
+        let pool = match ThreadPoolBuilder::new()
+            .num_threads(max_concurrent)
+            .thread_name(|i| format!("collection-loader-{}", i))
+            .build()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    "failed to build collection loader pool: {e}; recovery will not run"
+                );
+                return;
+            }
+        };
+
+        // Capture the calling thread's tracing dispatcher so per-task
+        // log emissions inside the rayon pool are visible to whatever
+        // subscriber the caller has installed (tests use a thread-local
+        // subscriber via `with_default`; production wires a global one).
+        // Without this, rayon worker threads default to the no-op
+        // dispatcher and the per-collection `recovery plan:` and
+        // `recovered collection with` events are dropped.
+        let parent_dispatch =
+            tracing::dispatcher::get_default(|d| d.clone());
+
+        let collections_arc = Arc::clone(&self.collections);
+        let loading_arc = Arc::clone(&self.loading_state);
+        let cm_arc = Arc::clone(&self.collection_manager);
+        let recovery_paths_arc = Arc::clone(&self.recovery_paths);
+
+        pool.install(|| {
+            collection_names
+                .into_par_iter()
+                .for_each(|name| {
+                    // Catch panics at the per-task boundary so a single
+                    // bad collection cannot poison boot for the rest.
+                    // SAFETY: AssertUnwindSafe is used because the
+                    // borrowed references and the moved `name` are only
+                    // read inside the closure; on a panic we discard
+                    // any partial state for this collection and log.
+                    let panic_name = name.clone();
+                    let dispatch = parent_dispatch.clone();
+                    let cm_arc_inner = Arc::clone(&cm_arc);
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            let cm = cm_arc_inner.read();
+                            Self::load_single_collection(name, &cm)
+                        })
+                    }));
+
+                    match result {
+                        Ok(Some((loaded_name, loaded_state, recovery_path))) => {
+                            // Record the per-collection recovery path BEFORE the
+                            // collection becomes externally visible. Once the map
+                            // write below publishes the Arc, /readyz can flip,
+                            // and /recovery_status callers must see a non-Unknown
+                            // entry for the collection they observe.
+                            {
+                                let mut rp = recovery_paths_arc.write();
+                                rp.insert(loaded_name.clone(), recovery_path);
+                            }
+                            // Publish the loaded collection atomically. The per-collection
+                            // RwLock wrapper is created here so the map only holds Arcs.
+                            {
+                                let mut map = collections_arc.write();
+                                map.insert(loaded_name.clone(), Arc::new(RwLock::new(loaded_state)));
+                            }
+                            {
+                                let mut ls = loading_arc.write();
+                                ls.in_progress.remove(&loaded_name);
+                            }
+                        }
+                        Ok(None) => {
+                            // Loader returned None (data-level error already
+                            // logged as warn). Remove from in_progress so the
+                            // boot does not stay "recovering" forever.
+                            let mut ls = loading_arc.write();
+                            ls.in_progress.remove(&panic_name);
+                        }
+                        Err(_) => {
+                            tracing::dispatcher::with_default(
+                                &parent_dispatch,
+                                || {
+                                    tracing::error!(
+                                        collection = %panic_name,
+                                        "collection loader panicked, skipping"
+                                    );
+                                },
+                            );
+                            let mut ls = loading_arc.write();
+                            ls.in_progress.remove(&panic_name);
+                        }
+                    }
+                });
+        });
+
+        let recovered_count = self.collections.read().len();
         if recovered_count > 0 {
             tracing::info!(
                 "recovered {} collection(s) from storage",
@@ -233,14 +531,69 @@ impl AppState {
             );
         }
 
-        Ok(Self {
-            collections: Arc::new(RwLock::new(collections)),
-            collection_manager: Arc::new(RwLock::new(collection_manager)),
-            config,
-            max_ef_search,
-            max_batch_lock_size,
-            max_wal_flush_interval,
-            max_ef_construction,
+        // Record the boot recovery summary BEFORE the boot task flips
+        // /readyz to 200. The summary path uses the worst (highest-cost)
+        // path actually taken: FullRebuild beats IncrementalReplay beats
+        // CleanShutdown beats Unknown. This gives operators a single
+        // worst-case answer without losing the per-collection detail
+        // recorded in `recovery_paths`.
+        let elapsed_secs = recovery_start.elapsed().as_secs();
+        self.recovery_elapsed_secs.store(elapsed_secs, Ordering::Release);
+        let worst_path = {
+            let rp = self.recovery_paths.read();
+            let mut worst = RecoveryStatus::Unknown;
+            for v in rp.values() {
+                if v.to_u8() > worst.to_u8() {
+                    worst = *v;
+                }
+            }
+            worst
+        };
+        self.recovery_path
+            .store(worst_path.to_u8(), Ordering::Release);
+    }
+
+    /// Short-lived helper that clones the per-collection `Arc<RwLock<CollectionState>>`
+    /// out of the map under a map read lock. Returns `None` if the collection
+    /// is not present. Callers should immediately drop this helper's return
+    /// value before doing any work that might block, then take the per-
+    /// collection lock (read or write) on the returned handle. This is the
+    /// canonical entry point for every per-collection operation.
+    pub fn collection_handle(
+        &self,
+        name: &str,
+    ) -> Option<Arc<RwLock<CollectionState>>> {
+        // Bump the map-lock acquisition counter once per call. Relaxed
+        // ordering: this counter is observed by the metrics endpoint, not
+        // by control flow.
+        self.map_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let map = self.collections.read();
+        map.get(name).map(Arc::clone)
+    }
+
+    /// Per-endpoint readiness gate. Returns `Ok(())` only when the named
+    /// collection is fully loaded. Returns a structured `NotReady` error if
+    /// the name is still listed in the recovery queue. Returns `NotFound` if
+    /// the collection is neither loaded nor pending recovery.
+    pub fn require_collection_ready(
+        &self,
+        name: &str,
+    ) -> Result<(), CollectionAvailability> {
+        if self.collections.read().contains_key(name) {
+            return Ok(());
+        }
+        let ls = self.loading_state.read();
+        if ls.is_loading(name) {
+            return Err(CollectionAvailability::Recovering {
+                name: name.to_string(),
+                loaded: ls.loaded(),
+                total: ls.total,
+                retry_after_secs: estimate_retry_after_secs(&ls),
+            });
+        }
+        Err(CollectionAvailability::NotFound {
+            name: name.to_string(),
         })
     }
 
@@ -259,7 +612,7 @@ impl AppState {
     fn load_single_collection(
         name: String,
         collection_manager: &CollectionManager,
-    ) -> Option<(String, CollectionState)> {
+    ) -> Option<(String, CollectionState, RecoveryStatus)> {
         let collection = match collection_manager.get_collection(&name) {
             Ok(c) => c,
             Err(e) => {
@@ -277,7 +630,33 @@ impl AppState {
         let collection_dir = collection.collection_dir().to_path_buf();
 
         // Plan recovery strategy based on available files.
-        let plan = plan_recovery(&name, &collection_dir);
+        let mut plan = plan_recovery(&name, &collection_dir);
+
+        // G2 fix: under IncrementalReplay, the HNSW delta tail and the graph
+        // delta tail must be in lock-step. If hnsw.delta is present but
+        // graph.delta is missing (or graph.base is missing while graph.delta
+        // exists), replaying HNSW alone would drift the graph topology
+        // relative to the index. Demote to FullRebuild so both layers
+        // reconverge from the same vector set. Logged as error because in
+        // a healthy pipeline these tails are written together.
+        if matches!(plan.strategy, RecoveryStrategy::IncrementalReplay { .. }) {
+            let hnsw_delta_present = plan.has_hnsw_delta;
+            let graph_base_present = plan.has_graph_base;
+            let graph_delta_present = plan.has_graph_delta;
+            let inconsistent = (hnsw_delta_present && graph_base_present && !graph_delta_present)
+                || (graph_delta_present && !graph_base_present);
+            if inconsistent {
+                tracing::error!(
+                    collection = %name,
+                    hnsw_delta = hnsw_delta_present,
+                    graph_base = graph_base_present,
+                    graph_delta = graph_delta_present,
+                    "G2 inconsistency between hnsw.delta and graph.delta detected; forcing full rebuild to avoid topology drift"
+                );
+                plan.strategy = RecoveryStrategy::FullRebuild;
+            }
+        }
+
         tracing::info!(
             collection = %name,
             strategy = ?plan.strategy,
@@ -368,7 +747,7 @@ impl AppState {
             .map(|(id, data, _)| (*id, data.as_slice()))
             .collect();
 
-        let (index, graph) = match plan.strategy {
+        let (index, graph, recovery_path) = match plan.strategy {
             RecoveryStrategy::CleanShutdown => {
                 let hnsw_path = collection_dir.join("hnsw.base");
 
@@ -394,14 +773,15 @@ impl AppState {
                                 "recovered from clean shutdown (plain HNSW, trait flow)"
                             );
                             let boxed: Box<dyn PersistableIndex> = idx;
-                            (boxed, g)
+                            (boxed, g, RecoveryStatus::CleanShutdown)
                         }
                         (Err(e), _) | (_, Err(e)) => {
                             tracing::warn!(
                                 collection = %name,
                                 "plain hnsw clean-shutdown recovery failed ({e}), falling back to full rebuild"
                             );
-                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
+                            let (idx, g) = Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir);
+                            (idx, g, RecoveryStatus::FullRebuild)
                         }
                     }
                 } else {
@@ -467,14 +847,15 @@ impl AppState {
                                 vectors = vector_count,
                                 "recovered from clean shutdown (SQ8, trait flow)"
                             );
-                            (idx, g)
+                            (idx, g, RecoveryStatus::CleanShutdown)
                         }
                         (Err(e), _) | (_, Err(e)) => {
                             tracing::warn!(
                                 collection = %name,
                                 "SQ8 trait-flow recovery failed ({e}), falling back to full rebuild"
                             );
-                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
+                            let (idx, g) = Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir);
+                            (idx, g, RecoveryStatus::FullRebuild)
                         }
                     }
                 }
@@ -509,14 +890,15 @@ impl AppState {
                                 "recovered via incremental replay (plain HNSW, trait flow)"
                             );
                             let boxed: Box<dyn PersistableIndex> = idx;
-                            (boxed, g)
+                            (boxed, g, RecoveryStatus::IncrementalReplay)
                         }
                         (Err(e), _) | (_, Err(e)) => {
                             tracing::warn!(
                                 collection = %name,
                                 "plain hnsw incremental replay failed ({e}), falling back to full rebuild"
                             );
-                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
+                            let (idx, g) = Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir);
+                            (idx, g, RecoveryStatus::FullRebuild)
                         }
                     }
                 } else {
@@ -594,14 +976,15 @@ impl AppState {
                                 vectors = vector_count,
                                 "recovered via incremental replay (SQ8, trait flow)"
                             );
-                            (idx, g)
+                            (idx, g, RecoveryStatus::IncrementalReplay)
                         }
                         Err(e) => {
                             tracing::warn!(
                                 collection = %name,
                                 "SQ8 incremental replay failed ({e}), falling back to full rebuild"
                             );
-                            Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
+                            let (idx, g) = Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir);
+                            (idx, g, RecoveryStatus::FullRebuild)
                         }
                     }
                 }
@@ -609,7 +992,8 @@ impl AppState {
 
             RecoveryStrategy::FullRebuild => {
                 tracing::info!(collection = %name, "full rebuild from vectors");
-                Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir)
+                let (idx, g) = Self::full_rebuild(&name, dimension, distance_metric, &vectors, &config, &collection_dir);
+                (idx, g, RecoveryStatus::FullRebuild)
             }
         };
 
@@ -642,6 +1026,9 @@ impl AppState {
             deferred_metadata: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(AtomicBool::new(false)),
             mutation_count: Arc::new(AtomicU64::new(0)),
+            collection_read_acquisitions: AtomicU64::new(0),
+            collection_write_acquisitions: AtomicU64::new(0),
+            total_blocked_microseconds: AtomicU64::new(0),
         };
 
         tracing::info!(
@@ -651,10 +1038,10 @@ impl AppState {
             vector_count
         );
 
-        Some((name, collection_state))
+        Some((name, collection_state, recovery_path))
     }
 
-    /// Full rebuild path: load vectors into HNSW index one by one and recompute graph.
+    /// Full rebuild path: load vectors into HNSW index via parallel bulk insert and recompute graph.
     fn full_rebuild(
         name: &str,
         dimension: usize,
@@ -669,14 +1056,16 @@ impl AppState {
         };
 
         let vector_ids: Vec<u64> = vectors.iter().map(|(id, _, _)| *id).collect();
-        let vector_map: HashMap<u64, Vec<f32>> = vectors.iter()
-            .map(|(id, data, _)| (*id, data.clone()))
+        // Arc-wrap so the parallel graph compute below can share clones
+        // without re-allocating per-thread copies.
+        let vector_map: HashMap<u64, Arc<Vec<f32>>> = vectors.iter()
+            .map(|(id, data, _)| (*id, Arc::new(data.clone())))
             .collect();
 
         // Build the index. For SQ8 we go through cold_build_parallel so the
         // encode step runs on every core. For the plain (non-quantized)
-        // path the legacy sequential add loop is preserved verbatim; plain
-        // HNSW parallel build is out of P03 scope.
+        // path we use HnswIndex::bulk_add_with_lsn for parallel-neighbor-search
+        // on cold rebuild, with a serial-add fallback on bulk failure.
         let index: Box<dyn PersistableIndex> = match &config.quantization_config {
             Some(QuantizationConfig::Scalar(sq_config)) => {
                 let workers = std::thread::available_parallelism()
@@ -741,23 +1130,50 @@ impl AppState {
             }
             None => {
                 let hnsw_index = HnswIndex::with_defaults(dimension, distance_metric);
-                for (id, data, _metadata) in vectors {
-                    if let Err(e) = hnsw_index.add(*id, data) {
+                // Single parallel bulk insert: parallel-neighbor-search + serial-mutation.
+                // No delta writer is attached at rebuild time, so no delta entries are emitted;
+                // LSN=0 per item is therefore unobservable and equivalent to the legacy add() loop.
+                // Wrap each vector once in Arc; the index path uses Arc clones only.
+                let items: Vec<(VectorId, Arc<Vec<f32>>, u64)> = vectors
+                    .iter()
+                    .map(|(id, data, _)| (*id, Arc::new(data.clone()), 0u64))
+                    .collect();
+                match hnsw_index.bulk_add_with_lsn(&items) {
+                    Ok(()) => {
+                        tracing::info!(
+                            collection = %name,
+                            count = items.len(),
+                            "plain HNSW full rebuild via parallel bulk_add_with_lsn complete"
+                        );
+                        Box::new(hnsw_index)
+                    }
+                    Err(e) => {
                         tracing::warn!(
                             collection = %name,
-                            vector_id = id,
-                            "failed to add vector to HNSW index: {e}"
+                            error = %e,
+                            "plain HNSW bulk_add_with_lsn failed; falling back to legacy sequential path"
                         );
+                        // Legacy fallback: fresh empty HNSW, serial add loop.
+                        let hnsw_index = HnswIndex::with_defaults(dimension, distance_metric);
+                        for (id, data, _metadata) in vectors {
+                            if let Err(e) = hnsw_index.add(*id, data) {
+                                tracing::warn!(
+                                    collection = %name,
+                                    vector_id = id,
+                                    "failed to add vector to HNSW index: {e}"
+                                );
+                            }
+                        }
+                        Box::new(hnsw_index)
                     }
                 }
-                Box::new(hnsw_index)
             }
         };
 
-        if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
+        if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
             &mut graph, &*index, &vector_ids, &vector_map, 10,
         ) {
-            tracing::warn!(collection = %name, "graph compute_batch failed: {}", e);
+            tracing::warn!(collection = %name, "graph compute_batch_parallel failed: {}", e);
         }
 
         (index, graph)
@@ -1004,29 +1420,39 @@ impl AppState {
     /// Checks which operations were deferred (index, metadata, graph) and
     /// rebuilds each one. Returns statistics about the optimization.
     pub fn optimize_collection(&self, collection_name: &str, rebuild_graph: bool) -> Result<OptimizeResult, String> {
+        enum WorkOutcome {
+            NoOp,
+            Done(u64),
+        }
+
         let start = Instant::now();
 
-        // Check collection exists and get deferred flags.
-        let (need_index, need_metadata, need_graph) = {
-            let collections = self.collections.read();
-            let coll = collections.get(collection_name)
-                .ok_or_else(|| format!("collection '{}' not found", collection_name))?;
+        // Read flags, decide, perform the rebuild, and clear flags all under one per-collection
+        // write lock so that concurrent setters (bulk_insert, upsert, graph ops, which
+        // store-true under a per-collection read lock) cannot race with the read-decide-act-clear
+        // sequence on the deferred_* atomics. The map read lock is released as soon as the
+        // per-collection handle is cloned out.
+        let mut need_index = false;
+        let mut need_metadata = false;
+        let mut need_graph = false;
+        // Tracks whether we transitioned status to Optimizing; only then should we reset it.
+        let mut status_taken = false;
+        let coll_handle = self
+            .collection_handle(collection_name)
+            .ok_or_else(|| format!("collection '{}' not found", collection_name))?;
+        let result = (|| -> Result<WorkOutcome, String> {
+            let mut coll = metered_write(&coll_handle);
 
-            let need_index = coll.deferred_index.load(Ordering::Acquire);
-            let need_metadata = coll.deferred_metadata.load(Ordering::Acquire);
-            let need_graph = coll.deferred_graph.load(Ordering::Acquire);
+            need_index = coll.deferred_index.load(Ordering::Acquire);
+            need_metadata = coll.deferred_metadata.load(Ordering::Acquire);
+            need_graph = coll.deferred_graph.load(Ordering::Acquire);
             let has_quantization = coll.config.quantization_config.is_some();
 
             // Nothing to do if no deferred ops, or only graph is deferred but rebuild_graph is false.
             // Exception: quantized collections always need optimization to train the quantizer.
             let effective_graph = need_graph && rebuild_graph;
             if !need_index && !need_metadata && !effective_graph && !has_quantization {
-                return Ok(OptimizeResult {
-                    status: "already_optimized".to_string(),
-                    message: "nothing to optimize".to_string(),
-                    duration_ms: 0,
-                    vectors_processed: 0,
-                });
+                return Ok(WorkOutcome::NoOp);
             }
 
             // Check not already optimizing.
@@ -1045,15 +1471,7 @@ impl AppState {
                 let mut status = coll.status.write().unwrap();
                 *status = CollectionStatus::Optimizing;
             }
-
-            (need_index, need_metadata, need_graph)
-        };
-
-        // Perform the rebuild under a write lock.
-        let result = (|| -> Result<u64, String> {
-            let mut collections = self.collections.write();
-            let coll = collections.get_mut(collection_name)
-                .ok_or_else(|| format!("collection '{}' not found", collection_name))?;
+            status_taken = true;
 
             let vectors_processed = coll.store.len() as u64;
 
@@ -1139,7 +1557,11 @@ impl AppState {
             if need_graph && rebuild_graph {
                 let vector_data = coll.index.iter_vectors_owned();
                 let vector_ids: Vec<u64> = vector_data.iter().map(|(id, _)| *id).collect();
-                let vector_map: HashMap<u64, Vec<f32>> = vector_data.into_iter().collect();
+                // Arc-wrap so compute_batch_parallel can share clones across threads.
+                let vector_map: HashMap<u64, Arc<Vec<f32>>> = vector_data
+                    .into_iter()
+                    .map(|(id, v)| (id, Arc::new(v)))
+                    .collect();
 
                 // Reset graph and rebuild.
                 let threshold = coll.config.default_similarity_threshold.unwrap_or(0.7);
@@ -1147,7 +1569,7 @@ impl AppState {
                     if threshold > 0.0 { threshold } else { 0.7 },
                     coll.config.distance_metric,
                 );
-                if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
+                if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
                     &mut new_graph, coll.index.as_vector_index(), &vector_ids, &vector_map, 10,
                 ) {
                     tracing::warn!(
@@ -1166,13 +1588,25 @@ impl AppState {
                 );
             }
 
-            Ok(vectors_processed)
+            Ok(WorkOutcome::Done(vectors_processed))
         })();
 
-        // Always reset status back from optimizing (even on error).
-        {
-            let collections = self.collections.read();
-            if let Some(coll) = collections.get(collection_name) {
+        // Nothing to optimize; status was never flipped, do not touch it.
+        if matches!(result, Ok(WorkOutcome::NoOp)) {
+            return Ok(OptimizeResult {
+                status: "already_optimized".to_string(),
+                message: "nothing to optimize".to_string(),
+                duration_ms: 0,
+                vectors_processed: 0,
+            });
+        }
+
+        // Reset status back from Optimizing only if we transitioned it (preserves caller status on
+        // the already-optimizing error path, matching pre-fix behavior). Re-acquire the
+        // per-collection read lock to flip the inner status; no map write needed.
+        if status_taken {
+            if let Some(handle) = self.collection_handle(collection_name) {
+                let coll = metered_read(&handle);
                 let mut status = coll.status.write().unwrap();
                 *status = CollectionStatus::Ready;
             }
@@ -1206,7 +1640,7 @@ impl AppState {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
-            Ok(vectors_processed) => {
+            Ok(WorkOutcome::Done(vectors_processed)) => {
                 let mut parts = Vec::new();
                 if need_index { parts.push("HNSW index"); }
                 if need_metadata { parts.push("metadata indexes"); }
@@ -1219,9 +1653,105 @@ impl AppState {
                     vectors_processed,
                 })
             }
+            Ok(WorkOutcome::NoOp) => unreachable!("NoOp handled by early return above"),
             Err(e) => Err(e),
         }
     }
+
+    /// Snapshot of the global recovery summary captured during boot.
+    /// Returned by the `/recovery_status` endpoint. `paths` carries the
+    /// per-collection breakdown so operators can spot a single collection
+    /// that took the slow path even when most boot fast.
+    pub fn recovery_status_snapshot(&self) -> RecoveryStatusSnapshot {
+        let path = RecoveryStatus::from_u8(self.recovery_path.load(Ordering::Acquire));
+        let elapsed_secs = self.recovery_elapsed_secs.load(Ordering::Acquire);
+        let paths: HashMap<String, RecoveryStatus> = {
+            let rp = self.recovery_paths.read();
+            rp.clone()
+        };
+        RecoveryStatusSnapshot {
+            path,
+            elapsed_secs,
+            paths,
+        }
+    }
+
+    /// Read the in-memory persistence cursors for a collection. Returns
+    /// `Ok(None)` when the collection exists but its WAL meta could not
+    /// be loaded (a fresh collection that has not yet written wal_meta.json
+    /// hits this path). Errors are surfaced as `Err` so callers can map to
+    /// the right transport-level status.
+    pub fn persistence_status(
+        &self,
+        name: &str,
+    ) -> Result<PersistenceStatus, String> {
+        let (collection_dir, current_lsn) = {
+            let cm = self.collection_manager.read();
+            let coll = cm
+                .get_collection(name)
+                .map_err(|e| format!("collection '{}' not found: {}", name, e))?;
+            (coll.collection_dir().to_path_buf(), coll.current_lsn())
+        };
+        let meta = vf_storage::wal::load_wal_meta(&collection_dir)
+            .map_err(|e| format!("failed to load wal_meta: {}", e))?;
+        Ok(PersistenceStatus {
+            last_snapshot_lsn: meta.last_snapshot_lsn,
+            current_lsn,
+            next_lsn: meta.next_lsn,
+        })
+    }
+
+    /// Read the per-collection lock-contention counters. Lock-free
+    /// (atomic loads under a brief per-collection read lock to access
+    /// the inner counters); the read itself bumps the read counter via
+    /// `metered_read`, which is fine because it is what callers would
+    /// observe in production.
+    pub fn collection_metrics(
+        &self,
+        name: &str,
+    ) -> Result<CollectionMetricsSnapshot, String> {
+        let handle = self
+            .collection_handle(name)
+            .ok_or_else(|| format!("collection '{}' not found", name))?;
+        let coll = metered_read(&handle);
+        Ok(CollectionMetricsSnapshot {
+            map_lock_acquisitions: self.map_lock_acquisitions.load(Ordering::Relaxed),
+            collection_read_acquisitions: coll
+                .collection_read_acquisitions
+                .load(Ordering::Relaxed),
+            collection_write_acquisitions: coll
+                .collection_write_acquisitions
+                .load(Ordering::Relaxed),
+            total_blocked_microseconds: coll
+                .total_blocked_microseconds
+                .load(Ordering::Relaxed),
+        })
+    }
+}
+
+/// Aggregated recovery-status view returned by `/recovery_status`.
+#[derive(Debug, Clone)]
+pub struct RecoveryStatusSnapshot {
+    pub path: RecoveryStatus,
+    pub elapsed_secs: u64,
+    pub paths: HashMap<String, RecoveryStatus>,
+}
+
+/// Persistence cursors for a single collection.
+#[derive(Debug, Clone, Copy)]
+pub struct PersistenceStatus {
+    pub last_snapshot_lsn: u64,
+    pub current_lsn: u64,
+    pub next_lsn: u64,
+}
+
+/// Lock-contention counters for a single collection.
+#[derive(Debug, Clone, Copy)]
+pub struct CollectionMetricsSnapshot {
+    pub map_lock_acquisitions: u64,
+    pub collection_read_acquisitions: u64,
+    pub collection_write_acquisitions: u64,
+    pub total_blocked_microseconds: u64,
 }
 
 #[cfg(test)]

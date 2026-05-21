@@ -4,8 +4,10 @@
 // Change License: MIT
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use vf_core::types::{DistanceMetricType, VectorId};
+use rayon::prelude::*;
+use vf_core::types::{DistanceMetricType, ScoredResult, VectorId};
 use vf_index::traits::VectorIndex;
 
 use crate::error::GraphError;
@@ -110,6 +112,81 @@ impl RelationshipComputer {
         for &id in vector_ids {
             if let Some(data) = vectors.get(&id) {
                 total += Self::compute_for_vector(graph, index, id, data, k)?;
+            }
+        }
+
+        Ok(total)
+    }
+
+    // Result is deterministic per (initial graph, input slice); search is parallel, mutation is serial.
+    // Vectors arrive as Arc so the bulk-insert path keeps a single heap allocation per row across
+    // the index call and this graph compute step.
+    pub fn compute_batch_parallel(
+        graph: &mut VirtualGraph,
+        index: &dyn VectorIndex,
+        vector_ids: &[VectorId],
+        vectors: &HashMap<VectorId, Arc<Vec<f32>>>,
+        k: usize,
+    ) -> Result<usize, GraphError> {
+        // Parallel phase: per-vector neighbor search. No graph mutation here.
+        let searched: Vec<(VectorId, Option<Vec<ScoredResult>>)> = vector_ids
+            .par_iter()
+            .map(|&id| match vectors.get(&id) {
+                Some(data) => index.search(data.as_slice(), k, None).map(|r| (id, Some(r))),
+                None => Ok((id, None)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Serial mutation phase: walk results in input order, mirror compute_for_vector edge logic.
+        let metric = graph.config().distance_metric;
+        let max_edges = graph.config().max_edges_per_node;
+        let mut total = 0usize;
+
+        for (vector_id, maybe_results) in searched {
+            let Some(results) = maybe_results else {
+                continue;
+            };
+
+            graph.add_node(vector_id);
+            let threshold = graph.resolve_threshold(vector_id, None);
+
+            for result in results {
+                if result.id == vector_id {
+                    continue;
+                }
+
+                let similarity = distance_to_similarity(result.score, metric);
+                if similarity < threshold {
+                    continue;
+                }
+
+                let existing = graph
+                    .get_node(vector_id)
+                    .and_then(|node| node.edges.iter().find(|e| e.target == result.id))
+                    .map(|e| e.similarity);
+
+                let at_capacity = graph
+                    .get_node(vector_id)
+                    .map(|n| n.edges.len() >= max_edges)
+                    .unwrap_or(false);
+
+                if at_capacity {
+                    let min_sim = graph
+                        .get_node(vector_id)
+                        .and_then(|n| n.edges.last())
+                        .map(|e| e.similarity);
+                    if let Some(min) = min_sim {
+                        if similarity <= min && existing.is_none() {
+                            continue;
+                        }
+                    }
+                }
+
+                let is_new = existing.is_none();
+                graph.add_edge(vector_id, result.id, similarity);
+                if is_new {
+                    total += 1;
+                }
             }
         }
 

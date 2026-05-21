@@ -160,49 +160,51 @@ unsafe fn avx2_asymmetric_l2(
     min_vals: &[f32],
     scales: &[f32],
 ) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let dim = query.len();
-    let chunks = dim / 8;
-    let mut acc = _mm256_setzero_ps();
+        let dim = query.len();
+        let chunks = dim / 8;
+        let mut acc = _mm256_setzero_ps();
 
-    for i in 0..chunks {
-        let offset = i * 8;
+        for i in 0..chunks {
+            let offset = i * 8;
 
-        // Load 8 u8 values, zero-extend to i32, convert to f32
-        let code_bytes = _mm_loadl_epi64(code.as_ptr().add(offset) as *const __m128i);
-        let code_i32 = _mm256_cvtepu8_epi32(code_bytes);
-        let code_f32 = _mm256_cvtepi32_ps(code_i32);
+            // Load 8 u8 values, zero-extend to i32, convert to f32
+            let code_bytes = _mm_loadl_epi64(code.as_ptr().add(offset) as *const __m128i);
+            let code_i32 = _mm256_cvtepu8_epi32(code_bytes);
+            let code_f32 = _mm256_cvtepi32_ps(code_i32);
 
-        // Load scales and min_vals
-        let s = _mm256_loadu_ps(scales.as_ptr().add(offset));
-        let m = _mm256_loadu_ps(min_vals.as_ptr().add(offset));
+            // Load scales and min_vals
+            let s = _mm256_loadu_ps(scales.as_ptr().add(offset));
+            let m = _mm256_loadu_ps(min_vals.as_ptr().add(offset));
 
-        // Dequantize: code * scale + min
-        let dequant = _mm256_add_ps(_mm256_mul_ps(code_f32, s), m);
+            // Dequantize: code * scale + min
+            let dequant = _mm256_add_ps(_mm256_mul_ps(code_f32, s), m);
 
-        // Load query, compute diff, accumulate squared diff
-        let q = _mm256_loadu_ps(query.as_ptr().add(offset));
-        let diff = _mm256_sub_ps(q, dequant);
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+            // Load query, compute diff, accumulate squared diff
+            let q = _mm256_loadu_ps(query.as_ptr().add(offset));
+            let diff = _mm256_sub_ps(q, dequant);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+        }
+
+        // Horizontal sum of acc
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let lo = _mm256_castps256_ps128(acc);
+        let sum128 = _mm_add_ps(lo, hi);
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+        let mut result = _mm_cvtss_f32(sum32);
+
+        // Handle tail dimensions
+        for d in (chunks * 8)..dim {
+            let dequant = code[d] as f32 * scales[d] + min_vals[d];
+            let diff = query[d] - dequant;
+            result += diff * diff;
+        }
+
+        result.sqrt()
     }
-
-    // Horizontal sum of acc
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let lo = _mm256_castps256_ps128(acc);
-    let sum128 = _mm_add_ps(lo, hi);
-    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
-    let mut result = _mm_cvtss_f32(sum32);
-
-    // Handle tail dimensions
-    for d in (chunks * 8)..dim {
-        let dequant = code[d] as f32 * scales[d] + min_vals[d];
-        let diff = query[d] - dequant;
-        result += diff * diff;
-    }
-
-    result.sqrt()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -213,45 +215,47 @@ unsafe fn avx2_asymmetric_dot(
     min_vals: &[f32],
     scales: &[f32],
 ) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let dim = query.len();
-    let chunks = dim / 8;
-    let mut acc = _mm256_setzero_ps();
+        let dim = query.len();
+        let chunks = dim / 8;
+        let mut acc = _mm256_setzero_ps();
 
-    for i in 0..chunks {
-        let offset = i * 8;
+        for i in 0..chunks {
+            let offset = i * 8;
 
-        let code_bytes = _mm_loadl_epi64(code.as_ptr().add(offset) as *const __m128i);
-        let code_i32 = _mm256_cvtepu8_epi32(code_bytes);
-        let code_f32 = _mm256_cvtepi32_ps(code_i32);
+            let code_bytes = _mm_loadl_epi64(code.as_ptr().add(offset) as *const __m128i);
+            let code_i32 = _mm256_cvtepu8_epi32(code_bytes);
+            let code_f32 = _mm256_cvtepi32_ps(code_i32);
 
-        let s = _mm256_loadu_ps(scales.as_ptr().add(offset));
-        let m = _mm256_loadu_ps(min_vals.as_ptr().add(offset));
+            let s = _mm256_loadu_ps(scales.as_ptr().add(offset));
+            let m = _mm256_loadu_ps(min_vals.as_ptr().add(offset));
 
-        // Dequantize: code * scale + min
-        let dequant = _mm256_add_ps(_mm256_mul_ps(code_f32, s), m);
+            // Dequantize: code * scale + min
+            let dequant = _mm256_add_ps(_mm256_mul_ps(code_f32, s), m);
 
-        // Accumulate query * dequant
-        let q = _mm256_loadu_ps(query.as_ptr().add(offset));
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(q, dequant));
+            // Accumulate query * dequant
+            let q = _mm256_loadu_ps(query.as_ptr().add(offset));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(q, dequant));
+        }
+
+        // Horizontal sum
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let lo = _mm256_castps256_ps128(acc);
+        let sum128 = _mm_add_ps(lo, hi);
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+        let mut dot = _mm_cvtss_f32(sum32);
+
+        // Handle tail
+        for d in (chunks * 8)..dim {
+            let dequant = code[d] as f32 * scales[d] + min_vals[d];
+            dot += query[d] * dequant;
+        }
+
+        -dot
     }
-
-    // Horizontal sum
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let lo = _mm256_castps256_ps128(acc);
-    let sum128 = _mm_add_ps(lo, hi);
-    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
-    let mut dot = _mm_cvtss_f32(sum32);
-
-    // Handle tail
-    for d in (chunks * 8)..dim {
-        let dequant = code[d] as f32 * scales[d] + min_vals[d];
-        dot += query[d] * dequant;
-    }
-
-    -dot
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -262,54 +266,56 @@ unsafe fn avx2_asymmetric_cosine(
     min_vals: &[f32],
     scales: &[f32],
 ) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let dim = query.len();
-    let chunks = dim / 8;
-    let mut dot_acc = _mm256_setzero_ps();
-    let mut nq_acc = _mm256_setzero_ps();
-    let mut nc_acc = _mm256_setzero_ps();
+        let dim = query.len();
+        let chunks = dim / 8;
+        let mut dot_acc = _mm256_setzero_ps();
+        let mut nq_acc = _mm256_setzero_ps();
+        let mut nc_acc = _mm256_setzero_ps();
 
-    for i in 0..chunks {
-        let offset = i * 8;
+        for i in 0..chunks {
+            let offset = i * 8;
 
-        let code_bytes = _mm_loadl_epi64(code.as_ptr().add(offset) as *const __m128i);
-        let code_i32 = _mm256_cvtepu8_epi32(code_bytes);
-        let code_f32 = _mm256_cvtepi32_ps(code_i32);
+            let code_bytes = _mm_loadl_epi64(code.as_ptr().add(offset) as *const __m128i);
+            let code_i32 = _mm256_cvtepu8_epi32(code_bytes);
+            let code_f32 = _mm256_cvtepi32_ps(code_i32);
 
-        let s = _mm256_loadu_ps(scales.as_ptr().add(offset));
-        let m = _mm256_loadu_ps(min_vals.as_ptr().add(offset));
+            let s = _mm256_loadu_ps(scales.as_ptr().add(offset));
+            let m = _mm256_loadu_ps(min_vals.as_ptr().add(offset));
 
-        let dequant = _mm256_add_ps(_mm256_mul_ps(code_f32, s), m);
-        let q = _mm256_loadu_ps(query.as_ptr().add(offset));
+            let dequant = _mm256_add_ps(_mm256_mul_ps(code_f32, s), m);
+            let q = _mm256_loadu_ps(query.as_ptr().add(offset));
 
-        // dot += q * dequant
-        dot_acc = _mm256_add_ps(dot_acc, _mm256_mul_ps(q, dequant));
-        // norm_q += q * q
-        nq_acc = _mm256_add_ps(nq_acc, _mm256_mul_ps(q, q));
-        // norm_c += dequant * dequant
-        nc_acc = _mm256_add_ps(nc_acc, _mm256_mul_ps(dequant, dequant));
-    }
+            // dot += q * dequant
+            dot_acc = _mm256_add_ps(dot_acc, _mm256_mul_ps(q, dequant));
+            // norm_q += q * q
+            nq_acc = _mm256_add_ps(nq_acc, _mm256_mul_ps(q, q));
+            // norm_c += dequant * dequant
+            nc_acc = _mm256_add_ps(nc_acc, _mm256_mul_ps(dequant, dequant));
+        }
 
-    // Horizontal sums
-    let dot = avx2_hsum(dot_acc);
-    let norm_q = avx2_hsum(nq_acc);
-    let norm_c = avx2_hsum(nc_acc);
+        // Horizontal sums
+        let dot = avx2_hsum(dot_acc);
+        let norm_q = avx2_hsum(nq_acc);
+        let norm_c = avx2_hsum(nc_acc);
 
-    // Tail
-    let (mut dot, mut norm_q, mut norm_c) = (dot, norm_q, norm_c);
-    for d in (chunks * 8)..dim {
-        let dequant = code[d] as f32 * scales[d] + min_vals[d];
-        dot += query[d] * dequant;
-        norm_q += query[d] * query[d];
-        norm_c += dequant * dequant;
-    }
+        // Tail
+        let (mut dot, mut norm_q, mut norm_c) = (dot, norm_q, norm_c);
+        for d in (chunks * 8)..dim {
+            let dequant = code[d] as f32 * scales[d] + min_vals[d];
+            dot += query[d] * dequant;
+            norm_q += query[d] * query[d];
+            norm_c += dequant * dequant;
+        }
 
-    let denom = (norm_q * norm_c).sqrt();
-    if denom == 0.0 {
-        1.0
-    } else {
-        1.0 - dot / denom
+        let denom = (norm_q * norm_c).sqrt();
+        if denom == 0.0 {
+            1.0
+        } else {
+            1.0 - dot / denom
+        }
     }
 }
 
@@ -318,13 +324,15 @@ unsafe fn avx2_asymmetric_cosine(
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn avx2_hsum(v: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(lo, hi);
-    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
-    _mm_cvtss_f32(sum32)
+    unsafe {
+        use std::arch::x86_64::*;
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let sum128 = _mm_add_ps(lo, hi);
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+        _mm_cvtss_f32(sum32)
+    }
 }
 
 // ==========================================================================

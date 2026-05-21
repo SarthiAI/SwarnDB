@@ -8,6 +8,10 @@ service CollectionService {
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
   rpc GetCollection(GetCollectionRequest) returns (GetCollectionResponse);
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc GetRecoveryStatus(GetRecoveryStatusRequest) returns (GetRecoveryStatusResponse);
+  rpc SnapshotCollection(SnapshotCollectionRequest) returns (SnapshotCollectionResponse);
+  rpc GetPersistenceStatus(GetPersistenceStatusRequest) returns (GetPersistenceStatusResponse);
+  rpc GetCollectionMetrics(GetCollectionMetricsRequest) returns (GetCollectionMetricsResponse);
 }
 
 message ScalarQuantization {
@@ -28,6 +32,10 @@ message CreateCollectionRequest {
   float default_threshold = 4;
   uint64 max_vectors = 5;
   QuantizationConfig quantization = 6;
+  // Optional HNSW build parameter; when set, overrides the server default for m.
+  optional uint32 m = 7;
+  // Optional HNSW build parameter; when set, overrides the server default for ef_construction.
+  optional uint32 ef_construction = 8;
 }
 
 message CreateCollectionResponse {
@@ -61,4 +69,62 @@ message ListCollectionsRequest {}
 
 message ListCollectionsResponse {
   repeated GetCollectionResponse collections = 1;
+}
+
+// RecoveryPath mirrors the in-memory boot-time recovery strategy taken for
+// a collection. Unknown is reported for collections still loading or whose
+// path has not yet been recorded. Variant names are kept short so prost
+// generates the matching short Rust variant names without prefix stripping.
+enum RecoveryPath {
+  RECOVERY_UNKNOWN = 0;
+  RECOVERY_CLEAN_SHUTDOWN = 1;
+  RECOVERY_INCREMENTAL_REPLAY = 2;
+  RECOVERY_FULL_REBUILD = 3;
+}
+
+message GetRecoveryStatusRequest {}
+
+message CollectionRecoveryEntry {
+  string name = 1;
+  RecoveryPath path = 2;
+}
+
+message GetRecoveryStatusResponse {
+  // Global recovery elapsed seconds (wall clock from boot recovery start).
+  uint64 elapsed_secs = 1;
+  // Per-collection recovery path map. Empty until at least one collection
+  // has finished boot recovery.
+  repeated CollectionRecoveryEntry collections = 2;
+  // Worst-case recovery path across all collections (summary). Mirrors the
+  // top-level `path` field returned by the REST /recovery_status endpoint.
+  RecoveryPath path = 3;
+}
+
+message SnapshotCollectionRequest {
+  string name = 1;
+}
+
+message SnapshotCollectionResponse {
+  uint64 last_snapshot_lsn = 1;
+}
+
+message GetPersistenceStatusRequest {
+  string name = 1;
+}
+
+message GetPersistenceStatusResponse {
+  uint64 last_snapshot_lsn = 1;
+  uint64 current_lsn = 2;
+  uint64 next_lsn = 3;
+}
+
+message GetCollectionMetricsRequest {
+  string name = 1;
+}
+
+message GetCollectionMetricsResponse {
+  uint64 map_lock_acquisitions = 1;
+  uint64 collection_read_acquisitions = 2;
+  uint64 collection_write_acquisitions = 3;
+  uint64 total_blocked_microseconds = 4;
 }

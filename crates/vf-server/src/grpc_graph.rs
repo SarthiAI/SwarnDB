@@ -14,7 +14,14 @@ use crate::proto::swarndb::v1::{
     GetRelatedRequest, GetRelatedResponse, GraphEdge, SetThresholdRequest, SetThresholdResponse,
     TraversalNode, TraverseRequest, TraverseResponse,
 };
-use crate::state::AppState;
+use crate::state::{metered_read, metered_write, AppState, CollectionAvailability};
+
+fn status_from_availability(avail: CollectionAvailability) -> Status {
+    match avail {
+        CollectionAvailability::Recovering { .. } => Status::unavailable(avail.user_message()),
+        CollectionAvailability::NotFound { .. } => Status::not_found(avail.user_message()),
+    }
+}
 
 pub struct GraphServiceImpl {
     state: AppState,
@@ -34,12 +41,14 @@ impl GraphService for GraphServiceImpl {
     ) -> Result<Response<GetRelatedResponse>, Status> {
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| {
-                Status::not_found(format!("collection '{}' not found", req.collection))
-            })?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let threshold = if req.threshold > 0.0 {
             Some(req.threshold)
@@ -75,12 +84,14 @@ impl GraphService for GraphServiceImpl {
     ) -> Result<Response<TraverseResponse>, Status> {
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| {
-                Status::not_found(format!("collection '{}' not found", req.collection))
-            })?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let threshold = if req.threshold > 0.0 {
             Some(req.threshold)
@@ -123,12 +134,14 @@ impl GraphService for GraphServiceImpl {
     ) -> Result<Response<SetThresholdResponse>, Status> {
         let req = request.into_inner();
 
-        let mut collections = self.state.collections.write();
-        let collection = collections
-            .get_mut(&req.collection)
-            .ok_or_else(|| {
-                Status::not_found(format!("collection '{}' not found", req.collection))
-            })?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let mut collection = metered_write(&coll_handle);
 
         if req.vector_id == 0 {
             // Update collection-level default threshold

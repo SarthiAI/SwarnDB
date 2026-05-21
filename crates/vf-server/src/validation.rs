@@ -308,7 +308,8 @@ pub fn validate_batch_lock_size(
 
 /// Validates the wal_flush_every parameter for bulk insert operations.
 ///
-/// Logs a WARN when value is 0 (WAL disabled) and an INFO when value > 1 (batched).
+/// Logs an INFO when value > 1 (batched cadence). Value 0 means "default
+/// cadence" (per-item WAL write) and is silent.
 pub fn validate_wal_flush_every(
     n: u32,
     max_wal_flush_interval: u32,
@@ -319,9 +320,7 @@ pub fn validate_wal_flush_every(
             max: max_wal_flush_interval,
         });
     }
-    if n == 0 {
-        tracing::warn!("WAL disabled (wal_flush_every=0), data loss possible on crash");
-    } else if n > 1 {
+    if n > 1 {
         tracing::info!(wal_flush_every = n, "WAL batched every {} vectors", n);
     }
     Ok(())
@@ -386,6 +385,20 @@ pub fn validate_bulk_insert_options(
 /// against OOM from oversized payloads.
 pub fn request_size_limit_layer(max_bytes: usize) -> DefaultBodyLimit {
     DefaultBodyLimit::max(max_bytes)
+}
+
+/// Resolves the request body byte budget for the REST router.
+///
+/// Precedence: `SWARNDB_MAX_REQUEST_BODY_BYTES` env var, then the validation
+/// default. Returning a single value lets the router attach exactly one
+/// `DefaultBodyLimit` layer without threading the full `ValidationConfig`
+/// through `AppState`.
+pub fn request_body_limit_bytes() -> usize {
+    std::env::var("SWARNDB_MAX_REQUEST_BODY_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(default_max_request_body_bytes)
 }
 
 #[cfg(test)]

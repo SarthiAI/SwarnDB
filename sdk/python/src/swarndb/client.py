@@ -7,9 +7,12 @@ operations behind a single connection-managed interface.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Optional, Sequence, Tuple
+import urllib.error
+import urllib.request
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 
 import grpc
 
@@ -26,11 +29,13 @@ from swarndb.exceptions import (
     SwarnDBError,
     VectorNotFoundError,
 )
+from swarndb._proto import collection_pb2
 from swarndb._proto import collection_pb2_grpc
 from swarndb._proto import vector_pb2_grpc
 from swarndb._proto import search_pb2_grpc
 from swarndb._proto import graph_pb2_grpc
 from swarndb._proto import vector_math_pb2_grpc
+from swarndb.types import HealthStatus, ReadinessStatus, RecoveryStatus
 
 if TYPE_CHECKING:
     from swarndb.collections import CollectionAPI
@@ -41,11 +46,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 128 MB ceiling: headroom above server default (64 MB) so operators can raise SWARNDB_MAX_REQUEST_BODY_BYTES.
+_DEFAULT_MAX_MESSAGE_BYTES = 128 * 1024 * 1024
+
+# Default REST port; mirrors the server's default_rest_port in config.rs.
+_DEFAULT_REST_PORT = 8080
+
 # gRPC status codes that are considered transient and eligible for retry.
 _RETRYABLE_CODES = frozenset({
     grpc.StatusCode.UNAVAILABLE,
     grpc.StatusCode.DEADLINE_EXCEEDED,
 })
+
+# Map the proto RecoveryPath enum integer to the wire string used by the REST
+# /recovery_status endpoint. Keeps the SDK return value identical regardless of
+# which transport carried the response.
+_RECOVERY_PATH_NAMES = {
+    0: "Unknown",
+    1: "CleanShutdown",
+    2: "IncrementalReplay",
+    3: "FullRebuild",
+}
+
+
+def _recovery_path_name(value: int) -> str:
+    return _RECOVERY_PATH_NAMES.get(int(value), "Unknown")
 
 
 class _AuthInterceptor(grpc.UnaryUnaryClientInterceptor):
@@ -125,9 +150,11 @@ class SwarnDBClient:
         retry_delay: float = 0.5,
         timeout: float = 30.0,
         options: Optional[Sequence[Tuple[str, Any]]] = None,
+        rest_port: int = _DEFAULT_REST_PORT,
     ) -> None:
         self._host = host
         self._port = port
+        self._rest_port = rest_port
         self._api_key = api_key
         self._secure = secure
         self._max_retries = max_retries
@@ -135,7 +162,12 @@ class SwarnDBClient:
         self._timeout = timeout
 
         target = f"{host}:{port}"
-        channel_options = list(options) if options else []
+        channel_options: list[Tuple[str, Any]] = [
+            ("grpc.max_receive_message_length", _DEFAULT_MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", _DEFAULT_MAX_MESSAGE_BYTES),
+        ]
+        if options:
+            channel_options.extend(options)
 
         # Create channel
         if secure:
@@ -272,6 +304,109 @@ class SwarnDBClient:
     def _translate_error(exc: grpc.RpcError) -> SwarnDBError:
         """Map a gRPC RpcError to the appropriate SwarnDB exception."""
         return _translate_error_fn(exc)
+
+    def _rest_url(self, path: str) -> str:
+        scheme = "https" if self._secure else "http"
+        return f"{scheme}://{self._host}:{self._rest_port}{path}"
+
+    def _rest_probe(self, path: str) -> Tuple[int, Dict[str, Any]]:
+        """GET an HTTP probe endpoint that may legitimately return 503.
+
+        Returns the status code and parsed JSON body. Raises SwarnDBError on
+        transport / auth / quota failures and on unexpected HTTP statuses.
+        """
+        url = self._rest_url(path)
+        req = urllib.request.Request(url, method="GET")
+        if self._api_key:
+            req.add_header("X-API-Key", self._api_key)
+
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                status = resp.getcode()
+                body_bytes = resp.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                body_bytes = exc.read()
+            except Exception:
+                body_bytes = b""
+            if status == 401:
+                raise AuthenticationError(
+                    message="authentication failed",
+                    details=body_bytes.decode("utf-8", errors="replace") or None,
+                ) from exc
+            if status != 503:
+                raise SwarnDBError(
+                    message=f"HTTP {status} from {path}",
+                    details=body_bytes.decode("utf-8", errors="replace") or None,
+                ) from exc
+        except urllib.error.URLError as exc:
+            raise ConnectionError(
+                message=f"failed to reach REST endpoint {path}",
+                details=str(exc.reason),
+            ) from exc
+        except OSError as exc:
+            raise ConnectionError(
+                message=f"failed to reach REST endpoint {path}",
+                details=str(exc),
+            ) from exc
+
+        try:
+            body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SwarnDBError(
+                message=f"invalid JSON from {path}",
+                details=str(exc),
+            ) from exc
+        if not isinstance(body, dict):
+            body = {}
+        return status, body
+
+    # ------------------------------------------------------------------
+    # Operational endpoints
+    # ------------------------------------------------------------------
+
+    def recovery_status(self) -> RecoveryStatus:
+        """Return the boot recovery snapshot for the server."""
+        request = collection_pb2.GetRecoveryStatusRequest()
+        response = self._call(
+            self._collection_stub.GetRecoveryStatus, request
+        )
+        collections = {
+            entry.name: _recovery_path_name(entry.path)
+            for entry in response.collections
+        }
+        return RecoveryStatus(
+            path=_recovery_path_name(response.path),
+            elapsed_secs=int(response.elapsed_secs),
+            collections=collections,
+        )
+
+    def readyz(self) -> ReadinessStatus:
+        """Return the Kubernetes-style readiness probe result.
+
+        A 503 response is not an error; it maps to ``ready=False`` with the
+        probe body. Transport, auth, or other failures raise ``SwarnDBError``.
+        """
+        status, body = self._rest_probe("/readyz")
+        return ReadinessStatus(
+            ready=status == 200,
+            status=str(body.get("status", "")),
+            checks={k: str(v) for k, v in (body.get("checks") or {}).items()},
+        )
+
+    def healthz(self) -> HealthStatus:
+        """Return the Kubernetes-style liveness probe result.
+
+        A 503 response is not an error; it maps to ``healthy=False`` with the
+        probe body. Transport, auth, or other failures raise ``SwarnDBError``.
+        """
+        status, body = self._rest_probe("/healthz")
+        return HealthStatus(
+            healthy=status == 200,
+            status=str(body.get("status", "")),
+            checks={k: str(v) for k, v in (body.get("checks") or {}).items()},
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle

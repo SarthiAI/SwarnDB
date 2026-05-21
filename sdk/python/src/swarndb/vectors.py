@@ -15,7 +15,17 @@ import grpc
 from swarndb._helpers import _to_proto_vector
 from swarndb._proto import common_pb2, vector_pb2
 from swarndb.exceptions import SwarnDBError, VectorNotFoundError
-from swarndb.types import BulkInsertOptions, BulkInsertResult, VectorRecord
+from swarndb.types import (
+    BulkInsertFromPathRequest,
+    BulkInsertOptions,
+    BulkInsertResult,
+    VectorRecord,
+)
+
+# Re-exported so other modules can import VectorNotFoundError from here if
+# they need to. `vectors.get` no longer raises it for the missing-id case;
+# update/delete still do.
+__all__ = ["VectorAPI", "VectorNotFoundError"]
 
 if TYPE_CHECKING:
     from swarndb.client import SwarnDBClient
@@ -140,7 +150,7 @@ class VectorAPI:
     # Get
     # ------------------------------------------------------------------
 
-    def get(self, collection: str, id: int) -> VectorRecord:
+    def get(self, collection: str, id: int) -> Optional[VectorRecord]:
         """Get a vector by ID.
 
         Args:
@@ -148,18 +158,23 @@ class VectorAPI:
             id: Vector ID to retrieve.
 
         Returns:
-            A VectorRecord with the vector data and metadata.
+            A VectorRecord with the vector data and metadata, or
+            ``None`` if no vector with the given id exists.
 
         Raises:
-            VectorNotFoundError: If the vector does not exist.
+            SwarnDBError: On transport, auth, quota, or other non
+                NotFound failures.
         """
         request = vector_pb2.GetVectorRequest(
             collection=collection,
             id=id,
         )
-        response = self._client._call(
-            self._client._vector_stub.Get, request
-        )
+        try:
+            response = self._client._call(
+                self._client._vector_stub.Get, request
+            )
+        except VectorNotFoundError:
+            return None
         return VectorRecord(
             id=response.id,
             vector=list(response.vector.values),
@@ -246,6 +261,8 @@ class VectorAPI:
         index_mode: Optional[str] = None,
         skip_metadata_index: bool = False,
         parallel_build: bool = False,
+        checkpoint_every: Optional[int] = None,
+        resume_token: Optional[str] = None,
     ) -> BulkInsertResult:
         """Bulk insert vectors using streaming RPC.
 
@@ -282,6 +299,13 @@ class VectorAPI:
                 insert for faster ingestion.
             parallel_build: If True, use parallel HNSW construction
                 (only effective with ``index_mode="deferred"``).
+            checkpoint_every: optional, if non-zero the server writes a
+                checkpoint file every N batches; use the returned
+                resume_token to resume a failed bulk insert. 0 (default)
+                disables checkpoints.
+            resume_token: optional, opaque token from a prior partial bulk
+                insert response; the server validates it against its
+                on-disk checkpoint and skips already-committed batches.
 
         Returns:
             A BulkInsertResult with inserted_count and any errors.
@@ -332,6 +356,8 @@ class VectorAPI:
             index_mode=index_mode,
             skip_metadata_index=skip_metadata_index,
             parallel_build=parallel_build,
+            checkpoint_every=checkpoint_every,
+            resume_token=resume_token,
         )
         use_optimized_rpc = options.has_non_defaults()
 
@@ -375,6 +401,8 @@ class VectorAPI:
                     index_mode=options.index_mode or "",
                     skip_metadata_index=options.skip_metadata_index,
                     parallel_build=options.parallel_build,
+                    checkpoint_every=options.checkpoint_every or 0,
+                    resume_token=options.resume_token or "",
                 )
             )
             yield options_msg
@@ -396,7 +424,8 @@ class VectorAPI:
                         "BulkInsert with options: batch_lock_size=%s, "
                         "defer_graph=%s, wal_flush_every=%s, "
                         "ef_construction=%s, index_mode=%s, "
-                        "skip_metadata_index=%s, parallel_build=%s",
+                        "skip_metadata_index=%s, parallel_build=%s, "
+                        "checkpoint_every=%s, resume_token=%s",
                         options.batch_lock_size,
                         options.defer_graph,
                         options.wal_flush_every,
@@ -404,6 +433,8 @@ class VectorAPI:
                         options.index_mode,
                         options.skip_metadata_index,
                         options.parallel_build,
+                        options.checkpoint_every,
+                        options.resume_token,
                     )
                     response = self._client._vector_stub.BulkInsertWithOptions(
                         _options_request_iterator(),
@@ -419,6 +450,14 @@ class VectorAPI:
                 return BulkInsertResult(
                     inserted_count=response.inserted_count,
                     errors=list(response.errors),
+                    last_completed_batch_idx=getattr(
+                        response, "last_completed_batch_idx", 0
+                    ),
+                    last_committed_lsn=getattr(
+                        response, "last_committed_lsn", 0
+                    ),
+                    resume_token=getattr(response, "resume_token", ""),
+                    assigned_ids=list(getattr(response, "assigned_ids", []) or []),
                 )
             except grpc.RpcError as exc:
                 last_error = exc
@@ -446,3 +485,102 @@ class VectorAPI:
         # Should not reach here, but guard anyway
         assert last_error is not None
         raise self._client._translate_error(last_error) from last_error
+
+    # ------------------------------------------------------------------
+    # Bulk Insert From Path (mmap)
+    # ------------------------------------------------------------------
+
+    def bulk_insert_from_path(
+        self,
+        collection: str,
+        path: str,
+        *,
+        dim: int = 0,
+        expected_count: int = 0,
+        total_count_hint: int = 0,
+        id_start: int = 1,
+        ids_path: str = "",
+        skip_metadata_index: bool = False,
+        index_mode: str = "immediate",
+        ef_construction: int = 0,
+        chunk_size: int = 0,
+    ) -> BulkInsertResult:
+        """Bulk insert vectors from a server-side file via mmap.
+
+        The server memory-maps the file at ``path`` and ingests vectors
+        directly without streaming them over gRPC. Use this for very
+        large ingests where avoiding a client-side allocation matters.
+
+        Args:
+            collection: Target collection name.
+            path: Absolute path to the vector file on the server's
+                local filesystem.
+            dim: Vector dimensionality. Pass 0 to defer to the
+                collection's configured dimension.
+            expected_count: Expected number of vectors in the file. Use
+                0 to let the server infer from file size.
+            total_count_hint: Optional hint for total vectors across
+                multiple bulk inserts; used for capacity planning.
+            id_start: Starting ID for auto-assigned IDs (default 1).
+            ids_path: Optional path to a sidecar file containing explicit
+                IDs (one per vector). Empty string means use auto-assigned
+                IDs starting at ``id_start``.
+            skip_metadata_index: If True, skip metadata indexing during
+                insert for faster ingestion.
+            index_mode: Index build mode: ``"immediate"`` (default) or
+                ``"deferred"`` (build index after all inserts).
+            ef_construction: Optional HNSW ef_construction override for
+                this batch (0 = use collection default).
+            chunk_size: Server-side chunked compact-insert mode. ``0``
+                (default) preserves the existing single-pass behavior.
+                When ``> 0``, the server processes the load in chunks of
+                that many rows and snapshots, prunes the WAL, and
+                releases scratch memory between chunks. This trades
+                insert wall-clock for a lower peak RSS and is intended
+                for memory-tight boxes willing to accept a slower
+                one-time load. Resume mid-call is not supported in this
+                release; callers must restart the full call on failure.
+
+        Returns:
+            A BulkInsertResult with inserted_count, assigned_ids, and
+            any errors.
+
+        Raises:
+            ValueError: If index_mode is not a valid value.
+            SwarnDBError: On transport, auth, quota, or other failures.
+        """
+        if index_mode not in ("immediate", "deferred"):
+            raise ValueError(
+                f"index_mode must be 'immediate' or 'deferred', "
+                f"got {index_mode!r}"
+            )
+
+        request = vector_pb2.BulkInsertFromPathRequest(
+            collection=collection,
+            path=path,
+            dim=dim,
+            expected_count=expected_count,
+            total_count_hint=total_count_hint,
+            id_start=id_start,
+            ids_path=ids_path,
+            skip_metadata_index=skip_metadata_index,
+            index_mode=index_mode,
+            ef_construction=ef_construction,
+            chunk_size=chunk_size,
+        )
+
+        response = self._client._call(
+            self._client._vector_stub.BulkInsertFromPath, request
+        )
+        return BulkInsertResult(
+            inserted_count=response.inserted_count,
+            errors=list(response.errors),
+            last_completed_batch_idx=getattr(
+                response, "last_completed_batch_idx", 0
+            ),
+            last_committed_lsn=getattr(
+                response, "last_committed_lsn", 0
+            ),
+            resume_token=getattr(response, "resume_token", ""),
+            assigned_ids=list(getattr(response, "assigned_ids", []) or []),
+        )

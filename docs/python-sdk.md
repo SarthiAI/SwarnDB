@@ -198,10 +198,16 @@ insert(collection, vector, *, metadata=None, id=0) -> int
 
 ```python
 record = client.vectors.get("products", id=42)
-print(f"ID: {record.id}")
-print(f"Vector: {record.vector[:5]}...")  # first 5 values
-print(f"Metadata: {record.metadata}")
+if record is None:
+    print("Vector 42 not found")
+else:
+    print(f"ID: {record.id}")
+    print(f"Vector: {record.vector[:5]}...")  # first 5 values
+    print(f"Metadata: {record.metadata}")
 ```
+
+`client.vectors.get` returns `None` when no vector with the given id
+exists. Transport, auth, and other failures still raise `SwarnDBError`.
 
 ### Update a Vector
 
@@ -285,6 +291,63 @@ bulk_insert(
 | `index_mode`         | `str`         | `None`   | `"immediate"` or `"deferred"`                        |
 | `skip_metadata_index`| `bool`        | `False`  | Skip metadata indexing during insert                 |
 | `parallel_build`     | `bool`        | `False`  | Parallel HNSW build (requires `index_mode="deferred"`) |
+
+### Bulk Insert From a File
+
+For very large loads where staging vectors as a file is acceptable, the server can ingest directly from a `.npy` or flat `.f32` file on its own filesystem. The server reads the file via memory mapping, so the working memory for the load is bounded by the index being built rather than by the input file size.
+
+```python
+import numpy as np
+
+vectors = np.random.rand(1_000_000, 1536).astype(np.float32)
+np.save("/data/ingest/embeddings.npy", vectors)
+
+result = client.vectors.bulk_insert_from_path(
+    collection="docs",
+    path="/data/ingest/embeddings.npy",
+    dim=1536,
+    expected_count=1_000_000,
+    total_count_hint=1_000_000,
+    index_mode="immediate",
+)
+
+print(f"Inserted {result.inserted_count} vectors")
+print(f"IDs from {result.assigned_ids[0]} to {result.assigned_ids[-1]}")
+```
+
+**Signature:**
+
+```python
+bulk_insert_from_path(
+    collection, path, *,
+    dim=0, expected_count=0, total_count_hint=0,
+    id_start=1, ids_path="",
+    skip_metadata_index=False, index_mode="immediate",
+    ef_construction=0, chunk_size=0,
+) -> BulkInsertResult
+```
+
+**Bulk Insert From Path Options:**
+
+| Parameter             | Type   | Default       | Description                                                                                                                                                                                                                  |
+|-----------------------|--------|---------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `dim`                 | `int`  | `0`           | Vector dimensionality. `0` defers to the collection's configured dimension.                                                                                                                                                  |
+| `expected_count`      | `int`  | `0`           | Expected number of vectors. `0` lets the server infer from file size.                                                                                                                                                        |
+| `total_count_hint`    | `int`  | `0`           | Hint for the total vector count across multiple bulk inserts; used for arena capacity planning.                                                                                                                              |
+| `id_start`            | `int`  | `1`           | Starting ID for auto-assigned IDs.                                                                                                                                                                                           |
+| `ids_path`            | `str`  | `""`          | Optional path to a sidecar file containing explicit IDs (one per vector). Empty string uses auto-assigned IDs starting at `id_start`.                                                                                       |
+| `skip_metadata_index` | `bool` | `False`       | Skip metadata indexing during insert for faster ingestion. Rebuild later via `client.collections.optimize`.                                                                                                                  |
+| `index_mode`          | `str`  | `"immediate"` | `"immediate"` builds the index during insert. `"deferred"` builds it after, via `client.collections.optimize`.                                                                                                              |
+| `ef_construction`     | `int`  | `0`           | HNSW `ef_construction` override for this batch. `0` uses the collection default.                                                                                                                                             |
+| `chunk_size`          | `int`  | `0`           | `0` loads the file in a single pass. A positive value processes the load in chunks of that many rows, snapshotting and releasing scratch memory between chunks; trades wall-clock for a lower peak resident memory footprint. |
+
+**Path and format requirements:**
+
+- The `path` must be absolute and must point to a file the server can read.
+- The path must sit inside one of the directories listed in the server's `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` environment variable, which defaults to `SWARNDB_DATA_DIR`. Paths outside the allowed roots are rejected. Symlinks and `..` traversal are rejected.
+- Supported wire formats: `.npy` (auto-detected via NumPy magic bytes) and flat little-endian `float32` (`.f32`), where the file is `expected_count * dim * 4` bytes.
+
+Resume mid-call is not supported for `bulk_insert_from_path`; on failure, restart the full call. For resumable bulk loads, use streaming `bulk_insert` with `BulkInsertResult.resume_token`.
 
 ### NumPy Integration
 
@@ -834,8 +897,15 @@ with SwarnDBClient(host="localhost", port=50051) as client:
     except CollectionNotFoundError as e:
         print(f"Collection not found: {e.collection_name}")
 
+    # vectors.get returns None for missing ids; it does not raise.
+    record = client.vectors.get("products", id=999999)
+    if record is None:
+        print("Vector missing")
+
+    # VectorNotFoundError is still raised by update / delete when the
+    # target id does not exist.
     try:
-        client.vectors.get("products", id=999999)
+        client.vectors.delete("products", id=999999)
     except VectorNotFoundError as e:
         print(f"Vector missing: {e.vector_id}")
 
@@ -855,7 +925,65 @@ with SwarnDBClient(host="localhost", port=50051) as client:
 
 ---
 
-## 11. Type Reference
+## 11. Operational Endpoints
+
+For deployments behind orchestration (Kubernetes, load balancers, oncall dashboards), SwarnDB exposes a set of operational endpoints reachable from the SDK. The async client mirrors every method below with the same name and the same return type.
+
+### Recovery Status
+
+Returns the server's current boot-recovery snapshot, including the recovery path taken (snapshot only, snapshot plus WAL, full WAL replay, etc.), elapsed time since recovery started, and per-collection recovery path.
+
+```python
+status = client.recovery_status()
+print(status.path)             # e.g. "snapshot_plus_wal"
+print(status.elapsed_secs)     # seconds since recovery began
+for name, path in status.collections.items():
+    print(name, path)
+```
+
+### Per-Collection Persistence Status
+
+Returns the snapshot and WAL LSN state for a single collection. Useful for verifying a recent write has been durably committed before the call returns to the caller.
+
+```python
+ps = client.collections.persistence_status("docs")
+print(ps.last_snapshot_lsn, ps.current_lsn, ps.next_lsn)
+```
+
+### Force a Snapshot
+
+Forces a synchronous snapshot for a collection and returns the LSN written. Useful before deliberate restarts or for taking snapshots on a schedule outside the server's auto-snapshot policy.
+
+```python
+lsn = client.collections.snapshot_collection("docs")
+print(f"snapshot at LSN {lsn}")
+```
+
+### Per-Collection Lock-Contention Metrics
+
+Returns counters for lock acquisitions and total blocked time on a collection, useful for diagnosing contention under concurrent load.
+
+```python
+m = client.collections.metrics("docs")
+print(m.map_lock_acquisitions, m.collection_read_acquisitions)
+print(m.collection_write_acquisitions, m.total_blocked_microseconds)
+```
+
+### Liveness and Readiness Probes
+
+Mirrors the Kubernetes-style `/healthz` and `/readyz` HTTP probes. A 503 from the server is not raised as an exception; it maps to `healthy=False` or `ready=False` on the returned dataclass. Transport, auth, and other failures still raise `SwarnDBError`.
+
+```python
+h = client.healthz()
+print(h.healthy, h.status, h.checks)
+
+r = client.readyz()
+print(r.ready, r.status, r.checks)
+```
+
+---
+
+## 12. Type Reference
 
 All types are frozen dataclasses imported from `swarndb.types`.
 
@@ -913,12 +1041,16 @@ A stored vector with its metadata.
 
 ### BulkInsertResult
 
-Result of a bulk insert operation.
+Result of a bulk insert operation (returned by `bulk_insert` and `bulk_insert_from_path`).
 
-| Field            | Type         | Description                  |
-|------------------|--------------|------------------------------|
-| `inserted_count` | `int`        | Number of vectors inserted   |
-| `errors`         | `list[str]`  | Error messages (if any)      |
+| Field                       | Type         | Description                                                                                              |
+|-----------------------------|--------------|----------------------------------------------------------------------------------------------------------|
+| `inserted_count`            | `int`        | Number of vectors inserted                                                                               |
+| `errors`                    | `list[str]`  | Error messages (one per failed row, empty on full success)                                               |
+| `last_completed_batch_idx`  | `int`        | Index of the last batch fully committed before a partial failure (0 on full success or no batching)      |
+| `last_committed_lsn`        | `int`        | LSN of the last committed write in this operation                                                        |
+| `resume_token`              | `str`        | Opaque token for resuming a streaming bulk insert from the next batch (empty on full success or non-resumable failures) |
+| `assigned_ids`              | `list[int]`  | IDs assigned to inserted vectors, in input order                                                         |
 
 ### OptimizeResult
 
@@ -1023,3 +1155,54 @@ A result from MMR diversity sampling.
 | `id`              | `int`   | Vector ID                      |
 | `relevance_score` | `float` | Relevance to the query         |
 | `mmr_score`       | `float` | Combined MMR score             |
+
+### RecoveryStatus
+
+Server boot-recovery snapshot returned by `client.recovery_status()`.
+
+| Field          | Type             | Description                                                                                  |
+|----------------|------------------|----------------------------------------------------------------------------------------------|
+| `path`         | `str`            | Recovery path taken at boot, for example `"none"`, `"snapshot_only"`, `"snapshot_plus_wal"`, `"full_wal_replay"` |
+| `elapsed_secs` | `int`            | Seconds since recovery began                                                                  |
+| `collections`  | `dict[str, str]` | Per-collection recovery path                                                                  |
+
+### PersistenceStatus
+
+Per-collection persistence and LSN state returned by `client.collections.persistence_status(name)`.
+
+| Field                | Type  | Description                                              |
+|----------------------|-------|----------------------------------------------------------|
+| `last_snapshot_lsn`  | `int` | LSN of the last persisted snapshot                       |
+| `current_lsn`        | `int` | LSN of the most recently durably committed write         |
+| `next_lsn`           | `int` | LSN that the next write will receive                     |
+
+### CollectionMetrics
+
+Per-collection lock-contention counters returned by `client.collections.metrics(name)`.
+
+| Field                            | Type  | Description                                                |
+|----------------------------------|-------|------------------------------------------------------------|
+| `map_lock_acquisitions`          | `int` | Acquisitions of the collection map read lock               |
+| `collection_read_acquisitions`   | `int` | Read-lock acquisitions on this collection                  |
+| `collection_write_acquisitions`  | `int` | Write-lock acquisitions on this collection                 |
+| `total_blocked_microseconds`     | `int` | Total time waited for these locks, in microseconds         |
+
+### ReadinessStatus
+
+Result of the Kubernetes-style readiness probe returned by `client.readyz()`.
+
+| Field    | Type             | Description                                                              |
+|----------|------------------|--------------------------------------------------------------------------|
+| `ready`  | `bool`           | `True` when the server returned 200, `False` on 503                       |
+| `status` | `str`            | Status string from the probe body (`"ready"` or `"not_ready"`)            |
+| `checks` | `dict[str, str]` | Per-check status (e.g. `collections_accessible`, `collections_loaded`)    |
+
+### HealthStatus
+
+Result of the Kubernetes-style liveness probe returned by `client.healthz()`.
+
+| Field      | Type             | Description                                                              |
+|------------|------------------|--------------------------------------------------------------------------|
+| `healthy`  | `bool`           | `True` when the server returned 200, `False` on 503                       |
+| `status`   | `str`            | Status string from the probe body (`"alive"`)                             |
+| `checks`   | `dict[str, str]` | Per-check status, when present                                            |

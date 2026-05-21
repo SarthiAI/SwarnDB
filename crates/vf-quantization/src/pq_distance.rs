@@ -91,53 +91,55 @@ fn scalar_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_pq_distance(flat_tables: &[f32], codes: &[u8], m: usize) -> f32 {
-    use std::arch::x86_64::*;
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let chunks = m / 8;
-    let base_ptr = flat_tables.as_ptr();
+        let chunks = m / 8;
+        let base_ptr = flat_tables.as_ptr();
 
-    let mut sum = _mm256_setzero_ps();
+        let mut sum = _mm256_setzero_ps();
 
-    for chunk in 0..chunks {
-        let offset = chunk * 8;
+        for chunk in 0..chunks {
+            let offset = chunk * 8;
 
-        // Build 8 gather indices: index[j] = (offset + j) * 256 + codes[offset + j]
-        let indices = _mm256_set_epi32(
-            ((offset + 7) * 256 + codes[offset + 7] as usize) as i32,
-            ((offset + 6) * 256 + codes[offset + 6] as usize) as i32,
-            ((offset + 5) * 256 + codes[offset + 5] as usize) as i32,
-            ((offset + 4) * 256 + codes[offset + 4] as usize) as i32,
-            ((offset + 3) * 256 + codes[offset + 3] as usize) as i32,
-            ((offset + 2) * 256 + codes[offset + 2] as usize) as i32,
-            ((offset + 1) * 256 + codes[offset + 1] as usize) as i32,
-            ((offset + 0) * 256 + codes[offset + 0] as usize) as i32,
-        );
+            // Build 8 gather indices: index[j] = (offset + j) * 256 + codes[offset + j]
+            let indices = _mm256_set_epi32(
+                ((offset + 7) * 256 + codes[offset + 7] as usize) as i32,
+                ((offset + 6) * 256 + codes[offset + 6] as usize) as i32,
+                ((offset + 5) * 256 + codes[offset + 5] as usize) as i32,
+                ((offset + 4) * 256 + codes[offset + 4] as usize) as i32,
+                ((offset + 3) * 256 + codes[offset + 3] as usize) as i32,
+                ((offset + 2) * 256 + codes[offset + 2] as usize) as i32,
+                ((offset + 1) * 256 + codes[offset + 1] as usize) as i32,
+                ((offset + 0) * 256 + codes[offset + 0] as usize) as i32,
+            );
 
-        // Gather 8 f32 values from the flat table using the computed indices.
-        // Scale = 4 because each element is 4 bytes (f32).
-        let gathered = _mm256_i32gather_ps::<4>(base_ptr, indices);
+            // Gather 8 f32 values from the flat table using the computed indices.
+            // Scale = 4 because each element is 4 bytes (f32).
+            let gathered = _mm256_i32gather_ps::<4>(base_ptr, indices);
 
-        sum = _mm256_add_ps(sum, gathered);
+            sum = _mm256_add_ps(sum, gathered);
+        }
+
+        // Horizontal sum of the 256-bit accumulator.
+        let hi = _mm256_extractf128_ps(sum, 1);
+        let lo = _mm256_castps256_ps128(sum);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        let mut total = _mm_cvtss_f32(result);
+
+        // Scalar tail for remaining subquantizers (m % 8).
+        let tail_start = chunks * 8;
+        for i in tail_start..m {
+            let idx = i * 256 + codes[i] as usize;
+            total += *base_ptr.add(idx);
+        }
+
+        total
     }
-
-    // Horizontal sum of the 256-bit accumulator.
-    let hi = _mm256_extractf128_ps(sum, 1);
-    let lo = _mm256_castps256_ps128(sum);
-    let sum128 = _mm_add_ps(lo, hi);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    let result = _mm_add_ss(sums, shuf2);
-    let mut total = _mm_cvtss_f32(result);
-
-    // Scalar tail for remaining subquantizers (m % 8).
-    let tail_start = chunks * 8;
-    for i in tail_start..m {
-        let idx = i * 256 + codes[i] as usize;
-        total += *base_ptr.add(idx);
-    }
-
-    total
 }
 
 // ---------------------------------------------------------------------------

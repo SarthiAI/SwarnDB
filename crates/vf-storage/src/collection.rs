@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{StorageError, StorageResult};
 use crate::format::{DataTypeFlag, WalOp};
 use crate::segment::{Segment, SegmentWriter};
-use crate::wal::{WalWriter, WalMeta, load_wal_meta, save_wal_meta};
+use crate::wal::{FsyncMode, WalWriter, WalMeta, load_wal_meta, save_wal_meta};
 use vf_core::store::{InMemoryVectorStore, VectorRecord};
 use vf_core::types::{CollectionConfig, DataTypeConfig, Metadata, VectorId};
 use vf_core::vector::VectorData;
@@ -49,7 +49,8 @@ impl Collection {
         fs::create_dir_all(&collection_dir).map_err(StorageError::Io)?;
 
         let wal_path = collection_dir.join("wal.log");
-        let wal = WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE, 1)?;
+        let mut wal = WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE, 1)?;
+        wal.set_fsync_mode(FsyncMode::from_env());
 
         // Persist initial WAL metadata.
         save_wal_meta(&collection_dir, &WalMeta::new(1))?;
@@ -75,11 +76,12 @@ impl Collection {
         let meta = load_wal_meta(collection_dir)?;
 
         let wal_path = collection_dir.join("wal.log");
-        let wal = if wal_path.exists() {
+        let mut wal = if wal_path.exists() {
             WalWriter::open(&wal_path, DEFAULT_WAL_MAX_SIZE, meta.next_lsn)?
         } else {
             WalWriter::create(&wal_path, DEFAULT_WAL_MAX_SIZE, meta.next_lsn)?
         };
+        wal.set_fsync_mode(FsyncMode::from_env());
 
         let memtable = InMemoryVectorStore::new(config.dimension);
 

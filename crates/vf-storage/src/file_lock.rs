@@ -46,6 +46,6 @@ impl ProcessLock {
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
+        let _ = fs2::FileExt::unlock(&self._file);
     }
 }

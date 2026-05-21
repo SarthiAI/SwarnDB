@@ -5,7 +5,7 @@ import warnings
 
 from . import vector_pb2 as swarndb_dot_v1_dot_vector__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -64,6 +64,11 @@ class VectorServiceStub(object):
                 request_serializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertStreamMessage.SerializeToString,
                 response_deserializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertResponse.FromString,
                 _registered_method=True)
+        self.BulkInsertFromPath = channel.unary_unary(
+                '/swarndb.v1.VectorService/BulkInsertFromPath',
+                request_serializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertFromPathRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertResponse.FromString,
+                _registered_method=True)
         self.Optimize = channel.unary_unary(
                 '/swarndb.v1.VectorService/Optimize',
                 request_serializer=swarndb_dot_v1_dot_vector__pb2.OptimizeRequest.SerializeToString,
@@ -120,6 +125,12 @@ class VectorServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def BulkInsertFromPath(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Optimize(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -169,6 +180,11 @@ def add_VectorServiceServicer_to_server(servicer, server):
             'BulkInsertWithOptions': grpc.stream_unary_rpc_method_handler(
                     servicer.BulkInsertWithOptions,
                     request_deserializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertStreamMessage.FromString,
+                    response_serializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertResponse.SerializeToString,
+            ),
+            'BulkInsertFromPath': grpc.unary_unary_rpc_method_handler(
+                    servicer.BulkInsertFromPath,
+                    request_deserializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertFromPathRequest.FromString,
                     response_serializer=swarndb_dot_v1_dot_vector__pb2.BulkInsertResponse.SerializeToString,
             ),
             'Optimize': grpc.unary_unary_rpc_method_handler(
@@ -348,6 +364,33 @@ class VectorService(object):
             target,
             '/swarndb.v1.VectorService/BulkInsertWithOptions',
             swarndb_dot_v1_dot_vector__pb2.BulkInsertStreamMessage.SerializeToString,
+            swarndb_dot_v1_dot_vector__pb2.BulkInsertResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BulkInsertFromPath(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.VectorService/BulkInsertFromPath',
+            swarndb_dot_v1_dot_vector__pb2.BulkInsertFromPathRequest.SerializeToString,
             swarndb_dot_v1_dot_vector__pb2.BulkInsertResponse.FromString,
             options,
             channel_credentials,

@@ -17,7 +17,14 @@ use crate::proto::swarndb::v1::{
     self as proto, BatchSearchRequest, BatchSearchResponse, SearchRequest, SearchResponse,
 };
 use crate::metrics;
-use crate::state::{AppState, CollectionStatus};
+use crate::state::{metered_read, AppState, CollectionAvailability, CollectionStatus};
+
+fn status_from_availability(avail: CollectionAvailability) -> Status {
+    match avail {
+        CollectionAvailability::Recovering { .. } => Status::unavailable(avail.user_message()),
+        CollectionAvailability::NotFound { .. } => Status::not_found(avail.user_message()),
+    }
+}
 use crate::validation::validate_ef_search;
 
 pub struct SearchServiceImpl {
@@ -40,10 +47,14 @@ impl SearchService for SearchServiceImpl {
         let timer = Instant::now();
         let req = request.into_inner();
 
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(&req.collection)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", req.collection)))?;
+        self.state
+            .require_collection_ready(&req.collection)
+            .map_err(status_from_availability)?;
+
+        let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", req.collection))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         let query_vector = req
             .query
@@ -156,6 +167,14 @@ impl SearchService for SearchServiceImpl {
             }));
         }
 
+        // Per-query readiness guard: a recovering collection short-circuits
+        // the whole batch with Unavailable so the client can retry.
+        for q in &req.queries {
+            self.state
+                .require_collection_ready(&q.collection)
+                .map_err(status_from_availability)?;
+        }
+
         // Check if all queries target the same collection for batch optimization
         let first_collection = &req.queries[0].collection;
         let all_same_collection = req.queries.iter().all(|q| q.collection == *first_collection);
@@ -181,10 +200,10 @@ impl SearchServiceImpl {
         queries: &[SearchRequest],
     ) -> Result<Vec<SearchResponse>, Status> {
         let collection_name = &queries[0].collection;
-        let collections = self.state.collections.read();
-        let collection = collections
-            .get(collection_name)
-            .ok_or_else(|| Status::not_found(format!("collection '{}' not found", collection_name)))?;
+        let coll_handle = self.state.collection_handle(collection_name).ok_or_else(|| {
+            Status::not_found(format!("collection '{}' not found", collection_name))
+        })?;
+        let collection = metered_read(&coll_handle);
 
         // Check if all queries share the same filter and strategy (uniform batch)
         let first_filter = queries[0]
@@ -325,13 +344,13 @@ impl SearchServiceImpl {
         &self,
         queries: &[SearchRequest],
     ) -> Result<Vec<SearchResponse>, Status> {
-        let collections = self.state.collections.read();
         let mut responses = Vec::with_capacity(queries.len());
 
         for q in queries {
-            let collection = collections
-                .get(&q.collection)
-                .ok_or_else(|| Status::not_found(format!("collection '{}' not found", q.collection)))?;
+            let coll_handle = self.state.collection_handle(&q.collection).ok_or_else(|| {
+                Status::not_found(format!("collection '{}' not found", q.collection))
+            })?;
+            let collection = metered_read(&coll_handle);
 
             let query_vector = q
                 .query

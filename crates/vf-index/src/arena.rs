@@ -216,6 +216,18 @@ impl VectorArena {
         }
     }
 
+    /// Reserve capacity for an additional `additional_slots` vectors without
+    /// changing the active slot count. Used by bulk-insert paths to avoid the
+    /// doubling reallocations that would otherwise occur during a large load.
+    pub fn reserve(&mut self, additional_slots: usize) {
+        self.data.reserve_exact(additional_slots * self.dimension);
+    }
+
+    /// Pre-reserves the free-slot tracker; used during bulk insert to avoid doubling reallocations when many deletions are anticipated.
+    pub fn reserve_free_slots(&mut self, additional_capacity: usize) {
+        self.free_slots.reserve(additional_capacity);
+    }
+
     /// Stores a vector in the arena and returns its slot index.
     ///
     /// Reuses a previously freed slot if available, otherwise appends.
@@ -331,6 +343,14 @@ impl VectorArena {
         self.data.clear();
         self.free_slots.clear();
         self.slot_count = 0;
+    }
+
+    /// Release excess capacity in internal buffers without dropping live data.
+    /// Call after a bulk build phase completes so transient slack from grown
+    /// Vec capacities is returned to the allocator.
+    pub fn compact(&mut self) {
+        self.data.shrink_to_fit();
+        self.free_slots.shrink_to_fit();
     }
 }
 

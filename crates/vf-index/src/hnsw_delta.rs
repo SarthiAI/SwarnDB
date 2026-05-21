@@ -24,6 +24,8 @@ use crate::traits::IndexError;
 const DELTA_MAGIC: &[u8; 4] = b"HDLT";
 /// Current delta format version.
 const DELTA_VERSION: u8 = 1;
+/// Default BufWriter capacity matches the stdlib default of 8 KiB.
+const DEFAULT_BUF_CAP: usize = 8 * 1024;
 /// Op-type tag for AddNode.
 const OP_ADD_NODE: u8 = 0;
 /// Op-type tag for RemoveNode.
@@ -312,6 +314,18 @@ impl HnswDeltaWriter {
         let wrap = |e: io::Error| IndexError::Internal(format!("delta file_size: {}", e));
         let metadata = self.file.get_ref().metadata().map_err(wrap)?;
         Ok(metadata.len())
+    }
+
+    /// Flush and rebuild the internal BufWriter at its default capacity.
+    /// Releases any internal buffer growth that built up during a bulk write
+    /// burst. Safe to call at any quiescent point; the file handle is preserved
+    /// so subsequent appends continue from the same offset.
+    pub fn reset_buffer(&mut self) -> Result<(), IndexError> {
+        let wrap = |e: io::Error| IndexError::Internal(format!("delta reset_buffer: {}", e));
+        self.file.flush().map_err(wrap)?;
+        let cloned = self.file.get_ref().try_clone().map_err(wrap)?;
+        self.file = BufWriter::with_capacity(DEFAULT_BUF_CAP, cloned);
+        Ok(())
     }
 }
 

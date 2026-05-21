@@ -17,6 +17,7 @@ dashmap = { workspace = true }
 log = { workspace = true }
 lz4_flex = { workspace = true }
 crc32fast = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

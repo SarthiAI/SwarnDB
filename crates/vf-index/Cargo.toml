@@ -20,6 +20,9 @@ log = { workspace = true }
 lz4_flex = { workspace = true }
 crc32fast = { workspace = true }
 memmap2 = { workspace = true }
+dashmap = { workspace = true }
+bytemuck = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

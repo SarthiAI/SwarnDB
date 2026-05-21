@@ -165,6 +165,8 @@ class BulkInsertOptions:
     index_mode: Optional[str] = None
     skip_metadata_index: bool = False
     parallel_build: bool = False
+    checkpoint_every: Optional[int] = None
+    resume_token: Optional[str] = None
 
     def has_non_defaults(self) -> bool:
         """Return True if any parameter differs from its default."""
@@ -176,6 +178,8 @@ class BulkInsertOptions:
             or self.index_mode is not None
             or self.skip_metadata_index
             or self.parallel_build
+            or self.checkpoint_every is not None
+            or self.resume_token is not None
         )
 
 
@@ -216,6 +220,31 @@ class BulkInsertResult:
 
     inserted_count: int
     errors: List[str] = field(default_factory=list)
+    last_completed_batch_idx: int = 0
+    last_committed_lsn: int = 0
+    resume_token: str = ""
+    assigned_ids: List[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BulkInsertFromPathRequest:
+    """Parameters for an mmap-based bulk insert from a server-side path.
+
+    The server reads vector bytes directly from a file on its local
+    filesystem rather than streaming them over gRPC. This avoids the
+    client-side allocation cost for very large ingests.
+    """
+
+    collection: str
+    path: str
+    dim: int = 0
+    expected_count: int = 0
+    total_count_hint: int = 0
+    id_start: int = 1
+    ids_path: str = ""
+    skip_metadata_index: bool = False
+    index_mode: str = "immediate"
+    ef_construction: int = 0
 
 
 @dataclass(frozen=True)
@@ -233,3 +262,49 @@ class BatchSearchResult:
 
     results: List[SearchResult]
     total_time_us: int
+
+
+@dataclass(frozen=True)
+class RecoveryStatus:
+    """Server recovery status snapshot."""
+
+    path: str
+    elapsed_secs: int
+    collections: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PersistenceStatus:
+    """Per-collection persistence and LSN state."""
+
+    last_snapshot_lsn: int
+    current_lsn: int
+    next_lsn: int
+
+
+@dataclass(frozen=True)
+class CollectionMetrics:
+    """Per-collection lock-contention counters."""
+
+    map_lock_acquisitions: int
+    collection_read_acquisitions: int
+    collection_write_acquisitions: int
+    total_blocked_microseconds: int
+
+
+@dataclass(frozen=True)
+class ReadinessStatus:
+    """Result of the readiness probe."""
+
+    ready: bool
+    status: str
+    checks: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class HealthStatus:
+    """Result of the liveness probe."""
+
+    healthy: bool
+    status: str
+    checks: Dict[str, str] = field(default_factory=dict)

@@ -11,6 +11,7 @@ use crate::proto::swarndb::v1 as pb;
 use vf_core::types::{
     DistanceMetricType, Metadata as CoreMetadata, MetadataValue as CoreMetadataValue,
 };
+use vf_index::hnsw::HnswParams;
 
 /// Convert a proto MetadataValue to a core MetadataValue.
 pub fn proto_to_core_metadata_value(pv: &pb::MetadataValue) -> Option<CoreMetadataValue> {
@@ -78,4 +79,26 @@ pub fn distance_metric_to_string(metric: DistanceMetricType) -> String {
         DistanceMetricType::DotProduct => "dot_product".to_string(),
         DistanceMetricType::Manhattan => "manhattan".to_string(),
     }
+}
+
+/// Build an `HnswParams` starting from `HnswParams::default()` and overriding
+/// `m` / `ef_construction` only when the caller supplied a value. Omitted
+/// fields fall through to the existing server defaults so existing callers
+/// see no behavior change.
+pub fn build_hnsw_params(m: Option<u32>, ef_construction: Option<u32>) -> HnswParams {
+    let mut params = HnswParams::default();
+    if let Some(m_val) = m {
+        if m_val > 0 {
+            let m_usize = m_val as usize;
+            params.m = m_usize;
+            params.m0 = 2 * m_usize;
+            params.m_l = 1.0 / (m_usize as f64).ln();
+        }
+    }
+    if let Some(ef_val) = ef_construction {
+        if ef_val > 0 {
+            params.ef_construction = ef_val as usize;
+        }
+    }
+    params
 }

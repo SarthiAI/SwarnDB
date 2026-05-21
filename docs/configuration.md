@@ -42,7 +42,7 @@ These variables control the basic server setup: where it listens, where it store
 |----------|---------|------|-------------|
 | `SWARNDB_API_KEYS` | *(empty)* | string | Comma-separated list of API keys. When empty, authentication is disabled entirely. |
 
-See the [Authentication](#10-authentication) section below for details on how API key auth works.
+See the [Authentication](#11-authentication) section below for details on how API key auth works.
 
 ---
 
@@ -51,6 +51,7 @@ See the [Authentication](#10-authentication) section below for details on how AP
 | Variable | Default | Type | Description |
 |----------|---------|------|-------------|
 | `SWARNDB_MAX_CONNECTIONS` | `1000` | usize | Maximum number of concurrent client connections across both gRPC and REST. |
+| `SWARNDB_MAX_REQUEST_BODY_BYTES` | `67108864` (64 MB) | usize | Maximum allowed REST request body size in bytes. Requests above this are rejected with 413. |
 
 ---
 
@@ -102,7 +103,57 @@ SwarnDB includes an adaptive concurrency controller that automatically adjusts t
 
 ---
 
-## 8. Setting Configuration
+## 8. Storage and Persistence Configuration
+
+SwarnDB persists collections to disk through a write-ahead log plus periodic snapshots. These variables control snapshot cadence, WAL pruning, post-optimize behavior, segment compaction, parallel collection loading at startup, and the allowed file roots for server-side bulk insert.
+
+### Snapshots
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `SWARNDB_SNAPSHOT_INTERVAL_SECS` | `120` | u64 | Time-based snapshot interval per collection in seconds. A collection with pending mutations is snapshotted at least this often. |
+| `SWARNDB_SNAPSHOT_MUTATION_THRESHOLD` | `25000` | u64 | Mutation-based snapshot trigger. A collection is snapshotted once this many writes have accumulated since the last snapshot. |
+| `SWARNDB_SNAPSHOT_CHECK_INTERVAL_SECS` | `30` | u64 | How often the snapshot scheduler wakes up to evaluate the interval and threshold above. |
+
+### Write-Ahead Log (WAL)
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `SWARNDB_WAL_FSYNC_MODE` | `per_write` | string | WAL fsync policy. `per_write` fsyncs every append (maximum durability). `per_batch:N` fsyncs every N appends, trading durability for throughput on slow disks. `none` skips automatic fsyncs and only fsyncs on WAL rotate or close (use only for ephemeral workloads). |
+| `SWARNDB_WAL_PRUNE_INTERVAL_SECS` | `300` | u64 | How often the background pruner sweeps and removes WAL segments older than the latest snapshot. |
+| `SWARNDB_WAL_PRUNE_AFTER_OPTIMIZE` | `true` | bool | Whether to prune WAL segments immediately after `optimize()` completes for a collection. |
+
+### Compaction
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `SWARNDB_AUTO_COMPACT_AFTER_OPTIMIZE` | `true` | bool | Whether to run segment compaction automatically after `optimize()` completes for a collection. |
+| `SWARNDB_COMPACTION_MIN_SEGMENTS` | `4` | usize | Minimum number of on-disk segments required before compaction merges them. |
+
+### Startup and Recovery
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS` | `min(cores, 4)` | usize | Number of collections loaded in parallel during server startup. |
+
+### Bulk Insert From Path
+
+The `bulk_insert_from_path` API reads files from the server's local filesystem. This variable controls which filesystem roots the server will accept files from.
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` | value of `SWARNDB_DATA_DIR` | string | Comma-separated list of absolute directory paths the server will read bulk-insert files from. Paths must be absolute; relative paths cause the server to fail at startup. Paths outside the listed roots, symlinks, and `..` traversal are rejected at request time. |
+
+Example: allow staging from two object-store mount points alongside the data dir.
+
+```bash
+SWARNDB_DATA_DIR=/var/lib/swarndb/data
+SWARNDB_BULK_INSERT_ALLOWED_ROOTS=/var/lib/swarndb/data,/mnt/s3/uploads,/mnt/nfs/ingest
+```
+
+---
+
+## 9. Setting Configuration
 
 ### Via Docker run
 
@@ -117,7 +168,7 @@ docker run -d \
   -v swarndb_data:/data \
   -p 50051:50051 \
   -p 8080:8080 \
-  ghcr.io/sarthiai/swarndb:latest
+  sarthiai/swarndb:latest
 ```
 
 ### Via Docker Compose
@@ -125,7 +176,7 @@ docker run -d \
 ```yaml
 services:
   swarndb:
-    image: ghcr.io/sarthiai/swarndb:latest
+    image: sarthiai/swarndb:latest
     environment:
       SWARNDB_HOST: "0.0.0.0"
       SWARNDB_GRPC_PORT: "50051"
@@ -197,7 +248,7 @@ Environment variables always override values from the JSON file.
 
 ---
 
-## 9. Example Configurations
+## 10. Example Configurations
 
 ### a. Development
 
@@ -244,7 +295,7 @@ SWARNDB_MAX_BATCH_LOCK_SIZE=50000
 
 ---
 
-## 10. Authentication
+## 11. Authentication
 
 SwarnDB supports API key authentication. When enabled, every request must include a valid API key.
 
@@ -299,7 +350,7 @@ When no API keys are configured, all requests are accepted without authenticatio
 
 ---
 
-## 11. Logging
+## 12. Logging
 
 SwarnDB uses structured logging with the `tracing` framework (Rust) and outputs JSON-formatted log entries.
 
@@ -332,7 +383,7 @@ Logs are written to stdout by default, which Docker captures automatically. Use 
 ```yaml
 services:
   swarndb:
-    image: ghcr.io/sarthiai/swarndb:latest
+    image: sarthiai/swarndb:latest
     logging:
       driver: "json-file"
       options:

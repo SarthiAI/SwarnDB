@@ -37,6 +37,11 @@ from swarndb._proto import (
     vector_pb2,
     vector_pb2_grpc,
 )
+from swarndb.client import (
+    _DEFAULT_MAX_MESSAGE_BYTES,
+    _DEFAULT_REST_PORT,
+    _recovery_path_name,
+)
 from swarndb._helpers import _translate_error as _translate_error_fn
 from swarndb.exceptions import (
     AuthenticationError,
@@ -58,14 +63,19 @@ from swarndb.types import (
     ClusterAssignment,
     ClusterResult,
     CollectionInfo,
+    CollectionMetrics,
     ConeSearchResult,
     DiversityResult,
     DriftReport,
     GhostVector,
     GraphEdge,
+    HealthStatus,
     OptimizeResult,
     PCAResult,
+    PersistenceStatus,
     QuantizationConfig,
+    ReadinessStatus,
+    RecoveryStatus,
     ScalarQuantizationConfig,
     ScoredResult,
     SearchQuantizationParams,
@@ -162,9 +172,11 @@ class AsyncSwarnDBClient:
         retry_delay: float = 0.5,
         timeout: float = 30.0,
         options: Optional[Sequence[Tuple[str, Any]]] = None,
+        rest_port: int = _DEFAULT_REST_PORT,
     ) -> None:
         self._host = host
         self._port = port
+        self._rest_port = rest_port
         self._api_key = api_key
         self._secure = secure
         self._max_retries = max_retries
@@ -172,7 +184,12 @@ class AsyncSwarnDBClient:
         self._timeout = timeout
 
         target = f"{host}:{port}"
-        channel_options = list(options) if options else []
+        channel_options: list[Tuple[str, Any]] = [
+            ("grpc.max_receive_message_length", _DEFAULT_MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", _DEFAULT_MAX_MESSAGE_BYTES),
+        ]
+        if options:
+            channel_options.extend(options)
 
         # Build interceptor list
         interceptors: list[grpc.aio.ClientInterceptor] = []
@@ -313,6 +330,116 @@ class AsyncSwarnDBClient:
         """Map a gRPC RpcError to the appropriate SwarnDB exception."""
         return _translate_error_fn(exc)
 
+    async def _rest_probe(self, path: str) -> Tuple[int, Dict[str, Any]]:
+        """Async wrapper around the sync stdlib HTTP probe call.
+
+        Delegates the blocking urllib call to a worker thread so the event
+        loop stays unblocked. Error semantics mirror the sync client.
+        """
+        import json
+        import urllib.error
+        import urllib.request
+
+        scheme = "https" if self._secure else "http"
+        url = f"{scheme}://{self._host}:{self._rest_port}{path}"
+        api_key = self._api_key
+        call_timeout = self._timeout
+
+        def _fetch() -> Tuple[int, bytes]:
+            req = urllib.request.Request(url, method="GET")
+            if api_key:
+                req.add_header("X-API-Key", api_key)
+            try:
+                with urllib.request.urlopen(req, timeout=call_timeout) as resp:
+                    return resp.getcode(), resp.read()
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = exc.read()
+                except Exception:
+                    body = b""
+                return exc.code, body
+
+        try:
+            status, body_bytes = await asyncio.to_thread(_fetch)
+        except urllib.error.URLError as exc:
+            raise ConnectionError(
+                message=f"failed to reach REST endpoint {path}",
+                details=str(exc.reason),
+            ) from exc
+        except OSError as exc:
+            raise ConnectionError(
+                message=f"failed to reach REST endpoint {path}",
+                details=str(exc),
+            ) from exc
+
+        if status == 401:
+            raise AuthenticationError(
+                message="authentication failed",
+                details=body_bytes.decode("utf-8", errors="replace") or None,
+            )
+        if status not in (200, 503):
+            raise SwarnDBError(
+                message=f"HTTP {status} from {path}",
+                details=body_bytes.decode("utf-8", errors="replace") or None,
+            )
+
+        try:
+            body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SwarnDBError(
+                message=f"invalid JSON from {path}",
+                details=str(exc),
+            ) from exc
+        if not isinstance(body, dict):
+            body = {}
+        return status, body
+
+    # ------------------------------------------------------------------
+    # Operational endpoints
+    # ------------------------------------------------------------------
+
+    async def recovery_status(self) -> RecoveryStatus:
+        """Return the boot recovery snapshot for the server."""
+        request = collection_pb2.GetRecoveryStatusRequest()
+        response = await self._call(
+            self._collection_stub.GetRecoveryStatus, request
+        )
+        collections = {
+            entry.name: _recovery_path_name(entry.path)
+            for entry in response.collections
+        }
+        return RecoveryStatus(
+            path=_recovery_path_name(response.path),
+            elapsed_secs=int(response.elapsed_secs),
+            collections=collections,
+        )
+
+    async def readyz(self) -> ReadinessStatus:
+        """Return the Kubernetes-style readiness probe result.
+
+        A 503 response is not an error; it maps to ``ready=False`` with the
+        probe body. Transport, auth, or other failures raise ``SwarnDBError``.
+        """
+        status, body = await self._rest_probe("/readyz")
+        return ReadinessStatus(
+            ready=status == 200,
+            status=str(body.get("status", "")),
+            checks={k: str(v) for k, v in (body.get("checks") or {}).items()},
+        )
+
+    async def healthz(self) -> HealthStatus:
+        """Return the Kubernetes-style liveness probe result.
+
+        A 503 response is not an error; it maps to ``healthy=False`` with the
+        probe body. Transport, auth, or other failures raise ``SwarnDBError``.
+        """
+        status, body = await self._rest_probe("/healthz")
+        return HealthStatus(
+            healthy=status == 200,
+            status=str(body.get("status", "")),
+            checks={k: str(v) for k, v in (body.get("checks") or {}).items()},
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -354,6 +481,8 @@ class AsyncCollectionAPI:
         default_threshold: float = 0.0,
         max_vectors: int = 0,
         quantization: Optional[QuantizationConfig] = None,
+        m: Optional[int] = None,
+        ef_construction: Optional[int] = None,
     ) -> CollectionInfo:
         """Create a new collection.
 
@@ -364,6 +493,10 @@ class AsyncCollectionAPI:
             default_threshold: Default similarity threshold for searches.
             max_vectors: Maximum number of vectors (0 = unlimited).
             quantization: Optional quantization configuration (e.g. SQ8).
+            m: Optional HNSW M parameter override. When None, the server
+                uses its default.
+            ef_construction: Optional HNSW ef_construction override. When
+                None, the server uses its default.
 
         Returns:
             CollectionInfo with the created collection's metadata.
@@ -386,6 +519,10 @@ class AsyncCollectionAPI:
                     always_ram=sq.always_ram,
                 )
                 request.quantization.scalar.CopyFrom(proto_sq)
+        if m is not None:
+            request.m = m
+        if ef_construction is not None:
+            request.ef_construction = ef_construction
         await self._client._call(
             self._client._collection_stub.CreateCollection, request
         )
@@ -507,6 +644,46 @@ class AsyncCollectionAPI:
             vectors_processed=response.vectors_processed,
         )
 
+    async def snapshot(self, name: str) -> int:
+        """Force a synchronous snapshot for a collection.
+
+        Args:
+            name: Collection name.
+
+        Returns:
+            The LSN of the snapshot just written.
+        """
+        request = collection_pb2.SnapshotCollectionRequest(name=name)
+        response = await self._client._call(
+            self._client._collection_stub.SnapshotCollection, request
+        )
+        return int(response.last_snapshot_lsn)
+
+    async def persistence_status(self, name: str) -> PersistenceStatus:
+        """Return the snapshot and WAL LSN state for a collection."""
+        request = collection_pb2.GetPersistenceStatusRequest(name=name)
+        response = await self._client._call(
+            self._client._collection_stub.GetPersistenceStatus, request
+        )
+        return PersistenceStatus(
+            last_snapshot_lsn=int(response.last_snapshot_lsn),
+            current_lsn=int(response.current_lsn),
+            next_lsn=int(response.next_lsn),
+        )
+
+    async def metrics(self, name: str) -> CollectionMetrics:
+        """Return per-collection lock-contention counters."""
+        request = collection_pb2.GetCollectionMetricsRequest(name=name)
+        response = await self._client._call(
+            self._client._collection_stub.GetCollectionMetrics, request
+        )
+        return CollectionMetrics(
+            map_lock_acquisitions=int(response.map_lock_acquisitions),
+            collection_read_acquisitions=int(response.collection_read_acquisitions),
+            collection_write_acquisitions=int(response.collection_write_acquisitions),
+            total_blocked_microseconds=int(response.total_blocked_microseconds),
+        )
+
     async def get_status(self, collection: str) -> str:
         """Get collection optimization status.
 
@@ -570,7 +747,7 @@ class AsyncVectorAPI:
         )
         return response.id
 
-    async def get(self, collection: str, id: int) -> VectorRecord:
+    async def get(self, collection: str, id: int) -> Optional[VectorRecord]:
         """Get a vector by ID.
 
         Args:
@@ -578,20 +755,25 @@ class AsyncVectorAPI:
             id: Vector ID to retrieve.
 
         Returns:
-            A VectorRecord with the vector data and metadata.
+            A VectorRecord with the vector data and metadata, or
+            ``None`` if no vector with the given id exists.
 
         Raises:
-            VectorNotFoundError: If the vector does not exist.
+            SwarnDBError: On transport, auth, quota, or other non
+                NotFound failures.
         """
         request = vector_pb2.GetVectorRequest(
             collection=collection,
             id=id,
         )
-        response = await self._client._call(
-            self._client._vector_stub.Get, request
-        )
+        try:
+            response = await self._client._call(
+                self._client._vector_stub.Get, request
+            )
+        except VectorNotFoundError:
+            return None
         return VectorRecord(
-            id=str(response.id),
+            id=response.id,
             vector=list(response.vector.values),
             metadata=_from_proto_metadata(response.metadata),
         )
@@ -663,6 +845,8 @@ class AsyncVectorAPI:
         index_mode: Optional[str] = None,
         skip_metadata_index: bool = False,
         parallel_build: bool = False,
+        checkpoint_every: Optional[int] = None,
+        resume_token: Optional[str] = None,
     ) -> BulkInsertResult:
         """Bulk insert vectors using async streaming RPC.
 
@@ -695,6 +879,13 @@ class AsyncVectorAPI:
                 insert for faster ingestion.
             parallel_build: If True, use parallel HNSW construction
                 (only effective with ``index_mode="deferred"``).
+            checkpoint_every: optional, if non-zero the server writes a
+                checkpoint file every N batches; use the returned
+                resume_token to resume a failed bulk insert. 0 (default)
+                disables checkpoints.
+            resume_token: optional, opaque token from a prior partial bulk
+                insert response; the server validates it against its
+                on-disk checkpoint and skips already-committed batches.
 
         Returns:
             A BulkInsertResult with inserted_count and any errors.
@@ -738,6 +929,8 @@ class AsyncVectorAPI:
             index_mode=index_mode,
             skip_metadata_index=skip_metadata_index,
             parallel_build=parallel_build,
+            checkpoint_every=checkpoint_every,
+            resume_token=resume_token,
         )
         use_optimized_rpc = options.has_non_defaults()
 
@@ -771,6 +964,8 @@ class AsyncVectorAPI:
                     index_mode=options.index_mode or "",
                     skip_metadata_index=options.skip_metadata_index,
                     parallel_build=options.parallel_build,
+                    checkpoint_every=options.checkpoint_every or 0,
+                    resume_token=options.resume_token or "",
                 )
             )
             yield options_msg
@@ -791,7 +986,8 @@ class AsyncVectorAPI:
                         "Async BulkInsert with options: batch_lock_size=%s, "
                         "defer_graph=%s, wal_flush_every=%s, "
                         "ef_construction=%s, index_mode=%s, "
-                        "skip_metadata_index=%s, parallel_build=%s",
+                        "skip_metadata_index=%s, parallel_build=%s, "
+                        "checkpoint_every=%s, resume_token=%s",
                         options.batch_lock_size,
                         options.defer_graph,
                         options.wal_flush_every,
@@ -799,6 +995,8 @@ class AsyncVectorAPI:
                         options.index_mode,
                         options.skip_metadata_index,
                         options.parallel_build,
+                        options.checkpoint_every,
+                        options.resume_token,
                     )
                     response = await self._client._vector_stub.BulkInsertWithOptions(
                         _options_request_iterator(),
@@ -814,6 +1012,14 @@ class AsyncVectorAPI:
                 return BulkInsertResult(
                     inserted_count=response.inserted_count,
                     errors=list(response.errors),
+                    last_completed_batch_idx=getattr(
+                        response, "last_completed_batch_idx", 0
+                    ),
+                    last_committed_lsn=getattr(
+                        response, "last_committed_lsn", 0
+                    ),
+                    resume_token=getattr(response, "resume_token", ""),
+                    assigned_ids=list(getattr(response, "assigned_ids", []) or []),
                 )
             except grpc.RpcError as exc:
                 last_error = exc
@@ -836,6 +1042,101 @@ class AsyncVectorAPI:
 
         assert last_error is not None
         raise self._client._translate_error(last_error) from last_error
+
+    async def bulk_insert_from_path(
+        self,
+        collection: str,
+        path: str,
+        *,
+        dim: int = 0,
+        expected_count: int = 0,
+        total_count_hint: int = 0,
+        id_start: int = 1,
+        ids_path: str = "",
+        skip_metadata_index: bool = False,
+        index_mode: str = "immediate",
+        ef_construction: int = 0,
+        chunk_size: int = 0,
+    ) -> BulkInsertResult:
+        """Bulk insert vectors from a server-side file via mmap.
+
+        The server memory-maps the file at ``path`` and ingests vectors
+        directly without streaming them over gRPC. Use this for very
+        large ingests where avoiding a client-side allocation matters.
+
+        Args:
+            collection: Target collection name.
+            path: Absolute path to the vector file on the server's
+                local filesystem.
+            dim: Vector dimensionality. Pass 0 to defer to the
+                collection's configured dimension.
+            expected_count: Expected number of vectors in the file. Use
+                0 to let the server infer from file size.
+            total_count_hint: Optional hint for total vectors across
+                multiple bulk inserts; used for capacity planning.
+            id_start: Starting ID for auto-assigned IDs (default 1).
+            ids_path: Optional path to a sidecar file containing explicit
+                IDs (one per vector). Empty string means use auto-assigned
+                IDs starting at ``id_start``.
+            skip_metadata_index: If True, skip metadata indexing during
+                insert for faster ingestion.
+            index_mode: Index build mode: ``"immediate"`` (default) or
+                ``"deferred"`` (build index after all inserts).
+            ef_construction: Optional HNSW ef_construction override for
+                this batch (0 = use collection default).
+            chunk_size: Server-side chunked compact-insert mode. ``0``
+                (default) preserves the existing single-pass behavior.
+                When ``> 0``, the server processes the load in chunks of
+                that many rows and snapshots, prunes the WAL, and
+                releases scratch memory between chunks. This trades
+                insert wall-clock for a lower peak RSS and is intended
+                for memory-tight boxes willing to accept a slower
+                one-time load. Resume mid-call is not supported in this
+                release; callers must restart the full call on failure.
+
+        Returns:
+            A BulkInsertResult with inserted_count, assigned_ids, and
+            any errors.
+
+        Raises:
+            ValueError: If index_mode is not a valid value.
+            SwarnDBError: On transport, auth, quota, or other failures.
+        """
+        if index_mode not in ("immediate", "deferred"):
+            raise ValueError(
+                f"index_mode must be 'immediate' or 'deferred', "
+                f"got {index_mode!r}"
+            )
+
+        request = vector_pb2.BulkInsertFromPathRequest(
+            collection=collection,
+            path=path,
+            dim=dim,
+            expected_count=expected_count,
+            total_count_hint=total_count_hint,
+            id_start=id_start,
+            ids_path=ids_path,
+            skip_metadata_index=skip_metadata_index,
+            index_mode=index_mode,
+            ef_construction=ef_construction,
+            chunk_size=chunk_size,
+        )
+
+        response = await self._client._call(
+            self._client._vector_stub.BulkInsertFromPath, request
+        )
+        return BulkInsertResult(
+            inserted_count=response.inserted_count,
+            errors=list(response.errors),
+            last_completed_batch_idx=getattr(
+                response, "last_completed_batch_idx", 0
+            ),
+            last_committed_lsn=getattr(
+                response, "last_committed_lsn", 0
+            ),
+            resume_token=getattr(response, "resume_token", ""),
+            assigned_ids=list(getattr(response, "assigned_ids", []) or []),
+        )
 
 
 # ---------------------------------------------------------------------------

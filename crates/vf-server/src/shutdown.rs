@@ -8,7 +8,7 @@
 //! Listens for OS termination signals (SIGTERM, SIGINT) and coordinates
 //! a clean shutdown: draining connections, flushing WAL, and syncing segments.
 
-use crate::state::AppState;
+use crate::state::{metered_read, AppState};
 
 /// Waits for a shutdown signal (SIGTERM or SIGINT).
 ///
@@ -90,12 +90,22 @@ pub async fn graceful_shutdown(state: AppState) {
     }
 
     // Phase 2: Persist HNSW topology, graph snapshots, WAL meta, and
-    // write clean shutdown marker for each collection.
+    // write clean shutdown marker for each collection. Map read lock is
+    // released after the handle snapshot so per-collection reads do not
+    // contend with the map RwLock.
     {
-        let collections = state.collections.read();
+        let handles: Vec<(String, std::sync::Arc<parking_lot::RwLock<crate::state::CollectionState>>)> = {
+            let collections = state.collections.read();
+            collections
+                .iter()
+                .map(|(k, v)| (k.clone(), std::sync::Arc::clone(v)))
+                .collect()
+        };
         let cm = state.collection_manager.read();
 
-        for (name, coll_state) in collections.iter() {
+        for (name, handle) in handles.iter() {
+            let coll_state = metered_read(handle);
+            let name = name.as_str();
             // Resolve collection directory and current LSN from CollectionManager.
             let (collection_dir, current_lsn) = match cm.get_collection(name) {
                 Ok(storage_coll) => (
@@ -129,6 +139,9 @@ pub async fn graceful_shutdown(state: AppState) {
                         Ok(())
                     },
                 );
+                // Release the snapshot's per-node neighbor clones before the
+                // shutdown loop continues to the next collection.
+                drop(snapshot);
                 match res {
                     Ok(()) => {
                         tracing::info!(collection = %name, "HNSW topology snapshot persisted");
@@ -156,6 +169,11 @@ pub async fn graceful_shutdown(state: AppState) {
                 // the collection is at least partially persisted on a sidecar error.
             }
 
+            // G1 ordering invariant: hnsw.base MUST be fsynced before
+            // hnsw.delta so recovery (which replays delta only for LSN >
+            // base.embedded_lsn) can safely discard any orphaned delta tail
+            // after a torn shutdown. Do not reorder these two persist steps.
+            //
             // Sync pending HNSW delta writer buffers so the BufWriter contents
             // survive shutdown and feed the next boot's IncrementalReplay path.
             if let Some(mut delta_writer) = coll_state.index.take_delta_writer() {
@@ -205,8 +223,23 @@ pub async fn graceful_shutdown(state: AppState) {
             }
 
             // 3. Update wal_meta.json with the final LSN.
+            //    Both next_lsn and last_snapshot_lsn advance to current_lsn:
+            //    the hnsw.base and graph.base writes above embed current_lsn,
+            //    so last_snapshot_lsn must mirror that. Loading the existing
+            //    meta first preserves the wal_format_version field.
             {
-                let meta = vf_storage::wal::WalMeta::new(current_lsn);
+                let mut meta = match vf_storage::wal::load_wal_meta(&collection_dir) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(
+                            collection = %name,
+                            "failed to load wal_meta.json before shutdown update: {}", e
+                        );
+                        vf_storage::wal::WalMeta::new(current_lsn)
+                    }
+                };
+                meta.next_lsn = current_lsn;
+                meta.last_snapshot_lsn = current_lsn;
                 if let Err(e) = vf_storage::wal::save_wal_meta(&collection_dir, &meta) {
                     tracing::error!(
                         collection = %name,

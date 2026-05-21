@@ -5,7 +5,7 @@ import warnings
 
 from . import collection_pb2 as swarndb_dot_v1_dot_collection__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -54,6 +54,26 @@ class CollectionServiceStub(object):
                 request_serializer=swarndb_dot_v1_dot_collection__pb2.ListCollectionsRequest.SerializeToString,
                 response_deserializer=swarndb_dot_v1_dot_collection__pb2.ListCollectionsResponse.FromString,
                 _registered_method=True)
+        self.GetRecoveryStatus = channel.unary_unary(
+                '/swarndb.v1.CollectionService/GetRecoveryStatus',
+                request_serializer=swarndb_dot_v1_dot_collection__pb2.GetRecoveryStatusRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_collection__pb2.GetRecoveryStatusResponse.FromString,
+                _registered_method=True)
+        self.SnapshotCollection = channel.unary_unary(
+                '/swarndb.v1.CollectionService/SnapshotCollection',
+                request_serializer=swarndb_dot_v1_dot_collection__pb2.SnapshotCollectionRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_collection__pb2.SnapshotCollectionResponse.FromString,
+                _registered_method=True)
+        self.GetPersistenceStatus = channel.unary_unary(
+                '/swarndb.v1.CollectionService/GetPersistenceStatus',
+                request_serializer=swarndb_dot_v1_dot_collection__pb2.GetPersistenceStatusRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_collection__pb2.GetPersistenceStatusResponse.FromString,
+                _registered_method=True)
+        self.GetCollectionMetrics = channel.unary_unary(
+                '/swarndb.v1.CollectionService/GetCollectionMetrics',
+                request_serializer=swarndb_dot_v1_dot_collection__pb2.GetCollectionMetricsRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_collection__pb2.GetCollectionMetricsResponse.FromString,
+                _registered_method=True)
 
 
 class CollectionServiceServicer(object):
@@ -83,6 +103,30 @@ class CollectionServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetRecoveryStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SnapshotCollection(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetPersistenceStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetCollectionMetrics(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CollectionServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -105,6 +149,26 @@ def add_CollectionServiceServicer_to_server(servicer, server):
                     servicer.ListCollections,
                     request_deserializer=swarndb_dot_v1_dot_collection__pb2.ListCollectionsRequest.FromString,
                     response_serializer=swarndb_dot_v1_dot_collection__pb2.ListCollectionsResponse.SerializeToString,
+            ),
+            'GetRecoveryStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRecoveryStatus,
+                    request_deserializer=swarndb_dot_v1_dot_collection__pb2.GetRecoveryStatusRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_collection__pb2.GetRecoveryStatusResponse.SerializeToString,
+            ),
+            'SnapshotCollection': grpc.unary_unary_rpc_method_handler(
+                    servicer.SnapshotCollection,
+                    request_deserializer=swarndb_dot_v1_dot_collection__pb2.SnapshotCollectionRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_collection__pb2.SnapshotCollectionResponse.SerializeToString,
+            ),
+            'GetPersistenceStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetPersistenceStatus,
+                    request_deserializer=swarndb_dot_v1_dot_collection__pb2.GetPersistenceStatusRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_collection__pb2.GetPersistenceStatusResponse.SerializeToString,
+            ),
+            'GetCollectionMetrics': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetCollectionMetrics,
+                    request_deserializer=swarndb_dot_v1_dot_collection__pb2.GetCollectionMetricsRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_collection__pb2.GetCollectionMetricsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -215,6 +279,114 @@ class CollectionService(object):
             '/swarndb.v1.CollectionService/ListCollections',
             swarndb_dot_v1_dot_collection__pb2.ListCollectionsRequest.SerializeToString,
             swarndb_dot_v1_dot_collection__pb2.ListCollectionsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetRecoveryStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.CollectionService/GetRecoveryStatus',
+            swarndb_dot_v1_dot_collection__pb2.GetRecoveryStatusRequest.SerializeToString,
+            swarndb_dot_v1_dot_collection__pb2.GetRecoveryStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SnapshotCollection(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.CollectionService/SnapshotCollection',
+            swarndb_dot_v1_dot_collection__pb2.SnapshotCollectionRequest.SerializeToString,
+            swarndb_dot_v1_dot_collection__pb2.SnapshotCollectionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetPersistenceStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.CollectionService/GetPersistenceStatus',
+            swarndb_dot_v1_dot_collection__pb2.GetPersistenceStatusRequest.SerializeToString,
+            swarndb_dot_v1_dot_collection__pb2.GetPersistenceStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetCollectionMetrics(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.CollectionService/GetCollectionMetrics',
+            swarndb_dot_v1_dot_collection__pb2.GetCollectionMetricsRequest.SerializeToString,
+            swarndb_dot_v1_dot_collection__pb2.GetCollectionMetricsResponse.FromString,
             options,
             channel_credentials,
             insecure,

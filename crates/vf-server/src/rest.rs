@@ -4,6 +4,7 @@
 // Change License: MIT
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -23,13 +24,19 @@ use vf_graph::{GraphTraversal, RelationshipQueryEngine, TraversalOrder};
 use vf_query::vector_math::*;
 use vf_query::{FilterExpression, FilterStrategy, IndexManager, QueryExecutor};
 
-use crate::convert::{distance_metric_to_string, parse_distance_metric};
+use crate::bulk_checkpoint_token::{
+    encode_resume_token, hash_collection_name, resolve_bulk_checkpoint_path,
+};
+use crate::convert::{build_hnsw_params, distance_metric_to_string, parse_distance_metric};
 use crate::metrics;
-use crate::state::{AppState, CollectionState, CollectionStatus, MetadataCache};
+use crate::state::{
+    metered_read, metered_write, AppState, CollectionAvailability, CollectionState,
+    CollectionStatus, MetadataCache,
+};
 use crate::validation::{
-    validate_batch_lock_size, validate_bulk_insert_options, validate_collection_name,
-    validate_ef_construction, validate_ef_search, validate_index_mode, validate_wal_flush_every,
-    ValidationConfig,
+    request_body_limit_bytes, request_size_limit_layer, validate_batch_lock_size,
+    validate_bulk_insert_options, validate_collection_name, validate_ef_construction,
+    validate_ef_search, validate_index_mode, validate_wal_flush_every, ValidationConfig,
 };
 
 // ── Error handling ──────────────────────────────────────────────────────
@@ -43,6 +50,24 @@ pub struct ErrorResponse {
 fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     let s = status;
     (s, Json(ErrorResponse { error: msg.into(), code: s.as_u16() }))
+}
+
+/// Convert a `CollectionAvailability` returned by the per-endpoint readiness
+/// guard into the `(status, body)` shape used by every REST handler. A
+/// recovering collection becomes 503; a missing collection becomes 404. The
+/// 503 body intentionally surfaces the load progress so clients can choose a
+/// sensible backoff instead of treating the response as a hard failure.
+fn err_from_availability(
+    avail: CollectionAvailability,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match avail {
+        CollectionAvailability::Recovering { .. } => {
+            err(StatusCode::SERVICE_UNAVAILABLE, avail.user_message())
+        }
+        CollectionAvailability::NotFound { .. } => {
+            err(StatusCode::NOT_FOUND, avail.user_message())
+        }
+    }
 }
 
 // ── Custom JSON extractor (returns 400 instead of 422) ──────────────────
@@ -86,6 +111,11 @@ pub struct CreateCollectionReq {
     #[serde(default)]
     pub max_vectors: u64,
     pub quantization: Option<QuantizationReq>,
+    // Optional HNSW build parameters; when set, override server defaults.
+    #[serde(default)]
+    pub m: Option<u32>,
+    #[serde(default)]
+    pub ef_construction: Option<u32>,
 }
 
 fn default_distance() -> String { "cosine".to_string() }
@@ -177,12 +207,50 @@ pub struct BulkInsertReq {
     pub skip_metadata_index: Option<bool>,
     #[serde(default)]
     pub parallel_build: Option<bool>,
+    // Write a checkpoint after every N completed chunks. 0 / None = never.
+    #[serde(default)]
+    pub checkpoint_every: Option<u32>,
+    // Opaque resume token returned by a previous partial bulk insert response.
+    #[serde(default)]
+    pub resume_token: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct BulkInsertRes {
     pub inserted_count: u64,
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub last_completed_batch_idx: u64,
+    #[serde(default)]
+    pub last_committed_lsn: u64,
+    #[serde(default)]
+    pub resume_token: String,
+    // Server-assigned ids in input order, parallel to the Ok arms of the chunk loop.
+    #[serde(default)]
+    pub assigned_ids: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct BulkInsertFromPathReq {
+    pub path: String,
+    #[serde(default)]
+    pub dim: u32,
+    #[serde(default)]
+    pub expected_count: u64,
+    #[serde(default)]
+    pub total_count_hint: u64,
+    #[serde(default)]
+    pub id_start: u64,
+    #[serde(default)]
+    pub ids_path: String,
+    #[serde(default)]
+    pub skip_metadata_index: bool,
+    #[serde(default)]
+    pub index_mode: String,
+    #[serde(default)]
+    pub ef_construction: u32,
+    #[serde(default)]
+    pub chunk_size: u32,
 }
 
 // ── Search types ────────────────────────────────────────────────────────
@@ -349,9 +417,18 @@ pub fn rest_router(state: AppState) -> Router {
         .route("/api/v1/collections/{collection}/vectors/{id}", put(update_vector))
         .route("/api/v1/collections/{collection}/vectors/{id}", delete(delete_vector))
         .route("/api/v1/collections/{collection}/vectors/bulk", post(bulk_insert))
+        .route("/api/v1/collections/{collection}/vectors/bulk-from-path", post(bulk_insert_from_path))
         .route("/api/v1/collections/{collection}/optimize", post(optimize_collection))
         .route("/api/v1/collections/{collection}/prune-wal", post(prune_wal_collection))
         .route("/api/v1/collections/{collection}/compact", post(compact_collection))
+        // Recovery, persistence, snapshot, and per-collection lock metrics.
+        // Operational endpoints (recovery_status, metrics) sit at the top
+        // level next to /health and /readyz. Collection-scoped endpoints
+        // (snapshot, persistence_status) join the existing /api/v1 surface.
+        .route("/recovery_status", get(recovery_status))
+        .route("/api/v1/collections/{collection}/snapshot", post(snapshot_collection))
+        .route("/api/v1/collections/{collection}/persistence_status", get(persistence_status))
+        .route("/metrics/collection/{collection}", get(collection_metrics))
         // Search
         .route("/api/v1/collections/{collection}/search", post(search))
         .route("/api/v1/search/batch", post(batch_search))
@@ -369,6 +446,8 @@ pub fn rest_router(state: AppState) -> Router {
         .route("/api/v1/collections/{collection}/math/pca", post(reduce_dimensions))
         .route("/api/v1/math/analogy", post(compute_analogy))
         .route("/api/v1/collections/{collection}/math/diversity", post(diversity_sample))
+        // Body-size cap protects every POST/PUT route from oversized payloads.
+        .layer(request_size_limit_layer(request_body_limit_bytes()))
         .with_state(state)
 }
 
@@ -442,13 +521,17 @@ async fn create_collection(
         }
     }
 
+    // Optional HNSW build parameters from the request; omitted fields fall
+    // through to the server defaults via build_hnsw_params.
+    let hnsw_params = build_hnsw_params(req.m, req.ef_construction);
+
     let store = InMemoryVectorStore::new(dimension);
     let index: Box<dyn vf_index::traits::PersistableIndex> = match &config.quantization_config {
         Some(vf_core::types::QuantizationConfig::Scalar(sq_config)) => {
             let q_index = vf_index::quantized_hnsw::QuantizedHnswIndex::new(
                 dimension,
                 distance_metric,
-                vf_index::hnsw::HnswParams::default(),
+                hnsw_params.clone(),
                 sq_config.clone(),
             );
             // Set data_dir unconditionally so post_optimize() can train the quantizer.
@@ -469,7 +552,7 @@ async fn create_collection(
             }
             Box::new(q_index)
         }
-        None => Box::new(vf_index::hnsw::HnswIndex::with_defaults(dimension, distance_metric)),
+        None => Box::new(vf_index::hnsw::HnswIndex::new(dimension, distance_metric, hnsw_params)),
     };
 
     // Attach a fresh hnsw.delta writer so first inserts are recorded for
@@ -497,10 +580,30 @@ async fn create_collection(
         None => vf_graph::VirtualGraph::with_threshold(0.7, distance_metric),
     };
 
-    let collection_state = CollectionState { config, store, index, index_manager, graph, metadata_cache: MetadataCache::new(), status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)), deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), mutation_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) };
+    let collection_state = CollectionState {
+        config,
+        store,
+        index,
+        index_manager,
+        graph,
+        metadata_cache: MetadataCache::new(),
+        status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)),
+        deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deferred_graph: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deferred_metadata: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        mutation_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        collection_read_acquisitions: std::sync::atomic::AtomicU64::new(0),
+        collection_write_acquisitions: std::sync::atomic::AtomicU64::new(0),
+        total_blocked_microseconds: std::sync::atomic::AtomicU64::new(0),
+    };
 
+    // Map write lock just long enough to insert the per-collection RwLock handle.
     let mut collections = state.collections.write();
-    collections.insert(req.name.clone(), collection_state);
+    collections.insert(
+        req.name.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(collection_state)),
+    );
 
     Ok(Json(CreateCollectionRes { name: req.name, success: true }))
 }
@@ -508,8 +611,14 @@ async fn create_collection(
 async fn list_collections(
     State(state): State<AppState>,
 ) -> Json<ListCollectionsRes> {
-    let collections = state.collections.read();
-    let list = collections.values().map(|c| {
+    // Snapshot handles under a short map read lock so per-collection reads can
+    // run independently after the map lock is released.
+    let handles: Vec<std::sync::Arc<parking_lot::RwLock<CollectionState>>> = {
+        let collections = state.collections.read();
+        collections.values().cloned().collect()
+    };
+    let list = handles.iter().map(|h| {
+        let c = h.read();
         let status_str = c.status.read().unwrap().as_str().to_string();
         let quantization_type = match &c.config.quantization_config {
             Some(vf_core::types::QuantizationConfig::Scalar(_)) => "scalar".to_string(),
@@ -532,9 +641,10 @@ async fn get_collection(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionInfo>, (StatusCode, Json<ErrorResponse>)> {
-    let collections = state.collections.read();
-    let c = collections.get(&name)
+    state.require_collection_ready(&name).map_err(err_from_availability)?;
+    let coll_handle = state.collection_handle(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", name)))?;
+    let c = metered_read(&coll_handle);
     let status_str = c.status.read().unwrap().as_str().to_string();
     let quantization_type = match &c.config.quantization_config {
         Some(vf_core::types::QuantizationConfig::Scalar(_)) => "scalar".to_string(),
@@ -555,6 +665,8 @@ async fn delete_collection(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<DeleteCollectionRes>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::info!(target: "vf_server::audit", collection = %name, "audit: collection delete requested via REST");
+    state.require_collection_ready(&name).map_err(err_from_availability)?;
     // Remove from storage layer
     {
         let mut cm = state.collection_manager.write();
@@ -563,10 +675,16 @@ async fn delete_collection(
         }
     }
 
+    // Map write lock to evict the entry; any in-flight handler still holding
+    // an Arc<RwLock<CollectionState>> completes naturally and the inner state
+    // is dropped when the last Arc handle is released.
     let mut collections = state.collections.write();
     if collections.remove(&name).is_none() {
         return Err(err(StatusCode::NOT_FOUND, format!("collection '{}' not found", name)));
     }
+    // Drop any recovery_paths entry so /recovery_status does not surface a
+    // stale entry for a deleted collection.
+    state.recovery_paths.write().remove(&name);
     Ok(Json(DeleteCollectionRes { success: true }))
 }
 
@@ -577,6 +695,7 @@ async fn insert_vector(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<InsertVectorReq>,
 ) -> Result<Json<InsertVectorRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     if req.values.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "vector values must not be empty"));
     }
@@ -585,9 +704,9 @@ async fn insert_vector(
         .transpose()
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
-    let mut collections = state.collections.write();
-    let coll = collections.get_mut(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&coll_handle);
 
     if req.values.len() != coll.config.dimension {
         return Err(err(StatusCode::BAD_REQUEST, format!("vector dimension mismatch: expected {}, got {}", coll.config.dimension, req.values.len())));
@@ -624,10 +743,15 @@ async fn insert_vector(
         coll.index_manager.index_record(assigned_id, meta);
     }
 
-    if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-        &mut coll.graph, coll.index.as_vector_index(), assigned_id, &req.values, 10,
-    ) {
-        tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
+    {
+        // Reborrow the lock guard to a plain &mut CollectionState so the
+        // compiler can split the disjoint field borrows of graph and index.
+        let coll: &mut CollectionState = &mut *coll;
+        if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
+            &mut coll.graph, coll.index.as_vector_index(), assigned_id, &req.values, 10,
+        ) {
+            tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
+        }
     }
 
     coll.dirty.store(true, Ordering::Release);
@@ -640,9 +764,10 @@ async fn get_vector(
     State(state): State<AppState>,
     Path((collection, id)): Path<(String, u64)>,
 ) -> Result<Json<GetVectorRes>, (StatusCode, Json<ErrorResponse>)> {
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let meta_record = coll.store.get(id)
         .map_err(|e| err(StatusCode::NOT_FOUND, format!("vector not found: {}", e)))?;
@@ -663,6 +788,7 @@ async fn update_vector(
     Path((collection, id)): Path<(String, u64)>,
     ValidatedJson(req): ValidatedJson<UpdateVectorReq>,
 ) -> Result<Json<UpdateVectorRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     if req.values.is_none() && req.metadata.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "at least one of 'values' or 'metadata' must be provided"));
     }
@@ -677,9 +803,9 @@ async fn update_vector(
         .transpose()
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
-    let mut collections = state.collections.write();
-    let coll = collections.get_mut(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&coll_handle);
 
     if let Some(ref v) = req.values {
         if v.len() != coll.config.dimension {
@@ -725,9 +851,10 @@ async fn delete_vector(
     State(state): State<AppState>,
     Path((collection, id)): Path<(String, u64)>,
 ) -> Result<Json<DeleteVectorRes>, (StatusCode, Json<ErrorResponse>)> {
-    let mut collections = state.collections.write();
-    let coll = collections.get_mut(&collection)
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&coll_handle);
 
     coll.store.delete(id)
         .map_err(|e| err(StatusCode::NOT_FOUND, format!("delete failed: {}", e)))?;
@@ -760,10 +887,19 @@ async fn bulk_insert(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<BulkInsertReq>,
 ) -> Result<Json<BulkInsertRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let mut inserted_count: u64 = 0;
-    let mut errors: Vec<String> = Vec::new();
-    let mut inserted_ids: Vec<u64> = Vec::new();
-    let mut inserted_vectors: HashMap<u64, Vec<f32>> = HashMap::new();
+    // Pending errors carry an optional row id so the final reconciliation pass
+    // can drop entries for rows that did land in the store.
+    let mut pending_errors: Vec<(Option<u64>, String)> = Vec::new();
+    // Track ids successfully committed by THIS call only; reconciliation uses
+    // this set instead of a global store lookup to avoid false positives under
+    // concurrent overlapping bulk_inserts.
+    let mut committed_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Server-assigned ids in input order, parallel to committed_ids; pushed on
+    // each Ok store-insert arm and popped if the corresponding chunk rolls back
+    // so the final response only carries durably committed rows.
+    let mut assigned_ids: Vec<u64> = Vec::new();
 
     // Validate and extract optimization parameters
     let index_mode = req.index_mode.as_deref().unwrap_or("immediate");
@@ -809,13 +945,65 @@ async fn bulk_insert(
     let deferred_index_mode = index_mode == "deferred";
     let skip_metadata_index = req.skip_metadata_index.unwrap_or(false);
     let _parallel_build = parallel_build; // stored for optimize()
+    let checkpoint_every = req.checkpoint_every.unwrap_or(0);
+    let resume_token = req.resume_token.clone().unwrap_or_default();
 
-    // Verify collection exists before iterating
+    // Verify collection exists before iterating. Map read lock dropped at the
+    // end of the block; per-chunk lookups below use the per-collection handle.
     {
         let collections = state.collections.read();
         if !collections.contains_key(&collection) {
             return Err(err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)));
         }
+    }
+
+    // Resolve checkpoint path under the per-collection data dir.
+    let checkpoint_path = resolve_bulk_checkpoint_path(&state, &collection);
+
+    // Stable u64 id for the collection. Hashed from the collection name with
+    // DefaultHasher; collisions are tolerated because the id is only used to
+    // detect on-disk checkpoint drift, not for cross-collection identity.
+    let collection_id_hash = hash_collection_name(&collection);
+
+    // Resume handling: if the client supplied a token, validate against the
+    // on-disk checkpoint and compute the start chunk index. Otherwise start
+    // from the first chunk.
+    let mut start_chunk_idx: usize = 0;
+    let mut last_completed_batch_idx: u64 = 0;
+    let mut last_committed_lsn: u64 = 0;
+    let mut any_chunk_completed: bool = false;
+    if !resume_token.is_empty() {
+        let cp_path = match &checkpoint_path {
+            Some(p) => p.clone(),
+            None => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "resume_token provided but server cannot resolve a data directory for this collection"
+                        .to_string(),
+                ));
+            }
+        };
+        let cp = match vf_storage::bulk_checkpoint::BulkCheckpoint::read(&cp_path) {
+            Ok(cp) => cp,
+            Err(e) => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!("resume_token provided but no checkpoint on disk: {}", e),
+                ));
+            }
+        };
+        let expected = encode_resume_token(&collection, cp.last_committed_lsn);
+        if expected != resume_token {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "resume_token does not match on-disk checkpoint (client view diverged from server state)"
+                    .to_string(),
+            ));
+        }
+        start_chunk_idx = (cp.last_completed_batch_idx as usize).saturating_add(1);
+        last_completed_batch_idx = cp.last_completed_batch_idx;
+        last_committed_lsn = cp.last_committed_lsn;
+        any_chunk_completed = true;
     }
 
     // Pre-validate and parse all vectors before acquiring locks
@@ -829,14 +1017,16 @@ async fn bulk_insert(
     let mut prepared: Vec<PreparedVector> = Vec::with_capacity(req.vectors.len());
     for (i, v) in req.vectors.into_iter().enumerate() {
         if v.values.is_empty() {
-            errors.push(format!("item {}: missing or empty vector", i));
+            let tag = if v.id != 0 { Some(v.id) } else { None };
+            pending_errors.push((tag, format!("item {}: missing or empty vector", i)));
             continue;
         }
 
         let core_metadata = match v.metadata.as_ref().map(json_to_metadata).transpose() {
             Ok(m) => m,
             Err(e) => {
-                errors.push(format!("item {}: {}", i, e));
+                let tag = if v.id != 0 { Some(v.id) } else { None };
+                pending_errors.push((tag, format!("item {}: {}", i, e)));
                 continue;
             }
         };
@@ -849,44 +1039,79 @@ async fn bulk_insert(
         });
     }
 
-    // Process vectors in batches. Per item we now write WAL first to obtain
-    // the LSN, then call index.add_with_lsn so the hnsw.delta writer records
-    // the insert. This matches single-insert semantics and enables fast
-    // incremental replay after a hard restart.
-    for chunk in prepared.chunks(batch_lock_size.max(1)) {
-        let mut collections = state.collections.write();
-        let coll = match collections.get_mut(&collection) {
-            Some(c) => c,
+    // Process vectors in batches. Per chunk we write WAL first per item to
+    // obtain the LSN, then issue a single parallel bulk_add_with_lsn for the
+    // whole chunk so the hnsw.delta writer records inserts in input order and
+    // restart replay stays incremental.
+    // Owned chunks so per-row vector bytes can be moved (not cloned) into the
+    // Arc that the index path and the graph compute step both share.
+    let chunk_size = batch_lock_size.max(1);
+    let mut chunks: Vec<Vec<PreparedVector>> = Vec::new();
+    while !prepared.is_empty() {
+        let take = chunk_size.min(prepared.len());
+        chunks.push(prepared.drain(..take).collect());
+    }
+    let total_chunks = chunks.len();
+    let mut last_resume_token: String = String::new();
+
+    for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+        // Skip chunks already covered by the prior checkpoint.
+        if chunk_idx < start_chunk_idx {
+            continue;
+        }
+
+        // Per-collection write lock for the chunk; searches on OTHER collections
+        // continue to run because the map RwLock is no longer held in write mode.
+        let coll_handle = match state.collection_handle(&collection) {
+            Some(h) => h,
             None => {
                 for pv in chunk {
-                    errors.push(format!("item {}: collection '{}' not found", pv.index, collection));
+                    let tag = if pv.id != 0 { Some(pv.id) } else { None };
+                    pending_errors.push((tag, format!("item {}: collection '{}' not found", pv.index, collection)));
                 }
                 continue;
             }
         };
+        let mut coll = metered_write(&coll_handle);
+
+        // Per-item: validate, write metadata + WAL, gather (id, Arc<Vec<f32>>, lsn).
+        // Each vector is wrapped once in Arc; chunk_items and the graph compute
+        // map share Arc clones so the bulk path never duplicates the vector bytes.
+        let mut chunk_items: Vec<(VectorId, Arc<Vec<f32>>, u64)> = Vec::with_capacity(chunk.len());
+        let mut chunk_metas: Vec<Option<Metadata>> = Vec::with_capacity(chunk.len());
+        let mut chunk_max_lsn: u64 = last_committed_lsn;
 
         for pv in chunk {
             if pv.values.len() != coll.config.dimension {
-                errors.push(format!(
+                let tag = if pv.id != 0 { Some(pv.id) } else { None };
+                pending_errors.push((tag, format!(
                     "item {}: vector dimension mismatch: expected {}, got {}",
                     pv.index, coll.config.dimension, pv.values.len()
-                ));
+                )));
                 continue;
             }
 
             let assigned_id = if pv.id == 0 {
                 match coll.store.insert_metadata_auto_id(pv.metadata.clone()) {
-                    Ok(id) => id,
+                    Ok(id) => {
+                        committed_ids.insert(id);
+                        assigned_ids.push(id);
+                        id
+                    }
                     Err(e) => {
-                        errors.push(format!("item {}: store insert failed: {}", pv.index, e));
+                        pending_errors.push((None, format!("item {}: store insert failed: {}", pv.index, e)));
                         continue;
                     }
                 }
             } else {
                 match coll.store.insert_metadata(pv.id, pv.metadata.clone()) {
-                    Ok(()) => pv.id,
+                    Ok(()) => {
+                        committed_ids.insert(pv.id);
+                        assigned_ids.push(pv.id);
+                        pv.id
+                    }
                     Err(e) => {
-                        errors.push(format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e));
+                        pending_errors.push((Some(pv.id), format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e)));
                         continue;
                     }
                 }
@@ -909,55 +1134,126 @@ async fn bulk_insert(
                 }
             };
 
-            // Index: skip if deferred mode. add_with_lsn records the entry
-            // in the hnsw.delta writer for incremental replay on restart.
-            if !deferred_index_mode {
-                if let Err(e) = coll.index.add_with_lsn(assigned_id, &pv.values, lsn) {
-                    let _ = coll.store.delete(assigned_id);
-                    errors.push(format!("item {}: index insert failed: {}", pv.index, e));
-                    continue;
-                }
+            if lsn > chunk_max_lsn {
+                chunk_max_lsn = lsn;
             }
 
-            // Metadata index: skip if flag set
+            // Single Arc per row; the index path and the graph compute share it.
+            let vec_arc = Arc::new(pv.values);
+            chunk_items.push((assigned_id, vec_arc, lsn));
+            chunk_metas.push(pv.metadata);
+        }
+
+        // Single parallel bulk add for the chunk. Whole-batch-fails on any
+        // late dim or id collision; emit a per-row error so the response
+        // contract errors_count + inserted_count == rows_seen holds.
+        if !deferred_index_mode && !chunk_items.is_empty() {
+            if let Err(e) = coll.index.bulk_add_with_lsn(&chunk_items) {
+                let rolled_back: std::collections::HashSet<u64> =
+                    chunk_items.iter().map(|(id, _, _)| *id).collect();
+                // Rollback metadata-store inserts for this chunk.
+                for (id, _, _) in &chunk_items {
+                    let _ = coll.store.delete(*id);
+                    // Drop rolled-back ids so reconciliation does not
+                    // reclassify them as successful inserts.
+                    committed_ids.remove(id);
+                }
+                // Symmetric pop from assigned_ids so the response excludes
+                // rows that did not make it past the index step.
+                assigned_ids.retain(|id| !rolled_back.contains(id));
+                let err_str = format!(
+                    "chunk {}: bulk index insert failed: {}",
+                    chunk_idx, e
+                );
+                for (id, _, _) in &chunk_items {
+                    pending_errors.push((Some(*id), err_str.clone()));
+                }
+                drop(chunk_items);
+                drop(chunk_metas);
+                continue;
+            }
+        }
+
+        // Single pass: index metadata, count, and seed the graph compute map.
+        let mut chunk_ids: Vec<u64> = Vec::with_capacity(chunk_items.len());
+        let mut chunk_vectors_map: HashMap<u64, Arc<Vec<f32>>> =
+            HashMap::with_capacity(chunk_items.len());
+        for ((assigned_id, vec_arc, _), meta_opt) in chunk_items.iter().zip(chunk_metas.into_iter()) {
             if !skip_metadata_index {
-                if let Some(ref meta) = pv.metadata {
-                    coll.index_manager.index_record(assigned_id, meta);
+                if let Some(ref m) = meta_opt {
+                    coll.index_manager.index_record(*assigned_id, m);
                 }
             }
-
-            // Graph: compute per-vector only if not deferred
-            if !defer_graph {
-                if let Err(e) = vf_graph::RelationshipComputer::compute_for_vector(
-                    &mut coll.graph, coll.index.as_vector_index(), assigned_id, &pv.values, 10,
-                ) {
-                    tracing::warn!(collection = %collection, id = assigned_id, "graph compute failed: {}", e);
-                }
-            }
-
-            inserted_ids.push(assigned_id);
-            inserted_vectors.insert(assigned_id, pv.values.clone());
             inserted_count += 1;
+            chunk_ids.push(*assigned_id);
+            chunk_vectors_map.insert(*assigned_id, Arc::clone(vec_arc));
         }
-        // write lock released at end of chunk
-    }
+        drop(chunk_items);
 
-    // Batch graph recomputation (only when graph is NOT deferred)
-    if !defer_graph && !inserted_ids.is_empty() {
-        let mut collections = state.collections.write();
-        if let Some(coll) = collections.get_mut(&collection) {
-            if let Err(e) = vf_graph::RelationshipComputer::compute_batch(
-                &mut coll.graph, coll.index.as_vector_index(), &inserted_ids, &inserted_vectors, 10,
+        // Graph recompute for just this chunk while we still hold the write lock.
+        if !defer_graph && !chunk_ids.is_empty() {
+            // Reborrow the lock guard to a plain &mut CollectionState so the
+            // compiler can split the disjoint field borrows of graph and index.
+            let coll: &mut CollectionState = &mut *coll;
+            if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
+                &mut coll.graph,
+                coll.index.as_vector_index(),
+                &chunk_ids,
+                &chunk_vectors_map,
+                10,
             ) {
-                tracing::warn!(collection = %collection, "graph compute_batch after bulk_insert failed: {}", e);
+                tracing::warn!(collection = %collection, "graph compute_batch_parallel after bulk_insert failed: {}", e);
+            }
+        }
+        drop(chunk_vectors_map);
+        drop(chunk_ids);
+
+        // Mark the chunk as the most recently completed.
+        last_completed_batch_idx = chunk_idx as u64;
+        last_committed_lsn = chunk_max_lsn;
+        any_chunk_completed = true;
+
+        // Drop the per-collection write lock before any checkpoint IO so the
+        // checkpoint write does not block concurrent searches.
+        drop(coll);
+
+        // Persist a checkpoint every N completed chunks.
+        if checkpoint_every > 0 && (chunk_idx as u64 + 1) % (checkpoint_every as u64) == 0 {
+            if let Some(ref cp_path) = checkpoint_path {
+                let cp = vf_storage::bulk_checkpoint::BulkCheckpoint::new(
+                    collection_id_hash,
+                    last_completed_batch_idx,
+                    last_committed_lsn,
+                );
+                if let Err(e) = cp.write_atomic(cp_path) {
+                    tracing::warn!(
+                        collection = %collection,
+                        chunk_idx,
+                        "bulk_insert checkpoint write failed: {}",
+                        e
+                    );
+                } else {
+                    last_resume_token = encode_resume_token(&collection, last_committed_lsn);
+                }
             }
         }
     }
 
-    // Set deferred flags and update collection status if any optimization was deferred
+    // Return capacity ratchet from the metadata-index manager to the allocator
+    // now that the bulk write burst is done. Per-collection write lock; map lock
+    // stays free.
+    if inserted_count > 0 && !skip_metadata_index {
+        if let Some(handle) = state.collection_handle(&collection) {
+            let mut coll = metered_write(&handle);
+            coll.index_manager.compact();
+        }
+    }
+
+    // Set deferred flags and update collection status if any optimization was deferred.
+    // Per-collection read lock is enough; atomics and the inner status RwLock handle their own sync.
     if inserted_count > 0 && (deferred_index_mode || defer_graph || skip_metadata_index) {
-        let collections = state.collections.read();
-        if let Some(coll) = collections.get(&collection) {
+        if let Some(handle) = state.collection_handle(&collection) {
+            let coll = metered_read(&handle);
             if deferred_index_mode {
                 coll.deferred_index.store(true, Ordering::Release);
             }
@@ -974,7 +1270,409 @@ async fn bulk_insert(
         }
     }
 
-    Ok(Json(BulkInsertRes { inserted_count, errors }))
+    // Successful end-to-end completion: scrub the checkpoint so a future call
+    // does not see a stale resume state. Anything other than full completion
+    // (errors with chunks remaining unprocessed) leaves the file in place.
+    let fully_complete = any_chunk_completed
+        && total_chunks > 0
+        && last_completed_batch_idx as usize + 1 == total_chunks;
+    if fully_complete {
+        if let Some(ref cp_path) = checkpoint_path {
+            let _ = vf_storage::bulk_checkpoint::BulkCheckpoint::delete(cp_path);
+        }
+        last_resume_token = String::new();
+    }
+
+    // Reconcile pending errors against the live store. A row that landed in the
+    // collection must not appear in the user-facing errors list; reclaimed
+    // entries are counted as inserted so errors_count + inserted_count stays
+    // equal to rows_seen.
+    let mut errors: Vec<String> = Vec::with_capacity(pending_errors.len());
+    {
+        // Reconcile against this call's own committed set so a concurrent
+        // overlapping bulk_insert by another client cannot cause us to
+        // silently claim credit for rows we did not commit.
+        for (id_tag, msg) in pending_errors {
+            let committed = match id_tag {
+                Some(id) => committed_ids.contains(&id),
+                None => false,
+            };
+            if committed {
+                inserted_count += 1;
+            } else {
+                errors.push(msg);
+            }
+        }
+    }
+
+    // Snapshot HNSW base + graph base at end of a successful bulk_insert so
+    // the next restart picks IncrementalReplay (seconds) over FullRebuild
+    // (minutes). Mirrors the gRPC handler.
+    if inserted_count > 0 {
+        if let Err(e) = crate::snapshot::force_snapshot_collection(&state, &collection) {
+            tracing::warn!(
+                collection = %collection,
+                "post-bulk_insert snapshot failed: {}",
+                e
+            );
+        }
+    }
+
+    Ok(Json(BulkInsertRes {
+        inserted_count,
+        errors,
+        last_completed_batch_idx,
+        last_committed_lsn,
+        resume_token: last_resume_token,
+        assigned_ids,
+    }))
+}
+
+// ── Bulk insert from path handler ───────────────────────────────────────
+
+async fn bulk_insert_from_path(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<BulkInsertFromPathReq>,
+) -> Result<Json<BulkInsertRes>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::bulk_insert_from_path::{self as bifp, DatasetView, IdsSource};
+    use std::os::fd::AsRawFd;
+
+    state
+        .require_collection_ready(&collection)
+        .map_err(err_from_availability)?;
+
+    if req.path.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "path must not be empty"));
+    }
+
+    let index_mode = if req.index_mode.is_empty() {
+        "immediate"
+    } else {
+        req.index_mode.as_str()
+    };
+    validate_index_mode(index_mode)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let index_mode_deferred = index_mode == "deferred";
+    let skip_metadata_index = req.skip_metadata_index;
+
+    if req.ef_construction > 0 {
+        validate_ef_construction(req.ef_construction, state.max_ef_construction)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+
+    let allowed_roots = &state.config.bulk_insert_allowed_roots;
+    if allowed_roots.is_empty() {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "bulk_insert_allowed_roots is empty; server misconfigured",
+        ));
+    }
+
+    let mut root_files: Vec<std::fs::File> = Vec::with_capacity(allowed_roots.len());
+    for root in allowed_roots {
+        match std::fs::File::open(root) {
+            Ok(f) => root_files.push(f),
+            Err(e) => {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to open allow-list root {}: {}", root.display(), e),
+                ));
+            }
+        }
+    }
+    let root_fds: Vec<std::os::fd::RawFd> =
+        root_files.iter().map(|f| f.as_raw_fd()).collect();
+
+    let (data_file, mmap, view): (std::fs::File, memmap2::Mmap, DatasetView) =
+        match bifp::open_validated(&req.path, &root_fds, req.dim as usize, req.expected_count) {
+            Ok(t) => t,
+            Err(e) => return Err(map_bifp_error_rest(e)),
+        };
+    let _data_file = data_file;
+
+    let coll_handle = state.collection_handle(&collection).ok_or_else(|| {
+        err(
+            StatusCode::NOT_FOUND,
+            format!("collection '{}' not found", collection),
+        )
+    })?;
+
+    {
+        let coll = metered_read(&coll_handle);
+        if coll.config.dimension != view.dim {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "vector dimension mismatch: collection expects {}, file has {}",
+                    coll.config.dimension, view.dim
+                ),
+            ));
+        }
+    }
+
+    let row_bytes: &[u8] = &mmap[view.header_offset..];
+    if row_bytes.len() < view.count.saturating_mul(view.dim).saturating_mul(4) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "file is shorter than count * dim * 4 bytes",
+        ));
+    }
+    let flat: &[f32] = bytemuck::cast_slice(row_bytes);
+    let rows: Vec<&[f32]> = flat
+        .chunks_exact(view.dim)
+        .take(view.count)
+        .collect();
+
+    let ids_holder: IdsSource;
+    let ids: Vec<u64> = if req.ids_path.is_empty() {
+        let start = if req.id_start == 0 { 1 } else { req.id_start };
+        ids_holder = IdsSource::Sequential;
+        (0..view.count as u64).map(|i| start + i).collect()
+    } else {
+        match bifp::open_ids_validated(&req.ids_path, &root_fds, view.count) {
+            Ok((file, mmap_ids, ids_vec)) => {
+                ids_holder = IdsSource::Mmap { _file: file, _mmap: mmap_ids };
+                ids_vec
+            }
+            Err(e) => return Err(map_bifp_error_rest(e)),
+        }
+    };
+    let _ids_holder = ids_holder;
+
+    if ids.len() != rows.len() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "ids count {} does not match vectors count {}",
+                ids.len(),
+                rows.len()
+            ),
+        ));
+    }
+
+    let mut committed_ids: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(rows.len());
+    let mut assigned_ids: Vec<u64> = Vec::with_capacity(rows.len());
+    let mut pending_errors: Vec<(Option<u64>, String)> = Vec::new();
+    let mut inserted_count: u64 = 0;
+    let mut last_committed_lsn: u64 = 0;
+
+    let mut coll = metered_write(&coll_handle);
+
+    let mut row_ids: Vec<u64> = Vec::with_capacity(rows.len());
+    let mut row_vecs: Vec<&[f32]> = Vec::with_capacity(rows.len());
+    for (i, vec_slice) in rows.iter().enumerate() {
+        let id_in = ids[i];
+        match coll.store.insert_metadata(id_in, None) {
+            Ok(()) => {
+                committed_ids.insert(id_in);
+                assigned_ids.push(id_in);
+                row_ids.push(id_in);
+                row_vecs.push(*vec_slice);
+            }
+            Err(e) => {
+                pending_errors.push((
+                    Some(id_in),
+                    format!("row {}: store insert failed for id {}: {}", i, id_in, e),
+                ));
+            }
+        }
+    }
+
+    let mut lsns: Vec<u64> = Vec::with_capacity(row_ids.len());
+    {
+        let mut cm = state.collection_manager.write();
+        if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
+            for (idx, id_in) in row_ids.iter().enumerate() {
+                if let Err(e) = storage_coll.insert(
+                    *id_in,
+                    VectorData::F32(row_vecs[idx].to_vec()),
+                    None,
+                ) {
+                    tracing::warn!(
+                        collection = %collection,
+                        id = *id_in,
+                        "storage bulk_insert_from_path insert failed: {}",
+                        e
+                    );
+                }
+                let lsn = storage_coll.current_lsn().saturating_sub(1);
+                if lsn > last_committed_lsn {
+                    last_committed_lsn = lsn;
+                }
+                lsns.push(lsn);
+            }
+        } else {
+            for _ in &row_ids {
+                lsns.push(0);
+            }
+        }
+    }
+
+    let items: Vec<(VectorId, &[f32], u64)> = row_ids
+        .iter()
+        .zip(row_vecs.iter())
+        .zip(lsns.iter())
+        .map(|((id, v), lsn)| (*id, *v, *lsn))
+        .collect();
+
+    let total_hint = if req.total_count_hint == 0 {
+        items.len()
+    } else {
+        req.total_count_hint as usize
+    };
+
+    if !index_mode_deferred && !items.is_empty() {
+        if req.chunk_size == 0 {
+            // Non-chunked path: preserve existing behavior, single bulk_add
+            // under the already-held write guard.
+            if let Err(e) = coll.index.bulk_add_from_slice_iter(&items, total_hint) {
+                let rolled_back: std::collections::HashSet<u64> =
+                    items.iter().map(|(id, _, _)| *id).collect();
+                for (id, _, _) in &items {
+                    let _ = coll.store.delete(*id);
+                    committed_ids.remove(id);
+                }
+                assigned_ids.retain(|id| !rolled_back.contains(id));
+                let err_str = format!("bulk_insert_from_path: index insert failed: {}", e);
+                for (id, _, _) in &items {
+                    pending_errors.push((Some(*id), err_str.clone()));
+                }
+            } else {
+                inserted_count = items.len() as u64;
+            }
+        } else {
+            // Chunked path: drop the outer write guard, then for each chunk
+            // re-acquire a fresh write guard, run bulk_add, drop the guard,
+            // snapshot, prune WAL, and release memory back to the OS. This
+            // keeps resident memory bounded across very large bulk inserts.
+            drop(coll);
+
+            let chunk_sz = req.chunk_size as usize;
+            for chunk in items.chunks(chunk_sz) {
+                let handle = state.collection_handle(&collection).ok_or_else(|| {
+                    err(
+                        StatusCode::NOT_FOUND,
+                        format!("collection '{}' not found", collection),
+                    )
+                })?;
+                let coll_inner = metered_write(&handle);
+                if let Err(e) = coll_inner.index.bulk_add_from_slice_iter(chunk, total_hint) {
+                    let rolled_back: std::collections::HashSet<u64> =
+                        chunk.iter().map(|(id, _, _)| *id).collect();
+                    for (id, _, _) in chunk {
+                        let _ = coll_inner.store.delete(*id);
+                        committed_ids.remove(id);
+                    }
+                    drop(coll_inner);
+                    drop(handle);
+                    assigned_ids.retain(|id| !rolled_back.contains(id));
+                    let err_str =
+                        format!("bulk_insert_from_path: index insert failed: {}", e);
+                    for (id, _, _) in chunk {
+                        pending_errors.push((Some(*id), err_str.clone()));
+                    }
+                    break;
+                }
+                drop(coll_inner);
+                drop(handle);
+
+                if let Err(e) = crate::snapshot::force_snapshot_collection(&state, &collection)
+                {
+                    tracing::warn!(
+                        collection = %collection,
+                        "chunked bulk_insert_from_path: snapshot failed: {}",
+                        e
+                    );
+                }
+                if let Err(e) = state.prune_wal_for_collection(&collection) {
+                    tracing::warn!(
+                        collection = %collection,
+                        "chunked bulk_insert_from_path: prune_wal failed: {}",
+                        e
+                    );
+                }
+                vf_index::release_to_os();
+
+                inserted_count += chunk.len() as u64;
+            }
+
+            // Re-acquire the write guard on the SAME collection handle so
+            // the trailing compact / deferred-flag bookkeeping below can
+            // proceed under a held write lock, mirroring the non-chunked
+            // path.
+            coll = metered_write(&coll_handle);
+        }
+    } else if index_mode_deferred {
+        inserted_count = items.len() as u64;
+        if !items.is_empty() {
+            coll.deferred_index.store(true, Ordering::Release);
+        }
+    }
+
+    if !skip_metadata_index {
+        coll.index_manager.compact();
+    } else if !items.is_empty() {
+        coll.deferred_metadata.store(true, Ordering::Release);
+    }
+
+    drop(coll);
+
+    let mut errors: Vec<String> = Vec::with_capacity(pending_errors.len());
+    for (id_tag, msg) in pending_errors {
+        let committed = match id_tag {
+            Some(id) => committed_ids.contains(&id),
+            None => false,
+        };
+        if committed {
+            inserted_count += 1;
+        } else {
+            errors.push(msg);
+        }
+    }
+
+    // Always snapshot the HNSW base + graph base at the end of a successful
+    // bulk_insert_from_path call (single-pass branch). The chunked path
+    // already snapshots per chunk. Without this, the single-pass path
+    // leaves a fat hnsw.delta and no hnsw.base, forcing FullRebuild on
+    // any restart. Snapshot failures are logged but not surfaced because
+    // the WAL holds the durable record; the next snapshot covers it.
+    if inserted_count > 0 {
+        if let Err(e) = crate::snapshot::force_snapshot_collection(&state, &collection) {
+            tracing::warn!(
+                collection = %collection,
+                "post-bulk_insert_from_path snapshot failed: {}",
+                e
+            );
+        }
+    }
+
+    Ok(Json(BulkInsertRes {
+        inserted_count,
+        errors,
+        last_completed_batch_idx: 0,
+        last_committed_lsn,
+        resume_token: String::new(),
+        assigned_ids,
+    }))
+}
+
+fn map_bifp_error_rest(
+    e: crate::bulk_insert_from_path::BulkFromPathError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    use crate::bulk_insert_from_path::BulkFromPathError as E;
+    let msg = e.to_string();
+    match e {
+        E::PathDenied { .. } => err(StatusCode::FORBIDDEN, msg),
+        E::RelativePath { .. }
+        | E::TraversalAttempt { .. }
+        | E::NullByte { .. }
+        | E::BadMagic { .. }
+        | E::DimensionMismatch { .. }
+        | E::CountMismatch { .. } => err(StatusCode::BAD_REQUEST, msg),
+        E::MmapFailed { .. } | E::Io { .. } => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
 }
 
 // ── Optimize handler ────────────────────────────────────────────────────
@@ -1000,6 +1698,7 @@ async fn optimize_collection(
     Path(collection): Path<String>,
     body: Option<Json<OptimizeReq>>,
 ) -> Result<Json<OptimizeRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let rebuild_graph = body.map_or(false, |b| b.rebuild_graph);
     match state.optimize_collection(&collection, rebuild_graph) {
         Ok(result) => Ok(Json(OptimizeRes {
@@ -1022,6 +1721,7 @@ async fn prune_wal_collection(
     State(state): State<AppState>,
     Path(collection): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let start = std::time::Instant::now();
 
     match state.prune_wal_for_collection(&collection) {
@@ -1055,6 +1755,7 @@ async fn compact_collection(
     Path(collection): Path<String>,
     body: Option<Json<CompactReq>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let start = std::time::Instant::now();
     let req = body.map(|b| b.0).unwrap_or(CompactReq { min_segments: 0, remove_deleted: true });
 
@@ -1075,6 +1776,112 @@ async fn compact_collection(
     }
 }
 
+// ── Recovery / persistence / snapshot / metrics handlers ────────────────
+
+#[derive(Serialize)]
+struct RecoveryStatusEntry {
+    name: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct RecoveryStatusRes {
+    path: String,
+    elapsed_secs: u64,
+    collections: Vec<RecoveryStatusEntry>,
+}
+
+async fn recovery_status(
+    State(state): State<AppState>,
+) -> Json<RecoveryStatusRes> {
+    let snap = state.recovery_status_snapshot();
+    let mut collections: Vec<RecoveryStatusEntry> = snap
+        .paths
+        .iter()
+        .map(|(name, p)| RecoveryStatusEntry {
+            name: name.clone(),
+            path: p.as_str().to_string(),
+        })
+        .collect();
+    collections.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(RecoveryStatusRes {
+        path: snap.path.as_str().to_string(),
+        elapsed_secs: snap.elapsed_secs,
+        collections,
+    })
+}
+
+#[derive(Serialize)]
+struct SnapshotRes {
+    last_snapshot_lsn: u64,
+}
+
+async fn snapshot_collection(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<SnapshotRes>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .require_collection_ready(&collection)
+        .map_err(err_from_availability)?;
+    match crate::snapshot::force_snapshot_collection(&state, &collection) {
+        Ok(lsn) => Ok(Json(SnapshotRes { last_snapshot_lsn: lsn })),
+        Err(e) if e.contains("not found") => Err(err(StatusCode::NOT_FOUND, e)),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+#[derive(Serialize)]
+struct PersistenceStatusRes {
+    last_snapshot_lsn: u64,
+    current_lsn: u64,
+    next_lsn: u64,
+}
+
+async fn persistence_status(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<PersistenceStatusRes>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .require_collection_ready(&collection)
+        .map_err(err_from_availability)?;
+    match state.persistence_status(&collection) {
+        Ok(p) => Ok(Json(PersistenceStatusRes {
+            last_snapshot_lsn: p.last_snapshot_lsn,
+            current_lsn: p.current_lsn,
+            next_lsn: p.next_lsn,
+        })),
+        Err(e) if e.contains("not found") => Err(err(StatusCode::NOT_FOUND, e)),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+#[derive(Serialize)]
+struct CollectionMetricsRes {
+    map_lock_acquisitions: u64,
+    collection_read_acquisitions: u64,
+    collection_write_acquisitions: u64,
+    total_blocked_microseconds: u64,
+}
+
+async fn collection_metrics(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<CollectionMetricsRes>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .require_collection_ready(&collection)
+        .map_err(err_from_availability)?;
+    match state.collection_metrics(&collection) {
+        Ok(m) => Ok(Json(CollectionMetricsRes {
+            map_lock_acquisitions: m.map_lock_acquisitions,
+            collection_read_acquisitions: m.collection_read_acquisitions,
+            collection_write_acquisitions: m.collection_write_acquisitions,
+            total_blocked_microseconds: m.total_blocked_microseconds,
+        })),
+        Err(e) if e.contains("not found") => Err(err(StatusCode::NOT_FOUND, e)),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
 // ── Search handlers ─────────────────────────────────────────────────────
 
 async fn search(
@@ -1082,6 +1889,7 @@ async fn search(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<SearchReq>,
 ) -> Result<Json<SearchRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
 
     if req.query.is_empty() {
@@ -1102,9 +1910,9 @@ async fn search(
         metrics::record_ef_search(ef, &collection);
     }
 
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     if req.query.len() != coll.config.dimension {
         return Err(err(StatusCode::BAD_REQUEST, format!("query dimension mismatch: expected {}, got {}", coll.config.dimension, req.query.len())));
@@ -1181,14 +1989,22 @@ async fn batch_search(
         return Ok(Json(BatchSearchRes { results: vec![], total_time_us: 0 }));
     }
 
-    let collections = state.collections.read();
+    // Per-query availability guard: each query may target a different
+    // collection. The guard must run before the read-lock acquisition so a
+    // recovering collection produces a 503 (with retry-after info) rather
+    // than a 404, matching the gRPC counterpart.
+    for q in &req.queries {
+        state.require_collection_ready(&q.collection).map_err(err_from_availability)?;
+    }
+
     let mut responses = Vec::with_capacity(req.queries.len());
 
     for q in &req.queries {
         let query_timer = Instant::now();
 
-        let coll = collections.get(&q.collection)
+        let coll_handle = state.collection_handle(&q.collection)
             .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", q.collection)))?;
+        let coll = metered_read(&coll_handle);
 
         if q.query.is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "query vector is required"));
@@ -1283,9 +2099,10 @@ async fn get_related(
     Path((collection, id)): Path<(String, u64)>,
     Query(params): Query<GetRelatedQuery>,
 ) -> Result<Json<GetRelatedRes>, (StatusCode, Json<ErrorResponse>)> {
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let threshold = params.threshold.filter(|&t| t > 0.0);
 
@@ -1317,9 +2134,10 @@ async fn traverse(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<TraverseReq>,
 ) -> Result<Json<TraverseRes>, (StatusCode, Json<ErrorResponse>)> {
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let threshold = req.threshold.filter(|&t| t > 0.0);
     let max_results = req.max_results.filter(|&m| m > 0).map(|m| m as usize);
@@ -1355,9 +2173,10 @@ async fn set_threshold(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<SetThresholdReq>,
 ) -> Result<Json<SetThresholdRes>, (StatusCode, Json<ErrorResponse>)> {
-    let mut collections = state.collections.write();
-    let coll = collections.get_mut(&collection)
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&coll_handle);
 
     if req.vector_id == 0 {
         coll.graph.config_mut().default_threshold = req.threshold;
@@ -1719,10 +2538,11 @@ async fn detect_ghosts(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<DetectGhostsReq>,
 ) -> Result<Json<DetectGhostsRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let owned_vectors = get_vectors_from_collection(&*coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
@@ -1764,10 +2584,11 @@ async fn cone_search(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ConeSearchReq>,
 ) -> Result<Json<ConeSearchRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     if req.direction.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "direction vector is required"));
@@ -1796,10 +2617,11 @@ async fn compute_centroid(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ComputeCentroidReq>,
 ) -> Result<Json<ComputeCentroidRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let owned_vectors = get_vectors_from_collection(&*coll.index, &req.vector_ids);
     let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
@@ -1863,10 +2685,11 @@ async fn detect_drift(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<DetectDriftReq>,
 ) -> Result<Json<DetectDriftRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let owned_w1 = get_vectors_from_collection(&*coll.index, &req.window1_ids);
     let owned_w2 = get_vectors_from_collection(&*coll.index, &req.window2_ids);
@@ -1900,10 +2723,11 @@ async fn cluster(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ClusterReq>,
 ) -> Result<Json<ClusterRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let owned_vectors = get_vectors_from_collection(&*coll.index, &[]);
     let vectors: Vec<(VectorId, &[f32])> = owned_vectors
@@ -1940,10 +2764,11 @@ async fn reduce_dimensions(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<ReduceDimensionsReq>,
 ) -> Result<Json<ReduceDimensionsRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     let owned_vectors = get_vectors_from_collection(&*coll.index, &req.vector_ids);
     let vec_slices: Vec<&[f32]> = owned_vectors.iter().map(|(_, v)| v.as_slice()).collect();
@@ -2008,10 +2833,11 @@ async fn diversity_sample(
     Path(collection): Path<String>,
     ValidatedJson(req): ValidatedJson<DiversitySampleReq>,
 ) -> Result<Json<DiversitySampleRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let timer = Instant::now();
-    let collections = state.collections.read();
-    let coll = collections.get(&collection)
+    let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
 
     if req.query.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "query vector is required"));

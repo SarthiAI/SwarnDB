@@ -8,7 +8,7 @@ the SwarnDB Python SDK.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -109,13 +109,18 @@ class NumpyMixin:
         """
         return self.search.query(collection, to_list(query), k, **kwargs)
 
-    def np_get(self, collection: str, id: int) -> Tuple[np.ndarray, dict]:
+    def np_get(
+        self, collection: str, id: int
+    ) -> Optional[Tuple[np.ndarray, dict]]:
         """Get a vector as a numpy array.
 
         Returns:
-            A tuple of ``(np.ndarray, metadata_dict)``.
+            A tuple of ``(np.ndarray, metadata_dict)``, or ``None`` if
+            no vector with the given id exists.
         """
         record = self.vectors.get(collection, id)
+        if record is None:
+            return None
         return to_numpy(record.vector), record.metadata
 
     def np_centroid(self, collection: str, **kwargs) -> np.ndarray:
