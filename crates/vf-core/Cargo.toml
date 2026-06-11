@@ -16,6 +16,7 @@ half = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

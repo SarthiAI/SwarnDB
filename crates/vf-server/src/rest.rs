@@ -10,17 +10,17 @@ use std::time::Instant;
 
 use axum::extract::{Path, Query, State, FromRequest};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use vf_core::store::InMemoryVectorStore;
 use vf_core::types::{
-    CollectionConfig, DataTypeConfig, DistanceMetricType, Metadata, MetadataValue,
+    CollectionConfig, DataTypeConfig, DistanceMetricType, Metadata, MetadataValue, Mode,
     SearchQuantizationParams, VectorId,
 };
 use vf_core::vector::VectorData;
-use vf_graph::{GraphTraversal, RelationshipQueryEngine, TraversalOrder};
+use vf_graph::{GraphStore, GraphTraversal, RelationshipQueryEngine, TraversalOrder};
 use vf_query::vector_math::*;
 use vf_query::{FilterExpression, FilterStrategy, IndexManager, QueryExecutor};
 
@@ -116,9 +116,23 @@ pub struct CreateCollectionReq {
     pub m: Option<u32>,
     #[serde(default)]
     pub ef_construction: Option<u32>,
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 fn default_distance() -> String { "cosine".to_string() }
+
+/// Parse the optional REST mode string into the core Mode. None defaults to
+/// VectorOnly (the new-collection default); an unknown value is a 400.
+fn parse_mode(s: Option<&str>) -> Result<Mode, (StatusCode, Json<ErrorResponse>)> {
+    match s {
+        None => Ok(Mode::VectorOnly),
+        Some("vector_only") => Ok(Mode::VectorOnly),
+        Some("auto_similarity") => Ok(Mode::AutoSimilarity),
+        Some("hybrid") => Ok(Mode::Hybrid),
+        Some(other) => Err(err(StatusCode::BAD_REQUEST, format!("unknown mode: {}", other))),
+    }
+}
 
 #[derive(Serialize)]
 pub struct CreateCollectionRes {
@@ -132,6 +146,9 @@ pub struct CollectionInfo {
     pub dimension: u32,
     pub distance_metric: String,
     pub vector_count: u64,
+    // Live HNSW index node count. May trail vector_count under a deferred /
+    // pending-optimization build; vector_count stays the stored-row count.
+    pub indexed_count: u64,
     pub default_threshold: f32,
     pub status: String,
     pub quantization_type: String,
@@ -402,6 +419,201 @@ pub struct SetThresholdRes {
     pub success: bool,
 }
 
+// ── Hybrid query types (P02) ────────────────────────────────────────────
+
+/// A node row in a hybrid query response. `node` is present when the typed
+/// store resolved the id; absent for an unmaterialized vector hit.
+#[derive(Serialize)]
+pub struct HybridNodeRes {
+    pub id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<vf_graph::Node>,
+}
+
+#[derive(Serialize)]
+pub struct HybridQueryRes {
+    pub nodes: Vec<HybridNodeRes>,
+    pub edges: Vec<vf_graph::TypedEdge>,
+    pub paths: Vec<Vec<u64>>,
+}
+
+// ── Typed graph CRUD types (P04) ─────────────────────────────────────────
+//
+// Node/edge JSON shape is the same one hybrid_query emits: we serialize
+// vf_graph::Node and vf_graph::TypedEdge directly, so edges carry id, source,
+// target, edge_type, properties, provenance, confidence, verified, is_manual,
+// created_at, and history (action/actor/at). No separate DTO is introduced for
+// the node/edge body to keep the shape identical across the API.
+
+#[derive(Deserialize)]
+pub struct PutNodeReq {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PutNodeRes {
+    pub id: u64,
+}
+
+#[derive(Serialize)]
+pub struct DeletedRes {
+    pub deleted: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ListEdgesQuery {
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub edge_type: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ListEdgesRes {
+    pub edges: Vec<vf_graph::TypedEdge>,
+}
+
+#[derive(Deserialize)]
+pub struct PutEdgeReq {
+    pub source: u64,
+    pub target: u64,
+    pub edge_type: String,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub provenance: Option<serde_json::Value>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub is_manual: bool,
+    // P17. Optional temporal validity window and context; absent = None.
+    #[serde(default)]
+    pub valid_from: Option<u64>,
+    #[serde(default)]
+    pub valid_until: Option<u64>,
+    #[serde(default)]
+    pub temporal_context: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PutEdgeRes {
+    pub id: u64,
+}
+
+// Absent field = unchanged (proto3-optional parity).
+#[derive(Deserialize)]
+pub struct UpdateEdgeReq {
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub verified: Option<bool>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct EdgeRes {
+    pub edge: vf_graph::TypedEdge,
+}
+
+// Absent field = unchanged (proto3-optional parity). Only properties are
+// mutable; provenance and the embedding are immutable.
+#[derive(Deserialize)]
+pub struct UpdateNodeReq {
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct NodeRes {
+    pub node: vf_graph::Node,
+}
+
+// Body for verify/reject: an optional actor, or an empty body.
+#[derive(Deserialize, Default)]
+pub struct ActorReq {
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RejectEdgeRes {
+    pub deleted: bool,
+    pub rule_added: bool,
+}
+
+#[derive(Deserialize)]
+pub struct BulkImportEdgesReq {
+    pub format: String,
+    pub data: String,
+    #[serde(default)]
+    pub auto_add_edge_types: bool,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BulkImportRowErrorRes {
+    pub row: u64,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct BulkImportEdgesRes {
+    pub total_rows: u64,
+    pub imported: u64,
+    pub failed: u64,
+    pub errors: Vec<BulkImportRowErrorRes>,
+}
+
+// ── Document diff / re-extraction types (P04) ────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DiffDocumentReq {
+    pub doc_id: String,
+    #[serde(default)]
+    pub chunks: Vec<ChunkReq>,
+}
+
+#[derive(Serialize)]
+pub struct ChunkDiffRes {
+    pub chunk_id: u64,
+    pub action: String,
+}
+
+#[derive(Serialize)]
+pub struct DiffDocumentRes {
+    pub diffs: Vec<ChunkDiffRes>,
+}
+
+#[derive(Serialize)]
+pub struct ReextractDocumentRes {
+    pub job_id: String,
+    pub unchanged: u64,
+    pub changed: u64,
+    pub added: u64,
+    pub deleted: u64,
+    pub edges_deleted: u64,
+    pub nodes_deleted: u64,
+}
+
 // ── Router ──────────────────────────────────────────────────────────────
 
 pub fn rest_router(state: AppState) -> Router {
@@ -436,6 +648,38 @@ pub fn rest_router(state: AppState) -> Router {
         .route("/api/v1/collections/{collection}/graph/related/{id}", get(get_related))
         .route("/api/v1/collections/{collection}/graph/traverse", post(traverse))
         .route("/api/v1/collections/{collection}/graph/threshold", post(set_threshold))
+        .route("/api/v1/collections/{collection}/hybrid_query", post(hybrid_query))
+        // Typed graph CRUD + manual-edge lifecycle (Hybrid mode only)
+        .route("/api/v1/collections/{collection}/graph/nodes", post(rest_put_node))
+        .route("/api/v1/collections/{collection}/graph/nodes/{node_id}", get(rest_get_node))
+        .route("/api/v1/collections/{collection}/graph/nodes/{node_id}", patch(rest_update_node))
+        .route("/api/v1/collections/{collection}/graph/nodes/{node_id}", delete(rest_delete_node))
+        .route("/api/v1/collections/{collection}/graph/nodes/{node_id}/edges", get(rest_list_edges))
+        .route("/api/v1/collections/{collection}/graph/edges", post(rest_put_edge))
+        // Static path declared before the {edge_id} param routes to avoid any
+        // matchit static-vs-param ambiguity.
+        .route("/api/v1/collections/{collection}/graph/bulk-import-edges", post(rest_bulk_import_edges))
+        .route("/api/v1/collections/{collection}/graph/edges/{edge_id}", get(rest_get_edge))
+        .route("/api/v1/collections/{collection}/graph/edges/{edge_id}", patch(rest_update_edge))
+        .route("/api/v1/collections/{collection}/graph/edges/{edge_id}", delete(rest_delete_edge))
+        .route("/api/v1/collections/{collection}/graph/edges/{edge_id}/verify", post(rest_verify_edge))
+        .route("/api/v1/collections/{collection}/graph/edges/{edge_id}/reject", post(rest_reject_edge))
+        // Extraction (Hybrid mode only)
+        .route("/api/v1/collections/{collection}/llm-config", put(set_llm_config))
+        .route("/api/v1/collections/{collection}/llm-config", get(get_llm_config))
+        .route("/api/v1/collections/{collection}/llm-config/rotate", post(rotate_llm_config))
+        .route("/api/v1/collections/{collection}/ontology", put(set_ontology))
+        .route("/api/v1/collections/{collection}/ontology", get(get_ontology))
+        .route("/api/v1/collections/{collection}/extraction/cost-preview", post(extraction_cost_preview))
+        .route("/api/v1/collections/{collection}/extraction", post(start_extraction))
+        .route("/api/v1/collections/{collection}/extraction/{job_id}", get(extraction_status))
+        .route("/api/v1/collections/{collection}/extraction/{job_id}/cancel", post(cancel_extraction))
+        .route("/api/v1/collections/{collection}/proposals", get(list_proposals))
+        .route("/api/v1/collections/{collection}/proposals/{id}/approve", post(approve_proposal))
+        .route("/api/v1/collections/{collection}/proposals/{id}/reject", post(reject_proposal))
+        // Document-update diff and re-extraction (Hybrid mode only, P04)
+        .route("/api/v1/collections/{collection}/extraction/diff", post(rest_diff_document))
+        .route("/api/v1/collections/{collection}/extraction/reextract", post(rest_reextract_document))
         // Vector Math
         .route("/api/v1/collections/{collection}/math/ghosts", post(detect_ghosts))
         .route("/api/v1/collections/{collection}/math/cone", post(cone_search))
@@ -489,6 +733,8 @@ async fn create_collection(
         None => None,
     };
 
+    let parsed_mode = parse_mode(req.mode.as_deref())?;
+
     let config = CollectionConfig {
         name: req.name.clone(),
         dimension,
@@ -497,6 +743,7 @@ async fn create_collection(
         max_vectors: req.max_vectors as usize,
         data_type: DataTypeConfig::F32,
         quantization_config,
+        mode: Some(parsed_mode),
     };
 
     // Check for duplicate in-memory BEFORE persisting to storage
@@ -580,12 +827,24 @@ async fn create_collection(
         None => vf_graph::VirtualGraph::with_threshold(0.7, distance_metric),
     };
 
+    // Typed graph store for Hybrid collections (ADR-007 R4); None otherwise.
+    let graph_store = {
+        let dir = {
+            let cm = state.collection_manager.read();
+            cm.get_collection(&req.name)
+                .map(|c| c.collection_dir().to_path_buf())
+                .ok()
+        };
+        dir.and_then(|d| crate::state::AppState::create_hybrid_graph_store(&d, &config))
+    };
+
     let collection_state = CollectionState {
         config,
         store,
         index,
         index_manager,
         graph,
+        graph_store,
         metadata_cache: MetadataCache::new(),
         status: std::sync::Arc::new(std::sync::RwLock::new(crate::state::CollectionStatus::Ready)),
         deferred_index: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -599,11 +858,17 @@ async fn create_collection(
     };
 
     // Map write lock just long enough to insert the per-collection RwLock handle.
-    let mut collections = state.collections.write();
-    collections.insert(
-        req.name.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(collection_state)),
-    );
+    {
+        let mut collections = state.collections.write();
+        collections.insert(
+            req.name.clone(),
+            std::sync::Arc::new(parking_lot::RwLock::new(collection_state)),
+        );
+    }
+
+    // Register the extraction runtime for Hybrid collections now that the
+    // handle is published. A no-op for VectorOnly / AutoSimilarity.
+    state.register_extraction_if_hybrid(&req.name);
 
     Ok(Json(CreateCollectionRes { name: req.name, success: true }))
 }
@@ -629,6 +894,7 @@ async fn list_collections(
             dimension: c.config.dimension as u32,
             distance_metric: distance_metric_to_string(c.config.distance_metric),
             vector_count: c.store.len() as u64,
+            indexed_count: c.index.len() as u64,
             default_threshold: c.config.default_similarity_threshold.unwrap_or(0.0),
             status: status_str,
             quantization_type,
@@ -655,6 +921,7 @@ async fn get_collection(
         dimension: c.config.dimension as u32,
         distance_metric: distance_metric_to_string(c.config.distance_metric),
         vector_count: c.store.len() as u64,
+        indexed_count: c.index.len() as u64,
         default_threshold: c.config.default_similarity_threshold.unwrap_or(0.0),
         status: status_str,
         quantization_type,
@@ -667,6 +934,10 @@ async fn delete_collection(
 ) -> Result<Json<DeleteCollectionRes>, (StatusCode, Json<ErrorResponse>)> {
     tracing::info!(target: "vf_server::audit", collection = %name, "audit: collection delete requested via REST");
     state.require_collection_ready(&name).map_err(err_from_availability)?;
+    // Cancel any in-flight extraction jobs for this collection and drop its
+    // extraction runtime, so a dropped collection never leaves a runaway job
+    // (ADR-016). Cooperative cancel: workers drain and skip its chunks.
+    state.extraction.cancel_collection_jobs(&name);
     // Remove from storage layer
     {
         let mut cm = state.collection_manager.write();
@@ -743,7 +1014,8 @@ async fn insert_vector(
         coll.index_manager.index_record(assigned_id, meta);
     }
 
-    {
+    // Only populate the similarity graph when the resolved mode enables it.
+    if coll.config.graph_enabled() {
         // Reborrow the lock guard to a plain &mut CollectionState so the
         // compiler can split the disjoint field borrows of graph and index.
         let coll: &mut CollectionState = &mut *coll;
@@ -1072,88 +1344,129 @@ async fn bulk_insert(
                 continue;
             }
         };
-        let mut coll = metered_write(&coll_handle);
-
-        // Per-item: validate, write metadata + WAL, gather (id, Arc<Vec<f32>>, lsn).
+        // Phase 1: acquire the per-collection write guard and run the per-item
+        // validate + store + WAL inserts inside its own lexical scope so the
+        // non-Send guard is dropped at the block's closing brace, before any
+        // await. The block returns the owned values the post-build phase needs.
+        //
         // Each vector is wrapped once in Arc; chunk_items and the graph compute
         // map share Arc clones so the bulk path never duplicates the vector bytes.
-        let mut chunk_items: Vec<(VectorId, Arc<Vec<f32>>, u64)> = Vec::with_capacity(chunk.len());
-        let mut chunk_metas: Vec<Option<Metadata>> = Vec::with_capacity(chunk.len());
-        let mut chunk_max_lsn: u64 = last_committed_lsn;
+        let (mut chunk_items, chunk_metas, chunk_max_lsn): (
+            Vec<(VectorId, Arc<Vec<f32>>, u64)>,
+            Vec<Option<Metadata>>,
+            u64,
+        ) = {
+            let coll = metered_write(&coll_handle);
 
-        for pv in chunk {
-            if pv.values.len() != coll.config.dimension {
-                let tag = if pv.id != 0 { Some(pv.id) } else { None };
-                pending_errors.push((tag, format!(
-                    "item {}: vector dimension mismatch: expected {}, got {}",
-                    pv.index, coll.config.dimension, pv.values.len()
-                )));
-                continue;
-            }
+            let mut chunk_items: Vec<(VectorId, Arc<Vec<f32>>, u64)> = Vec::with_capacity(chunk.len());
+            let mut chunk_metas: Vec<Option<Metadata>> = Vec::with_capacity(chunk.len());
+            let mut chunk_max_lsn: u64 = last_committed_lsn;
 
-            let assigned_id = if pv.id == 0 {
-                match coll.store.insert_metadata_auto_id(pv.metadata.clone()) {
-                    Ok(id) => {
-                        committed_ids.insert(id);
-                        assigned_ids.push(id);
-                        id
-                    }
-                    Err(e) => {
-                        pending_errors.push((None, format!("item {}: store insert failed: {}", pv.index, e)));
-                        continue;
-                    }
+            for pv in chunk {
+                if pv.values.len() != coll.config.dimension {
+                    let tag = if pv.id != 0 { Some(pv.id) } else { None };
+                    pending_errors.push((tag, format!(
+                        "item {}: vector dimension mismatch: expected {}, got {}",
+                        pv.index, coll.config.dimension, pv.values.len()
+                    )));
+                    continue;
                 }
-            } else {
-                match coll.store.insert_metadata(pv.id, pv.metadata.clone()) {
-                    Ok(()) => {
-                        committed_ids.insert(pv.id);
-                        assigned_ids.push(pv.id);
-                        pv.id
-                    }
-                    Err(e) => {
-                        pending_errors.push((Some(pv.id), format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e)));
-                        continue;
-                    }
-                }
-            };
 
-            // Persist to storage layer first so we can capture the WAL LSN.
-            let lsn = {
-                let mut cm = state.collection_manager.write();
-                if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
-                    if let Err(e) = storage_coll.insert(
-                        assigned_id,
-                        VectorData::F32(pv.values.clone()),
-                        pv.metadata.clone(),
-                    ) {
-                        tracing::warn!(collection = %collection, id = assigned_id, "storage bulk insert failed: {}", e);
+                let assigned_id = if pv.id == 0 {
+                    match coll.store.insert_metadata_auto_id(pv.metadata.clone()) {
+                        Ok(id) => {
+                            committed_ids.insert(id);
+                            assigned_ids.push(id);
+                            id
+                        }
+                        Err(e) => {
+                            pending_errors.push((None, format!("item {}: store insert failed: {}", pv.index, e)));
+                            continue;
+                        }
                     }
-                    storage_coll.current_lsn().saturating_sub(1)
                 } else {
-                    0
-                }
-            };
+                    match coll.store.insert_metadata(pv.id, pv.metadata.clone()) {
+                        Ok(()) => {
+                            committed_ids.insert(pv.id);
+                            assigned_ids.push(pv.id);
+                            pv.id
+                        }
+                        Err(e) => {
+                            pending_errors.push((Some(pv.id), format!("item {}: store insert failed for id {}: {}", pv.index, pv.id, e)));
+                            continue;
+                        }
+                    }
+                };
 
-            if lsn > chunk_max_lsn {
-                chunk_max_lsn = lsn;
+                // Persist to storage layer first so we can capture the WAL LSN.
+                let lsn = {
+                    let mut cm = state.collection_manager.write();
+                    if let Ok(storage_coll) = cm.get_collection_mut(&collection) {
+                        if let Err(e) = storage_coll.insert(
+                            assigned_id,
+                            VectorData::F32(pv.values.clone()),
+                            pv.metadata.clone(),
+                        ) {
+                            tracing::warn!(collection = %collection, id = assigned_id, "storage bulk insert failed: {}", e);
+                        }
+                        storage_coll.current_lsn().saturating_sub(1)
+                    } else {
+                        0
+                    }
+                };
+
+                if lsn > chunk_max_lsn {
+                    chunk_max_lsn = lsn;
+                }
+
+                // Single Arc per row; the index path and the graph compute share it.
+                let vec_arc = Arc::new(pv.values);
+                chunk_items.push((assigned_id, vec_arc, lsn));
+                chunk_metas.push(pv.metadata);
             }
 
-            // Single Arc per row; the index path and the graph compute share it.
-            let vec_arc = Arc::new(pv.values);
-            chunk_items.push((assigned_id, vec_arc, lsn));
-            chunk_metas.push(pv.metadata);
-        }
+            (chunk_items, chunk_metas, chunk_max_lsn)
+        };
+        // <-- per-collection write guard dropped here, before the await.
 
         // Single parallel bulk add for the chunk. Whole-batch-fails on any
         // late dim or id collision; emit a per-row error so the response
         // contract errors_count + inserted_count == rows_seen holds.
         if !deferred_index_mode && !chunk_items.is_empty() {
-            if let Err(e) = coll.index.bulk_add_with_lsn(&chunk_items) {
+            // Capture ids for D-1 rollback and run the CPU-bound build in
+            // spawn_blocking (which acquires its own fresh guard). No guard is
+            // held across the await; the post-build phase acquires a separate
+            // fresh guard binding.
+            let chunk_ids_for_rollback: Vec<u64> =
+                chunk_items.iter().map(|(id, _, _)| *id).collect();
+
+            let build_handle = coll_handle.clone();
+            let items = std::mem::take(&mut chunk_items);
+            let build_res = tokio::task::spawn_blocking(move || {
+                let coll = metered_write(&build_handle);
+                match coll.index.bulk_add_with_lsn(&items) {
+                    Ok(()) => Ok(items),
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
+
+            let build_err = match build_res {
+                Ok(Ok(returned_items)) => {
+                    chunk_items = returned_items;
+                    None
+                }
+                Ok(Err(e)) => Some(format!("{}", e)),
+                Err(join_err) => Some(format!("bulk index build task join error: {join_err}")),
+            };
+            if let Some(e) = build_err {
+                // D-1 rollback under a fresh post-await guard binding.
+                let coll_post = metered_write(&coll_handle);
                 let rolled_back: std::collections::HashSet<u64> =
-                    chunk_items.iter().map(|(id, _, _)| *id).collect();
+                    chunk_ids_for_rollback.iter().copied().collect();
                 // Rollback metadata-store inserts for this chunk.
-                for (id, _, _) in &chunk_items {
-                    let _ = coll.store.delete(*id);
+                for id in &chunk_ids_for_rollback {
+                    let _ = coll_post.store.delete(*id);
                     // Drop rolled-back ids so reconciliation does not
                     // reclassify them as successful inserts.
                     committed_ids.remove(id);
@@ -1165,57 +1478,66 @@ async fn bulk_insert(
                     "chunk {}: bulk index insert failed: {}",
                     chunk_idx, e
                 );
-                for (id, _, _) in &chunk_items {
+                for id in &chunk_ids_for_rollback {
                     pending_errors.push((Some(*id), err_str.clone()));
                 }
-                drop(chunk_items);
+                drop(coll_post);
                 drop(chunk_metas);
                 continue;
             }
         }
 
-        // Single pass: index metadata, count, and seed the graph compute map.
-        let mut chunk_ids: Vec<u64> = Vec::with_capacity(chunk_items.len());
-        let mut chunk_vectors_map: HashMap<u64, Arc<Vec<f32>>> =
-            HashMap::with_capacity(chunk_items.len());
-        for ((assigned_id, vec_arc, _), meta_opt) in chunk_items.iter().zip(chunk_metas.into_iter()) {
-            if !skip_metadata_index {
-                if let Some(ref m) = meta_opt {
-                    coll.index_manager.index_record(*assigned_id, m);
+        // Post-build phase: the metadata + graph work runs inside an inner block
+        // so the !Send write guard's region ends before the await below. An
+        // explicit drop() is not enough to shrink the async state machine's
+        // captured region; only a lexical block reliably scopes the guard out so
+        // the handler future stays Send (axum Handler requires Send).
+        {
+            let mut coll = metered_write(&coll_handle);
+
+            // Single pass: index metadata, count, and seed the graph compute map.
+            let mut chunk_ids: Vec<u64> = Vec::with_capacity(chunk_items.len());
+            let mut chunk_vectors_map: HashMap<u64, Arc<Vec<f32>>> =
+                HashMap::with_capacity(chunk_items.len());
+            for ((assigned_id, vec_arc, _), meta_opt) in chunk_items.iter().zip(chunk_metas.into_iter()) {
+                if !skip_metadata_index {
+                    if let Some(ref m) = meta_opt {
+                        coll.index_manager.index_record(*assigned_id, m);
+                    }
+                }
+                inserted_count += 1;
+                chunk_ids.push(*assigned_id);
+                chunk_vectors_map.insert(*assigned_id, Arc::clone(vec_arc));
+            }
+            drop(chunk_items);
+
+            // Graph recompute for just this chunk while we still hold the write lock.
+            // Skipped when the resolved mode disables the graph (vector-only).
+            if !defer_graph && coll.config.graph_enabled() && !chunk_ids.is_empty() {
+                // Reborrow the lock guard to a plain &mut CollectionState so the
+                // compiler can split the disjoint field borrows of graph and index.
+                let coll: &mut CollectionState = &mut *coll;
+                if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
+                    &mut coll.graph,
+                    coll.index.as_vector_index(),
+                    &chunk_ids,
+                    &chunk_vectors_map,
+                    10,
+                ) {
+                    tracing::warn!(collection = %collection, "graph compute_batch_parallel after bulk_insert failed: {}", e);
                 }
             }
-            inserted_count += 1;
-            chunk_ids.push(*assigned_id);
-            chunk_vectors_map.insert(*assigned_id, Arc::clone(vec_arc));
+            drop(chunk_vectors_map);
+            drop(chunk_ids);
+            // The per-collection write lock is released at the end of this block,
+            // before any checkpoint IO or await, so the checkpoint write does not
+            // block concurrent searches.
         }
-        drop(chunk_items);
-
-        // Graph recompute for just this chunk while we still hold the write lock.
-        if !defer_graph && !chunk_ids.is_empty() {
-            // Reborrow the lock guard to a plain &mut CollectionState so the
-            // compiler can split the disjoint field borrows of graph and index.
-            let coll: &mut CollectionState = &mut *coll;
-            if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
-                &mut coll.graph,
-                coll.index.as_vector_index(),
-                &chunk_ids,
-                &chunk_vectors_map,
-                10,
-            ) {
-                tracing::warn!(collection = %collection, "graph compute_batch_parallel after bulk_insert failed: {}", e);
-            }
-        }
-        drop(chunk_vectors_map);
-        drop(chunk_ids);
 
         // Mark the chunk as the most recently completed.
         last_completed_batch_idx = chunk_idx as u64;
         last_committed_lsn = chunk_max_lsn;
         any_chunk_completed = true;
-
-        // Drop the per-collection write lock before any checkpoint IO so the
-        // checkpoint write does not block concurrent searches.
-        drop(coll);
 
         // Persist a checkpoint every N completed chunks.
         if checkpoint_every > 0 && (chunk_idx as u64 + 1) % (checkpoint_every as u64) == 0 {
@@ -1237,6 +1559,9 @@ async fn bulk_insert(
                 }
             }
         }
+
+        // Yield between chunks so the runtime can schedule probes and reads.
+        tokio::task::yield_now().await;
     }
 
     // Return capacity ratchet from the metadata-index manager to the allocator
@@ -1390,6 +1715,12 @@ async fn bulk_insert_from_path(
             Err(e) => return Err(map_bifp_error_rest(e)),
         };
     let _data_file = data_file;
+    // F14: own the mmap behind an Arc so the CPU-bound HNSW build can be
+    // offloaded to spawn_blocking. Each build closure takes an Arc clone
+    // (refcount bump only; the mapped pages stay shared, zero copy) and
+    // reconstructs its row slices inside the blocking thread, so no mmap borrow
+    // is ever held across an .await.
+    let mmap = std::sync::Arc::new(mmap);
 
     let coll_handle = state.collection_handle(&collection).ok_or_else(|| {
         err(
@@ -1458,24 +1789,33 @@ async fn bulk_insert_from_path(
     let mut inserted_count: u64 = 0;
     let mut last_committed_lsn: u64 = 0;
 
-    let mut coll = metered_write(&coll_handle);
-
+    // `row_orig_idx` records each survivor's original dense row index so the
+    // F14 offload can reconstruct its mmap slice inside spawn_blocking without
+    // holding a borrow across the await.
     let mut row_ids: Vec<u64> = Vec::with_capacity(rows.len());
     let mut row_vecs: Vec<&[f32]> = Vec::with_capacity(rows.len());
-    for (i, vec_slice) in rows.iter().enumerate() {
-        let id_in = ids[i];
-        match coll.store.insert_metadata(id_in, None) {
-            Ok(()) => {
-                committed_ids.insert(id_in);
-                assigned_ids.push(id_in);
-                row_ids.push(id_in);
-                row_vecs.push(*vec_slice);
-            }
-            Err(e) => {
-                pending_errors.push((
-                    Some(id_in),
-                    format!("row {}: store insert failed for id {}: {}", i, id_in, e),
-                ));
+    let mut row_orig_idx: Vec<usize> = Vec::with_capacity(rows.len());
+    // Per-collection write lock for the metadata-store inserts. The guard lives
+    // only inside this block so the non-Send parking_lot guard is dropped at the
+    // closing brace, well before any spawn_blocking().await below.
+    {
+        let coll = metered_write(&coll_handle);
+        for (i, vec_slice) in rows.iter().enumerate() {
+            let id_in = ids[i];
+            match coll.store.insert_metadata(id_in, None) {
+                Ok(()) => {
+                    committed_ids.insert(id_in);
+                    assigned_ids.push(id_in);
+                    row_ids.push(id_in);
+                    row_vecs.push(*vec_slice);
+                    row_orig_idx.push(i);
+                }
+                Err(e) => {
+                    pending_errors.push((
+                        Some(id_in),
+                        format!("row {}: store insert failed for id {}: {}", i, id_in, e),
+                    ));
+                }
             }
         }
     }
@@ -1523,60 +1863,163 @@ async fn bulk_insert_from_path(
         req.total_count_hint as usize
     };
 
-    if !index_mode_deferred && !items.is_empty() {
-        if req.chunk_size == 0 {
-            // Non-chunked path: preserve existing behavior, single bulk_add
-            // under the already-held write guard.
-            if let Err(e) = coll.index.bulk_add_from_slice_iter(&items, total_hint) {
-                let rolled_back: std::collections::HashSet<u64> =
-                    items.iter().map(|(id, _, _)| *id).collect();
-                for (id, _, _) in &items {
-                    let _ = coll.store.delete(*id);
-                    committed_ids.remove(id);
-                }
-                assigned_ids.retain(|id| !rolled_back.contains(id));
-                let err_str = format!("bulk_insert_from_path: index insert failed: {}", e);
-                for (id, _, _) in &items {
-                    pending_errors.push((Some(*id), err_str.clone()));
-                }
-            } else {
-                inserted_count = items.len() as u64;
-            }
-        } else {
-            // Chunked path: drop the outer write guard, then for each chunk
-            // re-acquire a fresh write guard, run bulk_add, drop the guard,
-            // snapshot, prune WAL, and release memory back to the OS. This
-            // keeps resident memory bounded across very large bulk inserts.
-            drop(coll);
+    // F14: capture the row layout as owned, mmap-independent data so the
+    // CPU-bound HNSW build can move into spawn_blocking. `items` only borrows
+    // the mmap; the offloaded build instead carries (id, orig_idx, lsn) triples
+    // plus an Arc<Mmap> clone and rebuilds the &[f32] slices inside the blocking
+    // thread. Dimension and header offset are plain usize copies. We keep
+    // bulk_add_from_slice_iter (NOT bulk_add_with_lsn) so the chunked path does
+    // not re-snapshot all prior nodes per chunk.
+    let build_rows: Vec<(VectorId, usize, u64)> = row_ids
+        .iter()
+        .zip(row_orig_idx.iter())
+        .zip(lsns.iter())
+        .map(|((id, orig), lsn)| (*id, *orig, *lsn))
+        .collect();
+    // Stable count for the post-build deferred / metadata / F3 bookkeeping;
+    // build_rows itself is moved into the (non-chunked) build closure.
+    let item_count = build_rows.len();
+    let view_dim = view.dim;
+    let view_header_offset = view.header_offset;
+    // Drop the mmap-borrowing bindings before the build so only the Arc keeps
+    // the mapping alive; the closures reconstruct slices on demand.
+    drop(items);
+    drop(row_vecs);
+    drop(rows);
 
-            let chunk_sz = req.chunk_size as usize;
-            for chunk in items.chunks(chunk_sz) {
-                let handle = state.collection_handle(&collection).ok_or_else(|| {
-                    err(
-                        StatusCode::NOT_FOUND,
-                        format!("collection '{}' not found", collection),
-                    )
-                })?;
-                let coll_inner = metered_write(&handle);
-                if let Err(e) = coll_inner.index.bulk_add_from_slice_iter(chunk, total_hint) {
+    if !index_mode_deferred && !build_rows.is_empty() {
+        if req.chunk_size == 0 {
+            // Non-chunked path: offload the full single bulk_add to
+            // spawn_blocking. The metadata-insert guard was already dropped at
+            // its block above, so no parking_lot guard crosses the await; the
+            // closure takes a fresh guard on the same handle and rebuilds the
+            // borrowed slices from the Arc<Mmap> clone.
+            let build_handle = coll_handle.clone();
+            let mmap_for_build = mmap.clone();
+            let rows_for_build = build_rows;
+            let build_res = tokio::task::spawn_blocking(move || {
+                let flat: &[f32] =
+                    bytemuck::cast_slice(&mmap_for_build[view_header_offset..]);
+                let items: Vec<(VectorId, &[f32], u64)> = rows_for_build
+                    .iter()
+                    .map(|(id, orig, lsn)| {
+                        let start = orig * view_dim;
+                        (*id, &flat[start..start + view_dim], *lsn)
+                    })
+                    .collect();
+                let coll = metered_write(&build_handle);
+                match coll.index.bulk_add_from_slice_iter(&items, total_hint) {
+                    Ok(()) => Ok(rows_for_build),
+                    Err(e) => Err((format!("{}", e), rows_for_build)),
+                }
+            })
+            .await;
+
+            match build_res {
+                Ok(Ok(built_rows)) => {
+                    inserted_count = built_rows.len() as u64;
+                }
+                Ok(Err((e, failed_rows))) => {
+                    // Rollback under a fresh post-await guard binding.
+                    let coll_post = metered_write(&coll_handle);
                     let rolled_back: std::collections::HashSet<u64> =
-                        chunk.iter().map(|(id, _, _)| *id).collect();
-                    for (id, _, _) in chunk {
-                        let _ = coll_inner.store.delete(*id);
+                        failed_rows.iter().map(|(id, _, _)| *id).collect();
+                    for (id, _, _) in &failed_rows {
+                        let _ = coll_post.store.delete(*id);
                         committed_ids.remove(id);
                     }
-                    drop(coll_inner);
-                    drop(handle);
+                    drop(coll_post);
                     assigned_ids.retain(|id| !rolled_back.contains(id));
-                    let err_str =
-                        format!("bulk_insert_from_path: index insert failed: {}", e);
-                    for (id, _, _) in chunk {
+                    let err_str = format!("bulk_insert_from_path: index insert failed: {}", e);
+                    for (id, _, _) in &failed_rows {
                         pending_errors.push((Some(*id), err_str.clone()));
                     }
-                    break;
                 }
-                drop(coll_inner);
-                drop(handle);
+                Err(join_err) => {
+                    let err_str = format!(
+                        "bulk_insert_from_path: index build task join error: {join_err}"
+                    );
+                    let coll_post = metered_write(&coll_handle);
+                    for id in &assigned_ids {
+                        let _ = coll_post.store.delete(*id);
+                        committed_ids.remove(id);
+                    }
+                    drop(coll_post);
+                    for id in &assigned_ids {
+                        pending_errors.push((Some(*id), err_str.clone()));
+                    }
+                    assigned_ids.clear();
+                }
+            }
+        } else {
+            // Chunked path: no parking_lot guard is live here (the
+            // metadata-insert guard was dropped at its block above); for each
+            // chunk, offload the bulk_add to spawn_blocking (fresh guard inside,
+            // slices rebuilt from an Arc<Mmap> clone), then snapshot, prune WAL,
+            // and release memory back to the OS on the async side.
+            let chunk_sz = req.chunk_size as usize;
+            for chunk in build_rows.chunks(chunk_sz) {
+                let build_handle = coll_handle.clone();
+                let mmap_for_build = mmap.clone();
+                let chunk_rows: Vec<(VectorId, usize, u64)> = chunk.to_vec();
+                let build_res = tokio::task::spawn_blocking(move || {
+                    let flat: &[f32] =
+                        bytemuck::cast_slice(&mmap_for_build[view_header_offset..]);
+                    let items: Vec<(VectorId, &[f32], u64)> = chunk_rows
+                        .iter()
+                        .map(|(id, orig, lsn)| {
+                            let start = orig * view_dim;
+                            (*id, &flat[start..start + view_dim], *lsn)
+                        })
+                        .collect();
+                    let coll_inner = metered_write(&build_handle);
+                    match coll_inner.index.bulk_add_from_slice_iter(&items, total_hint) {
+                        Ok(()) => Ok(chunk_rows),
+                        Err(e) => Err((format!("{}", e), chunk_rows)),
+                    }
+                })
+                .await;
+
+                match build_res {
+                    Ok(Ok(built_rows)) => {
+                        inserted_count += built_rows.len() as u64;
+                    }
+                    Ok(Err((e, failed_rows))) => {
+                        let coll_inner = metered_write(&coll_handle);
+                        let rolled_back: std::collections::HashSet<u64> =
+                            failed_rows.iter().map(|(id, _, _)| *id).collect();
+                        for (id, _, _) in &failed_rows {
+                            let _ = coll_inner.store.delete(*id);
+                            committed_ids.remove(id);
+                        }
+                        drop(coll_inner);
+                        assigned_ids.retain(|id| !rolled_back.contains(id));
+                        let err_str =
+                            format!("bulk_insert_from_path: index insert failed: {}", e);
+                        for (id, _, _) in &failed_rows {
+                            pending_errors.push((Some(*id), err_str.clone()));
+                        }
+                        break;
+                    }
+                    Err(join_err) => {
+                        let err_str = format!(
+                            "bulk_insert_from_path: index build task join error: {join_err}"
+                        );
+                        let coll_inner = metered_write(&coll_handle);
+                        let rolled_back: std::collections::HashSet<u64> =
+                            chunk.iter().map(|(id, _, _)| *id).collect();
+                        for (id, _, _) in chunk {
+                            let _ = coll_inner.store.delete(*id);
+                            committed_ids.remove(id);
+                        }
+                        drop(coll_inner);
+                        assigned_ids.retain(|id| !rolled_back.contains(id));
+                        for (id, _, _) in chunk {
+                            pending_errors.push((Some(*id), err_str.clone()));
+                        }
+                        break;
+                    }
+                }
 
                 if let Err(e) = crate::snapshot::force_snapshot_collection(&state, &collection)
                 {
@@ -1594,27 +2037,45 @@ async fn bulk_insert_from_path(
                     );
                 }
                 vf_index::release_to_os();
-
-                inserted_count += chunk.len() as u64;
             }
-
-            // Re-acquire the write guard on the SAME collection handle so
-            // the trailing compact / deferred-flag bookkeeping below can
-            // proceed under a held write lock, mirroring the non-chunked
-            // path.
-            coll = metered_write(&coll_handle);
         }
     } else if index_mode_deferred {
-        inserted_count = items.len() as u64;
-        if !items.is_empty() {
-            coll.deferred_index.store(true, Ordering::Release);
-        }
+        inserted_count = item_count as u64;
+    }
+
+    // I12 (ADR-025): the file mapping is no longer needed once the build is done.
+    // Drop our Arc and purge the allocator arenas so the build-time heap freed
+    // inside bulk_add_from_slice_iter returns to the OS now.
+    drop(mmap);
+    vf_index::purge_allocator_arenas();
+
+    // Post-build bookkeeping under one fresh write guard, acquired AFTER all
+    // spawn_blocking().await points so no parking_lot guard ever crosses an
+    // await. Mirrors the post-build fresh-guard binding in
+    // bulk_insert_with_options. `mut` is required because
+    // IndexManager::compact takes &mut self.
+    let mut coll = metered_write(&coll_handle);
+
+    if index_mode_deferred && item_count > 0 {
+        coll.deferred_index.store(true, Ordering::Release);
     }
 
     if !skip_metadata_index {
         coll.index_manager.compact();
-    } else if !items.is_empty() {
+    } else if item_count > 0 {
         coll.deferred_metadata.store(true, Ordering::Release);
+    }
+
+    // F3: when anything was deferred, flip the collection to
+    // PendingOptimization so searches surface the stale-results warning and do
+    // not silently return 0 over an unbuilt index. Mirrors the REST bulk_insert
+    // deferred bookkeeping (~rest.rs:1547-1562).
+    let any_deferred = (index_mode_deferred && item_count > 0)
+        || (skip_metadata_index && item_count > 0);
+    if any_deferred {
+        if let Ok(mut status) = coll.status.write() {
+            *status = CollectionStatus::PendingOptimization;
+        }
     }
 
     drop(coll);
@@ -1700,7 +2161,7 @@ async fn optimize_collection(
 ) -> Result<Json<OptimizeRes>, (StatusCode, Json<ErrorResponse>)> {
     state.require_collection_ready(&collection).map_err(err_from_availability)?;
     let rebuild_graph = body.map_or(false, |b| b.rebuild_graph);
-    match state.optimize_collection(&collection, rebuild_graph) {
+    match state.optimize_collection(&collection, rebuild_graph).await {
         Ok(result) => Ok(Json(OptimizeRes {
             status: result.status,
             message: result.message,
@@ -1761,7 +2222,22 @@ async fn compact_collection(
 
     let min_segments = if req.min_segments == 0 { 4 } else { req.min_segments as usize };
 
-    match state.compact_collection(&collection, min_segments, req.remove_deleted) {
+    // F7: the on-disk segment merge inside compact_collection holds the global
+    // collection_manager write lock for its whole duration. Running it inline
+    // would pin a runtime worker (and stall /readyz) for the full merge. Offload
+    // to spawn_blocking on a cheap AppState clone (Arc bumps); the global write
+    // lock is acquired inside the closure and released the moment the merge
+    // returns. No parking_lot guard crosses the await.
+    let remove_deleted = req.remove_deleted;
+    let compact_state = state.clone();
+    let compact_collection_name = collection.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        compact_state.compact_collection(&compact_collection_name, min_segments, remove_deleted)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("compact task join error: {e}")))?;
+
+    match result {
         Ok(result) => {
             let duration_ms = start.elapsed().as_millis() as u64;
             Ok(Json(serde_json::json!({
@@ -1976,6 +2452,7 @@ async fn search(
         ScoredResult { id: r.id, score: r.score, metadata, graph_edges }
     }).collect();
 
+    metrics::record_search_latency_rest(timer, &collection);
     Ok(Json(SearchRes { results: scored, search_time_us: timer.elapsed().as_micros() as u64, warning }))
 }
 
@@ -2086,6 +2563,7 @@ async fn batch_search(
             ScoredResult { id: r.id, score: r.score, metadata, graph_edges }
         }).collect();
 
+        metrics::record_search_latency_rest(query_timer, &q.collection);
         responses.push(SearchRes { results: scored, search_time_us: query_timer.elapsed().as_micros() as u64, warning });
     }
 
@@ -2103,6 +2581,13 @@ async fn get_related(
     let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
     let coll = metered_read(&coll_handle);
+
+    if coll.config.is_vector_only() {
+        return Err(err(StatusCode::PRECONDITION_FAILED, format!(
+            "collection '{}' is in vector-only mode; graph queries are not available",
+            collection
+        )));
+    }
 
     let threshold = params.threshold.filter(|&t| t > 0.0);
 
@@ -2138,6 +2623,13 @@ async fn traverse(
     let coll_handle = state.collection_handle(&collection)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
     let coll = metered_read(&coll_handle);
+
+    if coll.config.is_vector_only() {
+        return Err(err(StatusCode::PRECONDITION_FAILED, format!(
+            "collection '{}' is in vector-only mode; graph queries are not available",
+            collection
+        )));
+    }
 
     let threshold = req.threshold.filter(|&t| t > 0.0);
     let max_results = req.max_results.filter(|&m| m > 0).map(|m| m as usize);
@@ -2178,6 +2670,13 @@ async fn set_threshold(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
     let mut coll = metered_write(&coll_handle);
 
+    if coll.config.is_vector_only() {
+        return Err(err(StatusCode::PRECONDITION_FAILED, format!(
+            "collection '{}' is in vector-only mode; graph queries are not available",
+            collection
+        )));
+    }
+
     if req.vector_id == 0 {
         coll.graph.config_mut().default_threshold = req.threshold;
         coll.deferred_graph.store(true, Ordering::Release);
@@ -2186,6 +2685,673 @@ async fn set_threshold(
     }
 
     Ok(Json(SetThresholdRes { success: true }))
+}
+
+// ── Hybrid query handler (P02) ──────────────────────────────────────────
+
+// The body is a serde QueryPlan directly; no proto translation for REST. The
+// plan's steps run as composed: the default graph-augmented ranking is the
+// vector_rank step (graph-first scope-then-rank, ADR-024). RRF is the opt-in
+// fusion path on the gRPC surface (an explicit RrfRankSpec on the request).
+async fn hybrid_query(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(plan): ValidatedJson<vf_query::hybrid::QueryPlan>,
+) -> Result<Json<HybridQueryRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let coll_handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&coll_handle);
+
+    // Hybrid queries need a graph layer; reject vector-only. AutoSimilarity is
+    // allowed and runs against an empty typed store.
+    if coll.config.effective_mode() == Mode::VectorOnly {
+        return Err(err(StatusCode::PRECONDITION_FAILED, format!(
+            "collection '{}' is in vector-only mode; hybrid queries are not available",
+            collection
+        )));
+    }
+
+    // Bind a typed store: the collection's own when present, else a local
+    // empty store kept alive for the executor borrow.
+    let fallback;
+    let store: &dyn vf_graph::GraphStore = match coll.graph_store.as_ref() {
+        Some(s) => s,
+        None => {
+            fallback = vf_graph::TypedGraphStore::with_defaults();
+            &fallback
+        }
+    };
+
+    let hybrid_timer = Instant::now();
+    let exec = vf_query::hybrid::HybridExecutor::new(coll.index.as_vector_index(), store);
+    // The executor is CPU-bound and synchronous, and runs while holding the
+    // collection read guard. Offload it onto the blocking pool via
+    // block_in_place so the async runtime (and the /readyz /livez probes)
+    // stays responsive during a large VectorRank. block_in_place runs the
+    // closure on the current worker thread, so borrowing exec and plan is
+    // fine (no 'static bound, unlike spawn_blocking). Requires the
+    // multi-threaded runtime, which main.rs uses (#[tokio::main] default).
+    let result = tokio::task::block_in_place(|| exec.execute(&plan))
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    metrics::record_hybrid_query_latency(hybrid_timer);
+
+    let mut res = HybridQueryRes { nodes: Vec::new(), edges: Vec::new(), paths: Vec::new() };
+    match result {
+        vf_query::hybrid::QueryResult::Nodes(records) => {
+            res.nodes = records.into_iter()
+                .map(|r| HybridNodeRes { id: r.id.0, node: r.node })
+                .collect();
+        }
+        vf_query::hybrid::QueryResult::Edges(edges) => {
+            res.edges = edges;
+        }
+        vf_query::hybrid::QueryResult::Paths(paths) => {
+            res.paths = paths.into_iter()
+                .map(|p| p.nodes.iter().map(|n| n.0).collect())
+                .collect();
+        }
+    }
+    Ok(Json(res))
+}
+
+// ── Typed graph helpers (P04) ────────────────────────────────────────────
+
+// Parse an optional JSON value into a property map. None -> empty map.
+fn parse_props_value(
+    v: Option<serde_json::Value>,
+) -> Result<HashMap<String, serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(HashMap::new()),
+        Some(serde_json::Value::Object(m)) => Ok(m.into_iter().collect()),
+        Some(_) => Err(err(StatusCode::BAD_REQUEST, "properties must be a JSON object")),
+    }
+}
+
+// Parse an optional JSON provenance value. None -> default provenance.
+fn parse_provenance_value(
+    v: Option<serde_json::Value>,
+) -> Result<vf_graph::Provenance, (StatusCode, Json<ErrorResponse>)> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(vf_graph::Provenance::default()),
+        Some(value) => serde_json::from_value(value)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid provenance: {e}"))),
+    }
+}
+
+fn parse_node_source(s: Option<&str>) -> vf_graph::NodeSource {
+    match s {
+        Some("ingested") => vf_graph::NodeSource::Ingested,
+        Some("extracted") => vf_graph::NodeSource::Extracted,
+        _ => vf_graph::NodeSource::Manual,
+    }
+}
+
+fn parse_edge_direction(s: Option<&str>) -> vf_graph::EdgeDirection {
+    match s {
+        Some("incoming") => vf_graph::EdgeDirection::Incoming,
+        Some("both") => vf_graph::EdgeDirection::Both,
+        _ => vf_graph::EdgeDirection::Outgoing,
+    }
+}
+
+// Empty/blank actor means no actor recorded.
+fn actor_opt(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
+// Best-effort display name for a node: its "name" property if present.
+fn node_display_name(store: &vf_graph::TypedGraphStore, id: vf_graph::NodeId) -> Option<String> {
+    store
+        .get_node(id)
+        .and_then(|n| n.properties.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+// Current LSN for the collection, defaulting to 0 when unknown.
+fn current_lsn(state: &AppState, collection: &str) -> u64 {
+    let cm = state.collection_manager.read();
+    cm.get_collection(collection).map(|c| c.current_lsn()).unwrap_or(0)
+}
+
+// 412 returned when a collection lacks a typed graph store (not hybrid mode).
+fn not_hybrid_err(collection: &str) -> (StatusCode, Json<ErrorResponse>) {
+    err(
+        StatusCode::PRECONDITION_FAILED,
+        format!("collection '{}' is not in hybrid mode; typed graph is unavailable", collection),
+    )
+}
+
+// ── Typed graph handlers (P04) ───────────────────────────────────────────
+
+async fn rest_put_node(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<PutNodeReq>,
+) -> Result<Json<PutNodeRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let kind = match req.kind.as_deref() {
+        Some("entity") => vf_graph::NodeKind::Entity {
+            label: req.label.clone().unwrap_or_default(),
+        },
+        _ => vf_graph::NodeKind::Content,
+    };
+    // Consistency guard: a content node with an embedding via put_node would be stored
+    // inline but never indexed into HNSW, so it would not be searchable and would break the
+    // NodeId==VectorId bridge. Searchable content vectors must go through vectors.insert.
+    // Entity nodes may carry an inline embedding (graph-scoped vector_rank), and content
+    // placeholders without an embedding remain allowed.
+    if matches!(kind, vf_graph::NodeKind::Content) && !req.embedding.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "put_node: a content node with an embedding is not searchable via put_node; \
+             create it with vectors.insert (which assigns the id, indexes the vector, and \
+             links the content node by the NodeId==VectorId bridge). put_node is for entity \
+             nodes (which may carry an inline embedding for graph-scoped ranking) and for \
+             content placeholders without an embedding.",
+        ));
+    }
+    let properties = parse_props_value(req.properties)?;
+    let source = parse_node_source(req.source.as_deref());
+
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&handle);
+    let lsn = current_lsn(&state, &collection);
+    let coll_ref = &mut *coll;
+    // Allocate the node id from the unified per-collection id authority (the
+    // vector store's next_id) BEFORE taking the &mut graph_store borrow, so
+    // entity ids can never collide with vector/content ids. The id is not
+    // inserted into vectors, so the NodeId == VectorId bridge stays content-only.
+    let id = vf_graph::NodeId(coll_ref.store.alloc_id());
+    let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+    let node = vf_graph::Node {
+        id,
+        kind,
+        properties,
+        embedding: if req.embedding.is_empty() { None } else { Some(req.embedding) },
+        source,
+        created_at: vf_graph::now_millis(),
+        created_by: actor_opt(req.created_by),
+        updated_at: None,
+        history: Vec::new(),
+    };
+    store
+        .put_node(node, lsn)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("put_node failed: {e}")))?;
+    let _ = store.sync_delta();
+    coll_ref.dirty.store(true, Ordering::Release);
+    coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+    Ok(Json(PutNodeRes { id: id.0 }))
+}
+
+async fn rest_get_node(
+    State(state): State<AppState>,
+    Path((collection, node_id)): Path<(String, u64)>,
+) -> Result<Json<vf_graph::Node>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&handle);
+    let store = coll.graph_store.as_ref().ok_or_else(|| not_hybrid_err(&collection))?;
+    match store.get_node(vf_graph::NodeId(node_id)) {
+        Some(n) => Ok(Json(n)),
+        None => Err(err(StatusCode::NOT_FOUND, "node not found")),
+    }
+}
+
+async fn rest_delete_node(
+    State(state): State<AppState>,
+    Path((collection, node_id)): Path<(String, u64)>,
+) -> Result<Json<DeletedRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&handle);
+    let lsn = current_lsn(&state, &collection);
+    let coll_ref = &mut *coll;
+    let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+    let deleted = store
+        .delete_node(vf_graph::NodeId(node_id), lsn)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("delete_node failed: {e}")))?;
+    let _ = store.sync_delta();
+    coll_ref.dirty.store(true, Ordering::Release);
+    coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+    Ok(Json(DeletedRes { deleted }))
+}
+
+async fn rest_list_edges(
+    State(state): State<AppState>,
+    Path((collection, node_id)): Path<(String, u64)>,
+    Query(q): Query<ListEdgesQuery>,
+) -> Result<Json<ListEdgesRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&handle);
+    let store = coll.graph_store.as_ref().ok_or_else(|| not_hybrid_err(&collection))?;
+    let dir = parse_edge_direction(q.direction.as_deref());
+    let filter = q.edge_type.as_deref().filter(|t| !t.trim().is_empty());
+    let edges: Vec<vf_graph::TypedEdge> = store
+        .edges_for_node(vf_graph::NodeId(node_id), dir)
+        .into_iter()
+        .filter(|e| filter.map(|t| e.edge_type.as_str() == t).unwrap_or(true))
+        .collect();
+    Ok(Json(ListEdgesRes { edges }))
+}
+
+async fn rest_put_edge(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<PutEdgeReq>,
+) -> Result<Json<PutEdgeRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    if req.edge_type.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "edge_type must not be empty"));
+    }
+    let properties = parse_props_value(req.properties)?;
+    let provenance = parse_provenance_value(req.provenance)?;
+    let confidence = match req.confidence {
+        Some(c) if c > 0.0 => c,
+        _ => 1.0,
+    };
+
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&handle);
+    let lsn = current_lsn(&state, &collection);
+    let coll_ref = &mut *coll;
+    let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+    let edge_type = store.intern(&req.edge_type);
+    let id = store.alloc_edge_id();
+    let mut edge = vf_graph::TypedEdge {
+        id,
+        source: vf_graph::NodeId(req.source),
+        target: vf_graph::NodeId(req.target),
+        edge_type,
+        properties,
+        provenance,
+        confidence,
+        verified: req.verified,
+        is_manual: req.is_manual,
+        created_at: vf_graph::now_millis(),
+        history: Vec::new(),
+        valid_from: req.valid_from,
+        valid_until: req.valid_until,
+        // Empty-string context maps to None to honor the "absent = none" contract.
+        temporal_context: req.temporal_context.filter(|c| !c.trim().is_empty()),
+    };
+    edge.record_audit("created", None, vf_graph::now_millis());
+    store
+        .put_edge(edge, lsn)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("put_edge failed: {e}")))?;
+    let _ = store.sync_delta();
+    coll_ref.dirty.store(true, Ordering::Release);
+    coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+    Ok(Json(PutEdgeRes { id: id.0 }))
+}
+
+async fn rest_get_edge(
+    State(state): State<AppState>,
+    Path((collection, edge_id)): Path<(String, u64)>,
+) -> Result<Json<vf_graph::TypedEdge>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let coll = metered_read(&handle);
+    let store = coll.graph_store.as_ref().ok_or_else(|| not_hybrid_err(&collection))?;
+    match store.get_edge(vf_graph::EdgeId(edge_id)) {
+        Some(e) => Ok(Json(e)),
+        None => Err(err(StatusCode::NOT_FOUND, "edge not found")),
+    }
+}
+
+async fn rest_update_node(
+    State(state): State<AppState>,
+    Path((collection, node_id)): Path<(String, u64)>,
+    ValidatedJson(req): ValidatedJson<UpdateNodeReq>,
+) -> Result<Json<NodeRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    // Parse optional properties outside the lock so a bad payload fails fast.
+    // Only the property bag is mutable; provenance and embedding are immutable
+    // so the NodeId==VectorId bridge cannot desync.
+    let new_props = match req.properties {
+        Some(serde_json::Value::Null) | None => None,
+        Some(v) => Some(parse_props_value(Some(v))?),
+    };
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&handle);
+    let lsn = current_lsn(&state, &collection);
+    let coll_ref = &mut *coll;
+    let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+    let node = store
+        .update_node(
+            vf_graph::NodeId(node_id),
+            new_props,
+            actor_opt(req.actor),
+            vf_graph::now_millis(),
+            lsn,
+        )
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("update_node failed: {e}")))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "node not found"))?;
+    let _ = store.sync_delta();
+    coll_ref.dirty.store(true, Ordering::Release);
+    coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+    Ok(Json(NodeRes { node }))
+}
+
+async fn rest_update_edge(
+    State(state): State<AppState>,
+    Path((collection, edge_id)): Path<(String, u64)>,
+    ValidatedJson(req): ValidatedJson<UpdateEdgeReq>,
+) -> Result<Json<EdgeRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    // Parse optional properties outside the lock so a bad payload fails fast.
+    let new_props = match req.properties {
+        Some(serde_json::Value::Null) | None => None,
+        Some(v) => Some(parse_props_value(Some(v))?),
+    };
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&handle);
+    let lsn = current_lsn(&state, &collection);
+    let coll_ref = &mut *coll;
+    let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+    let mut edge = store
+        .get_edge(vf_graph::EdgeId(edge_id))
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "edge not found"))?;
+    if !edge.is_manual {
+        return Err(err(StatusCode::PRECONDITION_FAILED, "only manual edges may be updated"));
+    }
+    if let Some(props) = new_props {
+        edge.properties = props;
+    }
+    if let Some(c) = req.confidence {
+        edge.confidence = c;
+    }
+    if let Some(v) = req.verified {
+        edge.verified = v;
+    }
+    edge.record_audit("updated", actor_opt(req.actor), vf_graph::now_millis());
+    store
+        .put_edge(edge.clone(), lsn)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("put_edge failed: {e}")))?;
+    let _ = store.sync_delta();
+    coll_ref.dirty.store(true, Ordering::Release);
+    coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+    Ok(Json(EdgeRes { edge }))
+}
+
+async fn rest_delete_edge(
+    State(state): State<AppState>,
+    Path((collection, edge_id)): Path<(String, u64)>,
+) -> Result<Json<DeletedRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&handle);
+    let lsn = current_lsn(&state, &collection);
+    let coll_ref = &mut *coll;
+    let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+    let deleted = store
+        .delete_edge(vf_graph::EdgeId(edge_id), lsn)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("delete_edge failed: {e}")))?;
+    let _ = store.sync_delta();
+    coll_ref.dirty.store(true, Ordering::Release);
+    coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+    Ok(Json(DeletedRes { deleted }))
+}
+
+async fn rest_verify_edge(
+    State(state): State<AppState>,
+    Path((collection, edge_id)): Path<(String, u64)>,
+    ValidatedJson(req): ValidatedJson<ActorReq>,
+) -> Result<Json<EdgeRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let mut coll = metered_write(&handle);
+    let lsn = current_lsn(&state, &collection);
+    let coll_ref = &mut *coll;
+    let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+    let mut edge = store
+        .get_edge(vf_graph::EdgeId(edge_id))
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "edge not found"))?;
+    edge.verified = true;
+    edge.record_audit("verified", actor_opt(req.actor), vf_graph::now_millis());
+    store
+        .put_edge(edge.clone(), lsn)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("put_edge failed: {e}")))?;
+    let _ = store.sync_delta();
+    coll_ref.dirty.store(true, Ordering::Release);
+    coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+    Ok(Json(EdgeRes { edge }))
+}
+
+async fn rest_reject_edge(
+    State(state): State<AppState>,
+    Path((collection, edge_id)): Path<(String, u64)>,
+    ValidatedJson(req): ValidatedJson<ActorReq>,
+) -> Result<Json<RejectEdgeRes>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = req; // body accepted for parity; actor is unused on reject.
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+
+    // Delete the edge and build the reject rule under the write guard; the
+    // guard is dropped before calling into the extraction manager.
+    let (deleted, rule) = {
+        let mut coll = metered_write(&handle);
+        let lsn = current_lsn(&state, &collection);
+        let coll_ref = &mut *coll;
+        let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+        let edge = match store.get_edge(vf_graph::EdgeId(edge_id)) {
+            Some(e) => e,
+            None => return Ok(Json(RejectEdgeRes { deleted: false, rule_added: false })),
+        };
+        let src_name = node_display_name(store, edge.source);
+        let tgt_name = node_display_name(store, edge.target);
+        let rule = vf_extraction::RejectRule {
+            source_doc: edge.provenance.source_doc.clone(),
+            source_chunk_id: edge.provenance.source_chunk_id,
+            edge_type: edge.edge_type.as_str().to_string(),
+            source_name: src_name,
+            target_name: tgt_name,
+        };
+        let deleted = store
+            .delete_edge(vf_graph::EdgeId(edge_id), lsn)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("delete_edge failed: {e}")))?;
+        let _ = store.sync_delta();
+        coll_ref.dirty.store(true, Ordering::Release);
+        coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+        (deleted, rule)
+    };
+
+    // Guard dropped: now safe to call into the extraction manager.
+    let rule_added = match state.extraction.add_reject_rule(&collection, rule) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("failed to persist reject rule: {e}");
+            false
+        }
+    };
+    Ok(Json(RejectEdgeRes { deleted, rule_added }))
+}
+
+async fn rest_bulk_import_edges(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<BulkImportEdgesReq>,
+) -> Result<Json<BulkImportEdgesRes>, (StatusCode, Json<ErrorResponse>)> {
+    state.require_collection_ready(&collection).map_err(err_from_availability)?;
+
+    let format = match req.format.to_ascii_lowercase().as_str() {
+        "csv" => crate::edge_ops::BulkFormat::Csv,
+        "jsonl" => crate::edge_ops::BulkFormat::Jsonl,
+        other => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported format '{other}'; expected 'csv' or 'jsonl'"),
+            ))
+        }
+    };
+
+    // Snapshot the known edge types from the merged ontology (no guard held).
+    let mut known_edge_types: std::collections::HashSet<String> = state
+        .extraction
+        .get_ontology(&collection)
+        .map(|o| o.edge_types.into_iter().map(|t| t.edge_type).collect())
+        .unwrap_or_default();
+
+    // Parse the payload.
+    let (parsed_rows, parse_errors) = crate::edge_ops::parse_bulk_edges(format, &req.data);
+    let total_rows = (parsed_rows.len() + parse_errors.len()) as u64;
+
+    // Optionally extend the ontology with unknown edge types (no guard held).
+    if req.auto_add_edge_types {
+        let unknown: Vec<String> = parsed_rows
+            .iter()
+            .map(|r| r.edge_type.clone())
+            .filter(|t| !known_edge_types.contains(t))
+            .collect();
+        if !unknown.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            let extension = vf_extraction::Ontology {
+                entity_labels: Vec::new(),
+                edge_types: unknown
+                    .into_iter()
+                    .filter(|t| seen.insert(t.clone()))
+                    .map(|t| vf_extraction::EdgeTypeDef::new(t, String::new(), Vec::new(), Vec::new()))
+                    .collect(),
+                // Auto-edge-type extension carries no user prompt.
+                system_prompt: None,
+                extra_guidance: None,
+                link_passages: false,
+                // Auto-edge-type extension does not change resolution mode.
+                entity_resolution: vf_extraction::EntityResolution::Normalized,
+            };
+            state
+                .extraction
+                .set_ontology(&collection, None, extension, false)
+                .map_err(err_from_extraction)?;
+            known_edge_types = state
+                .extraction
+                .get_ontology(&collection)
+                .map(|o| o.edge_types.into_iter().map(|t| t.edge_type).collect())
+                .unwrap_or(known_edge_types);
+        }
+    }
+
+    // Apply rows under the write guard.
+    let handle = state.collection_handle(&collection)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection)))?;
+    let (imported, apply_errors) = {
+        let mut coll = metered_write(&handle);
+        let lsn = current_lsn(&state, &collection);
+        let coll_ref = &mut *coll;
+        // Build the valid-endpoint id set before taking the &mut graph_store
+        // borrow. An id is valid if it is an existing plain vector (the
+        // NodeId == VectorId bridge treats it as a virtual content node) or a
+        // materialized typed node. This owns a HashSet and holds no borrow.
+        let valid_node_ids: std::collections::HashSet<u64> = {
+            let mut candidates: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for r in &parsed_rows {
+                candidates.insert(r.source);
+                candidates.insert(r.target);
+            }
+            candidates
+                .into_iter()
+                .filter(|&id| {
+                    coll_ref.store.contains(id)
+                        || coll_ref
+                            .graph_store
+                            .as_ref()
+                            .map(|g| g.get_node(vf_graph::NodeId(id)).is_some())
+                            .unwrap_or(false)
+                })
+                .collect()
+        };
+        let store = coll_ref.graph_store.as_mut().ok_or_else(|| not_hybrid_err(&collection))?;
+        let (imported, errs) = crate::edge_ops::apply_bulk_edges(
+            store,
+            &known_edge_types,
+            &valid_node_ids,
+            parsed_rows,
+            actor_opt(req.actor),
+            lsn,
+        );
+        let _ = store.sync_delta();
+        coll_ref.dirty.store(true, Ordering::Release);
+        coll_ref.mutation_count.fetch_add(1, Ordering::Relaxed);
+        (imported, errs)
+    };
+
+    let mut errors: Vec<BulkImportRowErrorRes> =
+        Vec::with_capacity(parse_errors.len() + apply_errors.len());
+    for e in parse_errors.into_iter().chain(apply_errors.into_iter()) {
+        errors.push(BulkImportRowErrorRes { row: e.row, message: e.message });
+    }
+    Ok(Json(BulkImportEdgesRes {
+        total_rows,
+        imported,
+        failed: total_rows.saturating_sub(imported),
+        errors,
+    }))
+}
+
+// ── Document diff / re-extraction handlers (P04) ─────────────────────────
+
+fn chunk_diff_action_str(a: vf_extraction::ChunkDiffAction) -> &'static str {
+    match a {
+        vf_extraction::ChunkDiffAction::Unchanged => "unchanged",
+        vf_extraction::ChunkDiffAction::Changed => "changed",
+        vf_extraction::ChunkDiffAction::New => "new",
+        vf_extraction::ChunkDiffAction::Deleted => "deleted",
+    }
+}
+
+async fn rest_diff_document(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<DiffDocumentReq>,
+) -> Result<Json<DiffDocumentRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let chunks: Vec<ChunkContent> = req.chunks.into_iter().map(ChunkReq::into_content).collect();
+    let diffs = state
+        .extraction
+        .diff_document(&collection, &req.doc_id, &chunks)
+        .map_err(err_from_extraction)?;
+    Ok(Json(DiffDocumentRes {
+        diffs: diffs
+            .into_iter()
+            .map(|d| ChunkDiffRes {
+                chunk_id: d.chunk_id,
+                action: chunk_diff_action_str(d.action).to_string(),
+            })
+            .collect(),
+    }))
+}
+
+async fn rest_reextract_document(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<DiffDocumentReq>,
+) -> Result<Json<ReextractDocumentRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let chunks: Vec<ChunkContent> = req.chunks.into_iter().map(ChunkReq::into_content).collect();
+    let s = state
+        .extraction
+        .reextract_document(&collection, &req.doc_id, chunks)
+        .map_err(err_from_extraction)?;
+    Ok(Json(ReextractDocumentRes {
+        job_id: s.job_id,
+        unchanged: s.unchanged,
+        changed: s.changed,
+        added: s.added,
+        deleted: s.deleted,
+        edges_deleted: s.edges_deleted,
+        nodes_deleted: s.nodes_deleted,
+    }))
 }
 
 // ── Helpers: metadata conversion ────────────────────────────────────────
@@ -2859,4 +4025,514 @@ async fn diversity_sample(
         }).collect(),
         compute_time_us: timer.elapsed().as_micros() as u64,
     }))
+}
+
+// ── Extraction handlers (Hybrid mode only, P03) ──────────────────────────
+
+use vf_extraction::{
+    ChunkContent, EdgeTypeDef, EntityLabelDef, EntityResolution, ExtractionError, LlmConfig,
+    Ontology,
+};
+
+/// Map an `ExtractionError` onto a REST `(status, body)`.
+fn err_from_extraction(e: ExtractionError) -> (StatusCode, Json<ErrorResponse>) {
+    match e {
+        ExtractionError::Config(m) => err(StatusCode::BAD_REQUEST, m),
+        ExtractionError::Ontology(m) => err(StatusCode::BAD_REQUEST, m),
+        ExtractionError::Parse(m) => err(StatusCode::BAD_REQUEST, m),
+        ExtractionError::JobNotFound(m) => err(StatusCode::NOT_FOUND, format!("job not found: {m}")),
+        ExtractionError::Crypto(m) => err(StatusCode::PRECONDITION_FAILED, m),
+        ExtractionError::Cancelled => {
+            err(StatusCode::CONFLICT, "extraction cancelled".to_string())
+        }
+        ExtractionError::Llm(m) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("llm error: {m}")),
+        ExtractionError::Io(m) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("io error: {m}")),
+        ExtractionError::Graph(m) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, format!("graph write error: {m}"))
+        }
+    }
+}
+
+/// Readiness + Hybrid-mode gate for the extraction REST handlers. Non-Hybrid
+/// collections return 412 Precondition Failed.
+fn extraction_gate(
+    state: &AppState,
+    collection: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    state
+        .require_collection_ready(collection)
+        .map_err(err_from_availability)?;
+    let handle = state.collection_handle(collection).ok_or_else(|| {
+        err(StatusCode::NOT_FOUND, format!("collection '{}' not found", collection))
+    })?;
+    let mode = {
+        let coll = metered_read(&handle);
+        coll.config.effective_mode()
+    };
+    if mode != Mode::Hybrid {
+        return Err(err(
+            StatusCode::PRECONDITION_FAILED,
+            format!("collection '{}' is not in hybrid mode; extraction is not available", collection),
+        ));
+    }
+    Ok(())
+}
+
+// ── Extraction DTOs ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ChunkReq {
+    pub doc_id: String,
+    pub chunk_id: u64,
+    pub text: String,
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
+}
+
+impl ChunkReq {
+    fn into_content(self) -> ChunkContent {
+        ChunkContent {
+            doc_id: self.doc_id,
+            chunk_id: self.chunk_id,
+            text: self.text,
+            embedding: self.embedding,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SetLlmConfigReq {
+    base_url: String,
+    api_key: String,
+    model_name: String,
+    temperature: f32,
+    max_tokens: u32,
+    timeout_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct GetLlmConfigRes {
+    base_url: String,
+    model_name: String,
+    temperature: f32,
+    max_tokens: u32,
+    timeout_seconds: u64,
+    api_key_set: bool,
+}
+
+#[derive(Deserialize)]
+struct RotateLlmConfigReq {
+    new_api_key: String,
+}
+
+#[derive(Serialize)]
+struct SuccessRes {
+    success: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EntityLabelDto {
+    label: String,
+    description: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EdgeTypeDto {
+    edge_type: String,
+    description: String,
+    #[serde(default)]
+    source_labels: Vec<String>,
+    #[serde(default)]
+    target_labels: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct OntologyDto {
+    #[serde(default)]
+    entity_labels: Vec<EntityLabelDto>,
+    #[serde(default)]
+    edge_types: Vec<EdgeTypeDto>,
+    // Full override of the generic extraction task framing. Empty means use the default prompt.
+    #[serde(default)]
+    system_prompt: Option<String>,
+    // Domain guidance appended on top of the framing. Empty means use the default prompt.
+    #[serde(default)]
+    extra_guidance: Option<String>,
+    // ADR-012. Opt-in passage-to-entity linking for GraphRAG.
+    #[serde(default)]
+    link_passages: bool,
+    // ADR-020. Entity-resolution mode; "normalized" (default) or "fuzzy".
+    #[serde(default)]
+    entity_resolution: EntityResolution,
+}
+
+impl OntologyDto {
+    fn from_ontology(o: &Ontology) -> Self {
+        Self {
+            entity_labels: o
+                .entity_labels
+                .iter()
+                .map(|l| EntityLabelDto {
+                    label: l.label.clone(),
+                    description: l.description.clone(),
+                })
+                .collect(),
+            edge_types: o
+                .edge_types
+                .iter()
+                .map(|t| EdgeTypeDto {
+                    edge_type: t.edge_type.clone(),
+                    description: t.description.clone(),
+                    source_labels: t.source_labels.clone(),
+                    target_labels: t.target_labels.clone(),
+                })
+                .collect(),
+            system_prompt: o.system_prompt.clone(),
+            extra_guidance: o.extra_guidance.clone(),
+            link_passages: o.link_passages,
+            entity_resolution: o.entity_resolution,
+        }
+    }
+
+    fn into_ontology(self) -> Ontology {
+        Ontology {
+            entity_labels: self
+                .entity_labels
+                .into_iter()
+                .map(|l| EntityLabelDef::new(l.label, l.description))
+                .collect(),
+            edge_types: self
+                .edge_types
+                .into_iter()
+                .map(|t| EdgeTypeDef::new(t.edge_type, t.description, t.source_labels, t.target_labels))
+                .collect(),
+            // Empty/whitespace -> None so the engine falls back to the default prompt.
+            system_prompt: self
+                .system_prompt
+                .filter(|s| !s.trim().is_empty()),
+            extra_guidance: self
+                .extra_guidance
+                .filter(|s| !s.trim().is_empty()),
+            link_passages: self.link_passages,
+            entity_resolution: self.entity_resolution,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SetOntologyReq {
+    #[serde(default)]
+    base_template: Option<String>,
+    #[serde(default)]
+    extension: OntologyDto,
+    #[serde(default)]
+    replace: bool,
+}
+
+#[derive(Deserialize)]
+struct ChunksReq {
+    #[serde(default)]
+    chunks: Vec<ChunkReq>,
+}
+
+#[derive(Serialize)]
+struct CostPreviewRes {
+    chunks: u64,
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
+    estimated_cost_usd: f64,
+    model: String,
+    pricing_known: bool,
+}
+
+#[derive(Serialize)]
+struct StartExtractionRes {
+    job_id: String,
+}
+
+#[derive(Serialize)]
+struct ChunkErrorRes {
+    doc_id: String,
+    chunk_id: u64,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct JobStatusRes {
+    job_id: String,
+    collection: String,
+    state: String,
+    total_chunks: u64,
+    processed_chunks: u64,
+    entities_written: u64,
+    edges_written: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    error: Option<String>,
+    failed_chunks: u64,
+    chunk_errors: Vec<ChunkErrorRes>,
+}
+
+#[derive(Serialize)]
+struct ProposalRes {
+    id: String,
+    kind: String,
+    name: String,
+    description: String,
+    examples: Vec<String>,
+    status: String,
+    source_doc: Option<String>,
+    source_chunk_id: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ListProposalsRes {
+    proposals: Vec<ProposalRes>,
+}
+
+fn job_state_str(state: vf_extraction::JobState) -> &'static str {
+    match state {
+        vf_extraction::JobState::Queued => "queued",
+        vf_extraction::JobState::Running => "running",
+        vf_extraction::JobState::Completed => "completed",
+        vf_extraction::JobState::CompletedWithErrors => "completed_with_errors",
+        vf_extraction::JobState::Failed => "failed",
+        vf_extraction::JobState::Cancelled => "cancelled",
+    }
+}
+
+fn job_status_to_res(s: vf_extraction::JobStatus) -> JobStatusRes {
+    JobStatusRes {
+        job_id: s.job_id,
+        collection: s.collection,
+        state: job_state_str(s.state).to_string(),
+        total_chunks: s.total_chunks as u64,
+        processed_chunks: s.processed_chunks as u64,
+        entities_written: s.entities_written as u64,
+        edges_written: s.edges_written as u64,
+        cache_hits: s.cache_hits as u64,
+        cache_misses: s.cache_misses as u64,
+        error: s.error,
+        failed_chunks: s.failed_chunks as u64,
+        chunk_errors: s
+            .chunk_errors
+            .iter()
+            .map(|c| ChunkErrorRes {
+                doc_id: c.doc_id.clone(),
+                chunk_id: c.chunk_id,
+                error: c.error.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn proposal_to_res(p: &vf_extraction::OntologyProposal) -> ProposalRes {
+    let kind = match p.kind {
+        vf_extraction::ProposalKind::EntityLabel => "entity_label",
+        vf_extraction::ProposalKind::EdgeType => "edge_type",
+    };
+    let status = match p.status {
+        vf_extraction::ProposalStatus::Pending => "pending",
+        vf_extraction::ProposalStatus::Approved => "approved",
+        vf_extraction::ProposalStatus::Rejected => "rejected",
+    };
+    ProposalRes {
+        id: p.id.clone(),
+        kind: kind.to_string(),
+        name: p.name.clone(),
+        description: p.description.clone(),
+        examples: p.examples.clone(),
+        status: status.to_string(),
+        source_doc: p.source_doc.clone(),
+        source_chunk_id: p.source_chunk_id,
+    }
+}
+
+// ── Extraction handlers ──────────────────────────────────────────────
+
+async fn set_llm_config(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<SetLlmConfigReq>,
+) -> Result<Json<SuccessRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let config = LlmConfig::new(
+        req.base_url,
+        req.api_key,
+        req.model_name,
+        req.temperature,
+        req.max_tokens,
+        req.timeout_seconds,
+    );
+    state
+        .extraction
+        .set_llm_config(&collection, config)
+        .map_err(err_from_extraction)?;
+    Ok(Json(SuccessRes { success: true }))
+}
+
+async fn get_llm_config(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<GetLlmConfigRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let r = state
+        .extraction
+        .get_llm_config(&collection)
+        .map_err(err_from_extraction)?;
+    Ok(Json(GetLlmConfigRes {
+        base_url: r.base_url,
+        model_name: r.model_name,
+        temperature: r.temperature,
+        max_tokens: r.max_tokens,
+        timeout_seconds: r.timeout_seconds,
+        api_key_set: r.api_key_set,
+    }))
+}
+
+async fn rotate_llm_config(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<RotateLlmConfigReq>,
+) -> Result<Json<SuccessRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    state
+        .extraction
+        .rotate_llm_config(&collection, &req.new_api_key)
+        .map_err(err_from_extraction)?;
+    Ok(Json(SuccessRes { success: true }))
+}
+
+async fn set_ontology(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<SetOntologyReq>,
+) -> Result<Json<SuccessRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let base_template = req
+        .base_template
+        .filter(|s| !s.trim().is_empty());
+    state
+        .extraction
+        .set_ontology(&collection, base_template, req.extension.into_ontology(), req.replace)
+        .map_err(err_from_extraction)?;
+    Ok(Json(SuccessRes { success: true }))
+}
+
+async fn get_ontology(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<OntologyDto>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let ontology = state
+        .extraction
+        .get_ontology(&collection)
+        .map_err(err_from_extraction)?;
+    Ok(Json(OntologyDto::from_ontology(&ontology)))
+}
+
+async fn extraction_cost_preview(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<ChunksReq>,
+) -> Result<Json<CostPreviewRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let chunks: Vec<ChunkContent> = req.chunks.into_iter().map(ChunkReq::into_content).collect();
+    let estimate = state
+        .extraction
+        .cost_preview(&collection, &chunks)
+        .await
+        .map_err(err_from_extraction)?;
+    Ok(Json(CostPreviewRes {
+        chunks: estimate.chunks as u64,
+        estimated_input_tokens: estimate.estimated_input_tokens,
+        estimated_output_tokens: estimate.estimated_output_tokens,
+        estimated_cost_usd: estimate.estimated_cost_usd,
+        model: estimate.model,
+        pricing_known: estimate.pricing_known,
+    }))
+}
+
+async fn start_extraction(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+    ValidatedJson(req): ValidatedJson<ChunksReq>,
+) -> Result<Json<StartExtractionRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let chunks: Vec<ChunkContent> = req.chunks.into_iter().map(ChunkReq::into_content).collect();
+    let job_id = state
+        .extraction
+        .start_extraction(&collection, chunks)
+        .map_err(err_from_extraction)?;
+    metrics::record_extraction_job("started");
+    Ok(Json(StartExtractionRes { job_id }))
+}
+
+async fn extraction_status(
+    State(state): State<AppState>,
+    Path((collection, job_id)): Path<(String, String)>,
+) -> Result<Json<JobStatusRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let status = state
+        .extraction
+        .job_status(&collection, &job_id)
+        .map_err(err_from_extraction)?;
+    let total = status.cache_hits + status.cache_misses;
+    if total > 0 {
+        metrics::set_extraction_cache_hit_rate(
+            &collection,
+            status.cache_hits as f64 / total as f64,
+        );
+    }
+    Ok(Json(job_status_to_res(status)))
+}
+
+async fn cancel_extraction(
+    State(state): State<AppState>,
+    Path((collection, job_id)): Path<(String, String)>,
+) -> Result<Json<SuccessRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    state
+        .extraction
+        .cancel_extraction(&collection, &job_id)
+        .map_err(err_from_extraction)?;
+    Ok(Json(SuccessRes { success: true }))
+}
+
+async fn list_proposals(
+    State(state): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<ListProposalsRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    let proposals = state
+        .extraction
+        .list_proposals(&collection)
+        .map_err(err_from_extraction)?;
+    Ok(Json(ListProposalsRes {
+        proposals: proposals.iter().map(proposal_to_res).collect(),
+    }))
+}
+
+async fn approve_proposal(
+    State(state): State<AppState>,
+    Path((collection, id)): Path<(String, String)>,
+) -> Result<Json<SuccessRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    state
+        .extraction
+        .approve_proposal(&collection, &id)
+        .map_err(err_from_extraction)?;
+    Ok(Json(SuccessRes { success: true }))
+}
+
+async fn reject_proposal(
+    State(state): State<AppState>,
+    Path((collection, id)): Path<(String, String)>,
+) -> Result<Json<SuccessRes>, (StatusCode, Json<ErrorResponse>)> {
+    extraction_gate(&state, &collection)?;
+    state
+        .extraction
+        .reject_proposal(&collection, &id)
+        .map_err(err_from_extraction)?;
+    Ok(Json(SuccessRes { success: true }))
 }

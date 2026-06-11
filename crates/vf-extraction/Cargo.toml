@@ -1,0 +1,30 @@
+[package]
+name = "vf-extraction"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "LLM-driven extraction layer for SwarnDB hybrid collections"
+
+[dependencies]
+vf-core = { path = "../vf-core" }
+vf-graph = { path = "../vf-graph" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+unicode-normalization = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+aes-gcm = { version = "0.10", features = ["std", "getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+lru = "0.12"
+base64 = "0.22"
+uuid = { workspace = true }
+metrics = "0.24"
+
+[dev-dependencies]
+tempfile = { workspace = true }

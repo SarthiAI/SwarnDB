@@ -544,6 +544,12 @@ impl VectorIndex for IvfHnswPqIndex {
         ))
     }
 
+    fn metric_type(&self) -> vf_core::types::DistanceMetricType {
+        // IVF+HNSW+PQ scores residuals in L2 space; the coarse quantizer is the
+        // configured-metric source of truth (built Euclidean in new()).
+        self.coarse_quantizer.metric_type()
+    }
+
     fn search(
         &self,
         query: &[f32],

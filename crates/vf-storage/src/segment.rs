@@ -8,6 +8,7 @@
 //! A segment is an immutable, memory-mapped file that stores vectors and their
 //! optional metadata. See [`crate::format`] for the on-disk layout.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -120,13 +121,14 @@ impl Segment {
         let id = u64::from_le_bytes(slice[0..8].try_into().unwrap());
 
         // Read dim f32 values (LE). On-disk storage is always f32 (4 bytes).
+        // Decode the whole vector in one pass over 4-byte chunks (little-endian).
         let dim = self.header.dimension as usize;
         let mut data = Vec::with_capacity(dim);
-        for i in 0..dim {
-            let start = 8 + i * 4;
-            let val = f32::from_le_bytes(slice[start..start + 4].try_into().unwrap());
-            data.push(val);
-        }
+        data.extend(
+            slice[8..]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
 
         Ok((id, data))
     }
@@ -204,6 +206,49 @@ impl Segment {
         }
 
         Ok(None)
+    }
+
+    /// Read the entire metadata region once into a map of id -> metadata.
+    ///
+    /// This is the bulk counterpart to [`Segment::get_metadata`]: instead of a
+    /// linear scan per id, callers that need metadata for many vectors build the
+    /// map once and do O(1) lookups. Vector-only segments (no metadata region)
+    /// return an empty map and pay nothing.
+    pub fn metadata_map(&self) -> StorageResult<HashMap<VectorId, Metadata>> {
+        let meta_start = self.header.meta_offset as usize;
+        let file_len = self.mmap.len();
+
+        let mut map: HashMap<VectorId, Metadata> = HashMap::new();
+        if meta_start >= file_len {
+            // No metadata region at all.
+            return Ok(map);
+        }
+
+        let mut pos = meta_start;
+        while pos + 12 <= file_len {
+            // Read id (u64 LE).
+            let id = u64::from_le_bytes(self.mmap[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+
+            // Read meta_len (u32 LE).
+            let meta_len =
+                u32::from_le_bytes(self.mmap[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            if pos + meta_len > file_len {
+                return Err(StorageError::TruncatedData {
+                    expected: pos + meta_len,
+                    actual: file_len,
+                });
+            }
+
+            let meta: Metadata = bincode::deserialize(&self.mmap[pos..pos + meta_len])?;
+            map.insert(id, meta);
+
+            pos += meta_len;
+        }
+
+        Ok(map)
     }
 
     // ── Iteration ────────────────────────────────────────────────────────

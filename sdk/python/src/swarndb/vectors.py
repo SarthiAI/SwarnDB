@@ -7,8 +7,11 @@ and bulk insert with optional progress bars for bulk operations.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+from collections.abc import Sequence as _AbcSequence
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence
 
 import grpc
 
@@ -36,6 +39,177 @@ except ImportError:
     tqdm = None
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Bulk-insert deadline scaling
+# ---------------------------------------------------------------------------
+#
+# A large immediate-index bulk load can legitimately take far longer than the
+# client's default 30s deadline (a 5000 x 1536 immediate load is ~50s on a fast
+# box). The default deadline then trips DEADLINE_EXCEEDED mid-stream, which is
+# never the right outcome for a healthy load. These helpers derive an effective
+# deadline that scales with the workload so a real load is never cut short,
+# while an explicitly passed timeout always wins and is honored exactly.
+#
+# Per-vector insert cost grows with the vector's dimension: each immediate-index
+# insert does distance work proportional to the number of float elements, so a
+# 1536-dim vector costs far more than a 128-dim one. A count-only floor that
+# ignores dimension under-provisions high-dim loads and trips a spurious
+# deadline. So the work estimate is taken over total float elements
+# (vectors x dimension) whenever the dimension is known, and never drops below
+# the count-only estimate.
+#
+# Scaling model (streaming bulk_insert):
+#   work_s    = max(total_vectors / FLOOR_VEC_PER_S,
+#                   total_vectors * dim / FLOOR_ELEMENTS_PER_S)   # if dim known
+#   effective = max(default_timeout,
+#                   default_timeout + ceil(work_s * SAFETY_FACTOR))
+# The FLOOR rates are deliberately conservative throughput floors (slowest
+# realistic immediate-index path) so the derived deadline over-provisions
+# rather than under-provisions. There is no upper cap: a bigger load just gets
+# a bigger deadline. default_timeout is also the floor, so small loads keep the
+# exact prior behavior. The derived deadline (e.g. the multi-hour 1M value) is
+# a max ceiling on how long the client will wait, not an expected duration.
+
+# Conservative worst-case immediate-index throughput, in vectors/second.
+# Derived from the observed ~5000 vec / ~50s = 100 vec/s on the defect repro.
+# Dimension-blind, so it is only the floor for the dimension-aware estimate
+# below (and the sole estimate when the dimension is unknown).
+_BULK_FLOOR_VEC_PER_S = 100.0
+
+# Conservative worst-case immediate-index throughput, in float elements per
+# second (one element = one float of one vector). The defect repro ran 5000 x
+# 1536 in ~50s, i.e. ~153,600 elem/s at its best; the floor sits below that so
+# heavier high-dim, large-content loads (which run slower than the repro) still
+# get headroom instead of a spurious deadline. At 1536-dim this is ~65 vec/s
+# (more generous than the count-only 100 vec/s); at low dimensions it correctly
+# allows a much higher vec/s.
+_BULK_FLOOR_ELEMENTS_PER_S = 100_000.0
+
+# Conservative worst-case server-side mmap throughput, in bytes/second, for
+# bulk_insert_from_path. ~32 MiB/s leaves wide headroom over real immediate
+# index ingest rates so the derived deadline never under-provisions.
+_BULK_FLOOR_BYTES_PER_S = 32 * 1024 * 1024.0
+
+# Multiplier applied to the derived work time before adding the base overhead.
+_BULK_DEADLINE_SAFETY_FACTOR = 2.0
+
+# Floor deadline for bulk_insert_from_path when the client has no size signal
+# (no expected_count and the path is not locally visible, the normal
+# server-side deployment). The from-path API is explicitly the very-large-load
+# path, so its no-information default must over-provision rather than collapse
+# to the bare default deadline. 15 minutes leaves wide headroom.
+_BULK_FROM_PATH_MIN_DEADLINE = 900.0
+
+
+def _scaled_bulk_timeout(
+    explicit_timeout: Optional[float],
+    default_timeout: float,
+    *,
+    num_vectors: Optional[int] = None,
+    num_bytes: Optional[int] = None,
+    dim: Optional[int] = None,
+) -> float:
+    """Compute the effective deadline for a bulk insert.
+
+    If ``explicit_timeout`` is not None the caller wins and it is returned
+    verbatim. Otherwise the deadline scales with the workload size
+    (``num_vectors`` for the streaming path, ``num_bytes`` for the
+    from-path mmap load), floored at ``default_timeout`` so small loads keep
+    the prior behavior, with no upper cap. When ``dim`` is given alongside
+    ``num_vectors`` the estimate also accounts for per-vector cost growing with
+    dimension, and never drops below the count-only estimate.
+    """
+    if explicit_timeout is not None:
+        return explicit_timeout
+
+    work_seconds = 0.0
+    if num_vectors is not None and num_vectors > 0:
+        work_seconds = num_vectors / _BULK_FLOOR_VEC_PER_S
+        if dim is not None and dim > 0:
+            elements_seconds = (num_vectors * dim) / _BULK_FLOOR_ELEMENTS_PER_S
+            work_seconds = max(work_seconds, elements_seconds)
+    elif num_bytes is not None and num_bytes > 0:
+        work_seconds = num_bytes / _BULK_FLOOR_BYTES_PER_S
+
+    scaled = default_timeout + math.ceil(
+        work_seconds * _BULK_DEADLINE_SAFETY_FACTOR
+    )
+    return max(default_timeout, float(scaled))
+
+
+# ---------------------------------------------------------------------------
+# Assigned-ids materialization
+# ---------------------------------------------------------------------------
+#
+# The from-path API exists to avoid a client-side allocation for very large
+# loads. Eagerly doing list(response.assigned_ids) on a 1M result rebuilds the
+# exact giant Python list the API was meant to skip. Below a small threshold we
+# keep the prior behavior and return a plain list; above it we return a lazy
+# view over the proto repeated field that copies into a real list only if the
+# caller actually iterates or indexes it. len() stays O(1) either way, and the
+# public BulkInsertResult.assigned_ids attribute keeps working as a sequence.
+
+# Result sizes at or below this stay a plain list (prior behavior, no surprise).
+_ASSIGNED_IDS_EAGER_MAX = 100_000
+
+
+class _LazyAssignedIds(_AbcSequence):
+    """Lazy, list-compatible view over a proto repeated id field.
+
+    Holds the proto repeated scalar container and only materializes a real
+    Python list on first element access (indexing or iteration). ``len()`` is
+    answered directly from the container, so callers that only need the count
+    never pay for the copy. Equality and ``list(...)`` work as expected.
+    """
+
+    __slots__ = ("_proto", "_materialized")
+
+    def __init__(self, proto_repeated) -> None:
+        self._proto = proto_repeated
+        self._materialized: Optional[List[int]] = None
+
+    def _ensure(self) -> List[int]:
+        if self._materialized is None:
+            self._materialized = list(self._proto)
+        return self._materialized
+
+    def __len__(self) -> int:
+        if self._materialized is not None:
+            return len(self._materialized)
+        return len(self._proto)
+
+    def __getitem__(self, index):
+        return self._ensure()[index]
+
+    def __iter__(self):
+        return iter(self._ensure())
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, _LazyAssignedIds):
+            return self._ensure() == other._ensure()
+        if isinstance(other, list):
+            return self._ensure() == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"_LazyAssignedIds(count={len(self)})"
+
+
+def _assigned_ids_view(response) -> Sequence:
+    """Return assigned_ids without forcing a giant copy when the result is large.
+
+    Small results keep the prior plain-list behavior; large ones get a lazy
+    view that materializes only on element access. Either form is a valid value
+    for BulkInsertResult.assigned_ids.
+    """
+    proto_ids = getattr(response, "assigned_ids", None)
+    if not proto_ids:
+        return []
+    if len(proto_ids) <= _ASSIGNED_IDS_EAGER_MAX:
+        return list(proto_ids)
+    return _LazyAssignedIds(proto_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +437,7 @@ class VectorAPI:
         parallel_build: bool = False,
         checkpoint_every: Optional[int] = None,
         resume_token: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> BulkInsertResult:
         """Bulk insert vectors using streaming RPC.
 
@@ -306,6 +481,12 @@ class VectorAPI:
             resume_token: optional, opaque token from a prior partial bulk
                 insert response; the server validates it against its
                 on-disk checkpoint and skips already-committed batches.
+            timeout: optional per-call deadline in seconds for this bulk
+                insert RPC. When None (default), the client default timeout
+                is used, preserving prior behavior. Pass a larger value for
+                large immediate-index loads that would otherwise exceed the
+                default deadline; for very large loads prefer the
+                server-side ``bulk_insert_from_path`` path instead.
 
         Returns:
             A BulkInsertResult with inserted_count and any errors.
@@ -414,10 +595,35 @@ class VectorAPI:
         # Cannot use _call (which is for unary-unary), so call stub directly
         # with retry logic.
         metadata = self._client._metadata()
-        call_timeout = self._client._timeout
+        # Auto-scale the deadline with the workload when the caller did not pass
+        # an explicit timeout; an explicit timeout is honored verbatim. Pass the
+        # vector dimension so high-dim loads (e.g. 1536) get a deadline that
+        # reflects their heavier per-vector cost instead of timing out early.
+        insert_dim = len(vectors[0]) if total > 0 else 0
+        call_timeout = _scaled_bulk_timeout(
+            timeout, self._client._timeout, num_vectors=total, dim=insert_dim
+        )
+
+        # Streaming bulk_insert is NOT safely retryable once a single message
+        # has left the client, because the server is non-idempotent on explicit
+        # ids: re-streaming the same ids after a partial commit collides with
+        # the committed prefix and yields a misleading inserted_count plus a
+        # wall of "already exists" errors. A DEADLINE_EXCEEDED only ever fires
+        # after streaming has begun, so it is never re-streamed here. We retry
+        # ONLY genuine pre-stream transient failures (connection setup), where
+        # no data could have been committed; the marker below flips true the
+        # moment the request iterator yields its first message.
+        stream_started = {"v": False}
+
+        def _marking_iter(inner: Iterator) -> Iterator:
+            for item in inner:
+                stream_started["v"] = True
+                yield item
+
         last_error: Optional[grpc.RpcError] = None
 
         for attempt in range(self._client._max_retries + 1):
+            stream_started["v"] = False
             try:
                 if use_optimized_rpc:
                     logger.info(
@@ -437,13 +643,13 @@ class VectorAPI:
                         options.resume_token,
                     )
                     response = self._client._vector_stub.BulkInsertWithOptions(
-                        _options_request_iterator(),
+                        _marking_iter(_options_request_iterator()),
                         timeout=call_timeout,
                         metadata=metadata,
                     )
                 else:
                     response = self._client._vector_stub.BulkInsert(
-                        _request_iterator(),
+                        _marking_iter(_request_iterator()),
                         timeout=call_timeout,
                         metadata=metadata,
                     )
@@ -463,15 +669,32 @@ class VectorAPI:
                 last_error = exc
                 code = exc.code()
 
-                retryable = frozenset({
-                    grpc.StatusCode.UNAVAILABLE,
-                    grpc.StatusCode.DEADLINE_EXCEEDED,
-                })
-                if code in retryable and attempt < self._client._max_retries:
+                # A deadline that still trips after auto-scaling means the load
+                # genuinely outran the deadline. Do not re-stream: surface one
+                # clear, actionable error instead of a misleading partial count.
+                if code == grpc.StatusCode.DEADLINE_EXCEEDED:
+                    raise SwarnDBError(
+                        f"bulk_insert exceeded the {call_timeout:.0f}s deadline "
+                        f"for {total} vectors. The streaming insert cannot be "
+                        "auto-retried because re-sending the same ids would "
+                        "collide with the partially committed prefix. Retry "
+                        "with a larger timeout= (or pass checkpoint_every= and "
+                        "resume with the returned resume_token), or use "
+                        "bulk_insert_from_path for very large loads."
+                    ) from exc
+
+                # Only a pre-stream transient (e.g. UNAVAILABLE during connection
+                # setup, before any message was sent) is safe to retry, because
+                # nothing could have been committed yet.
+                if (
+                    code == grpc.StatusCode.UNAVAILABLE
+                    and not stream_started["v"]
+                    and attempt < self._client._max_retries
+                ):
                     delay = self._client._retry_delay * (2 ** attempt)
                     logger.debug(
-                        "Retrying BulkInsert (attempt %d/%d) after %s, "
-                        "backoff %.2fs",
+                        "Retrying BulkInsert (attempt %d/%d) after pre-stream "
+                        "%s, backoff %.2fs",
                         attempt + 1,
                         self._client._max_retries,
                         code.name,
@@ -504,6 +727,7 @@ class VectorAPI:
         index_mode: str = "immediate",
         ef_construction: int = 0,
         chunk_size: int = 0,
+        timeout: Optional[float] = None,
     ) -> BulkInsertResult:
         """Bulk insert vectors from a server-side file via mmap.
 
@@ -540,6 +764,16 @@ class VectorAPI:
                 for memory-tight boxes willing to accept a slower
                 one-time load. Resume mid-call is not supported in this
                 release; callers must restart the full call on failure.
+            timeout: optional per-call deadline in seconds. When None
+                (default), the deadline is derived from a client-known
+                signal and never collapses to the bare client default: it
+                scales from ``expected_count`` when that is given, refines by
+                the on-disk file size if ``path`` happens to be locally
+                visible (a shared filesystem), and otherwise falls back to a
+                generous from-path floor so a large server-side load is not
+                cut short. An explicit value is honored verbatim. The call
+                does not retry on DEADLINE_EXCEEDED, because the server-side
+                mmap ingest is non-idempotent and a retry would re-ingest.
 
         Returns:
             A BulkInsertResult with inserted_count, assigned_ids, and
@@ -555,6 +789,47 @@ class VectorAPI:
                 f"got {index_mode!r}"
             )
 
+        # Derive the deadline from whatever signal the client actually has,
+        # never the bare default. An explicit timeout always wins. With
+        # expected_count we scale from the vector count (same model as the
+        # streaming path). Otherwise, if the path is locally visible (client
+        # and server share a filesystem), refine by file size. With no signal
+        # at all (the normal server-side path) we use a generous from-path
+        # floor rather than guessing, since this API is the very-large-load
+        # path and must over-provision.
+        if timeout is not None:
+            call_timeout = timeout
+        elif expected_count > 0:
+            # from-path is the very-large-load path; the server-side index
+            # build dominates and is far slower than a file read, so never let
+            # a count/byte estimate drop the deadline below the generous floor.
+            # The estimate may only raise it (for multi-million loads).
+            call_timeout = max(
+                _BULK_FROM_PATH_MIN_DEADLINE,
+                _scaled_bulk_timeout(
+                    None,
+                    self._client._timeout,
+                    num_vectors=expected_count,
+                    dim=dim if dim > 0 else None,
+                ),
+            )
+        else:
+            file_bytes: Optional[int] = None
+            try:
+                file_bytes = os.path.getsize(path)
+            except OSError:
+                file_bytes = None
+            if file_bytes is not None:
+                call_timeout = max(
+                    _BULK_FROM_PATH_MIN_DEADLINE,
+                    _scaled_bulk_timeout(
+                        None, self._client._timeout, num_bytes=file_bytes
+                    ),
+                )
+            else:
+                # No client-side signal: over-provision via the floor.
+                call_timeout = _BULK_FROM_PATH_MIN_DEADLINE
+
         request = vector_pb2.BulkInsertFromPathRequest(
             collection=collection,
             path=path,
@@ -569,9 +844,18 @@ class VectorAPI:
             chunk_size=chunk_size,
         )
 
+        # Do not retry DEADLINE_EXCEEDED: the server-side mmap ingest is
+        # non-idempotent, so a retry would re-ingest the file and corrupt the
+        # client-visible count. UNAVAILABLE (connection setup) may still retry.
         response = self._client._call(
-            self._client._vector_stub.BulkInsertFromPath, request
+            self._client._vector_stub.BulkInsertFromPath,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
+        # Avoid rebuilding the full 1M id list the from-path API exists to skip:
+        # keep a plain list for small results, lazily view the proto field for
+        # large ones. inserted_count carries the count without touching ids.
         return BulkInsertResult(
             inserted_count=response.inserted_count,
             errors=list(response.errors),
@@ -582,5 +866,5 @@ class VectorAPI:
                 response, "last_committed_lsn", 0
             ),
             resume_token=getattr(response, "resume_token", ""),
-            assigned_ids=list(getattr(response, "assigned_ids", []) or []),
+            assigned_ids=_assigned_ids_view(response),
         )

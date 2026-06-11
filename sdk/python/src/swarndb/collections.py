@@ -21,8 +21,39 @@ from .types import (
     QuantizationConfig,
     ScalarQuantizationConfig,
 )
+from .vectors import _BULK_FROM_PATH_MIN_DEADLINE, _scaled_bulk_timeout
 
 logger = logging.getLogger(__name__)
+
+
+def _maintenance_timeout(
+    explicit_timeout: Optional[float],
+    default_timeout: float,
+    *,
+    num_vectors: Optional[int] = None,
+) -> float:
+    """Derive a generous deadline for a server-serialized maintenance RPC.
+
+    optimize/compact/snapshot/prune_wal can take many minutes on a large
+    collection (a 1M index rebuild), far past the 30s default. An explicit
+    timeout always wins. Otherwise we over-provision: scale from a known vector
+    count when one is cheaply available, floored at a generous from-path floor
+    so a multi-minute rebuild is never cut short and the non-idempotent RPC is
+    never re-issued by a deadline.
+    """
+    if explicit_timeout is not None:
+        return explicit_timeout
+    scaled = _scaled_bulk_timeout(
+        None, default_timeout, num_vectors=num_vectors
+    )
+    return max(_BULK_FROM_PATH_MIN_DEADLINE, scaled)
+
+# Maps the public mode string to the generated proto Mode enum value.
+_MODE_TO_PROTO = {
+    "vector_only": collection_pb2.MODE_VECTOR_ONLY,
+    "auto_similarity": collection_pb2.MODE_AUTO_SIMILARITY,
+    "hybrid": collection_pb2.MODE_HYBRID,
+}
 
 if TYPE_CHECKING:
     from .client import SwarnDBClient
@@ -45,6 +76,7 @@ class CollectionAPI:
         quantization: Optional[QuantizationConfig] = None,
         m: Optional[int] = None,
         ef_construction: Optional[int] = None,
+        mode: Optional[str] = None,
     ) -> CollectionInfo:
         """Create a new collection.
 
@@ -59,12 +91,15 @@ class CollectionAPI:
                 uses its default.
             ef_construction: Optional HNSW ef_construction override. When
                 None, the server uses its default.
+            mode: Optional graph mode ("vector_only", "auto_similarity",
+                "hybrid"). When None, the server defaults to vector-only.
 
         Returns:
             CollectionInfo with the created collection's metadata.
 
         Raises:
             CollectionExistsError: If a collection with this name already exists.
+            ValueError: If mode is not a recognized value.
         """
         request = collection_pb2.CreateCollectionRequest(
             name=name,
@@ -85,6 +120,14 @@ class CollectionAPI:
             request.m = m
         if ef_construction is not None:
             request.ef_construction = ef_construction
+        if mode is not None:
+            try:
+                request.mode = _MODE_TO_PROTO[mode]
+            except KeyError:
+                raise ValueError(
+                    f"unknown mode: {mode!r}; expected one of "
+                    "'vector_only', 'auto_similarity', 'hybrid'"
+                ) from None
         self._client._call(
             self._client._collection_stub.CreateCollection, request
         )
@@ -122,6 +165,7 @@ class CollectionAPI:
             vector_count=response.vector_count,
             default_threshold=response.default_threshold,
             quantization_type=qt,
+            indexed_count=getattr(response, 'indexed_count', 0),
         )
 
     def delete(self, name: str) -> bool:
@@ -160,6 +204,7 @@ class CollectionAPI:
                 vector_count=c.vector_count,
                 default_threshold=c.default_threshold,
                 quantization_type=getattr(c, 'quantization_type', '') or None,
+                indexed_count=getattr(c, 'indexed_count', 0),
             )
             for c in response.collections
         ]
@@ -179,19 +224,34 @@ class CollectionAPI:
         except CollectionNotFoundError:
             return False
 
-    def optimize(self, collection: str, rebuild_graph: bool = False) -> OptimizeResult:
+    def optimize(
+        self,
+        collection: str,
+        rebuild_graph: bool = False,
+        *,
+        timeout: Optional[float] = None,
+    ) -> OptimizeResult:
         """Optimize a collection (rebuild deferred HNSW index).
 
         Args:
             collection: Collection name.
             rebuild_graph: If True, also rebuild the virtual graph. Default False.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a multi-minute
+                index rebuild on a large collection is never cut short. An
+                explicit value is honored verbatim. This RPC is server
+                serialized and non-idempotent, so a deadline never re-issues it.
         """
         request = vector_pb2.OptimizeRequest(
             collection=collection,
             rebuild_graph=rebuild_graph,
         )
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
         response = self._client._call(
-            self._client._vector_stub.Optimize, request
+            self._client._vector_stub.Optimize,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
         return OptimizeResult(
             status=response.status,
@@ -200,15 +260,32 @@ class CollectionAPI:
             vectors_processed=response.vectors_processed,
         )
 
-    def prune_wal(self, collection: str) -> PruneWALResult:
+    def prune_wal(
+        self,
+        collection: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> PruneWALResult:
         """Prune old WAL files for a collection.
 
         Removes write-ahead log files that are no longer needed after
         data has been flushed to segments.
+
+        Args:
+            collection: Collection name.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a long prune on a
+                large collection is never cut short. An explicit value is
+                honored verbatim. This RPC is server serialized and
+                non-idempotent, so a deadline never re-issues it.
         """
         request = vector_pb2.PruneWALRequest(collection=collection)
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
         response = self._client._call(
-            self._client._vector_stub.PruneWAL, request
+            self._client._vector_stub.PruneWAL,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
         return PruneWALResult(
             status=response.status,
@@ -217,21 +294,37 @@ class CollectionAPI:
             duration_ms=response.duration_ms,
         )
 
-    def compact(self, collection: str, min_segments: int = 0, remove_deleted: bool = True) -> CompactResult:
+    def compact(
+        self,
+        collection: str,
+        min_segments: int = 0,
+        remove_deleted: bool = True,
+        *,
+        timeout: Optional[float] = None,
+    ) -> CompactResult:
         """Compact collection segments into fewer, larger files.
 
         Args:
             collection: Collection name.
             min_segments: Minimum segment count to trigger compaction. 0 = use server default (4).
             remove_deleted: Whether to remove deleted vectors during compaction. Default True.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a multi-minute
+                compaction on a large collection is never cut short. An
+                explicit value is honored verbatim. This RPC is server
+                serialized and non-idempotent, so a deadline never re-issues it.
         """
         request = vector_pb2.CompactRequest(
             collection=collection,
             min_segments=min_segments,
             remove_deleted=remove_deleted,
         )
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
         response = self._client._call(
-            self._client._vector_stub.Compact, request
+            self._client._vector_stub.Compact,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
         return CompactResult(
             status=response.status,
@@ -241,18 +334,32 @@ class CollectionAPI:
             duration_ms=response.duration_ms,
         )
 
-    def snapshot(self, name: str) -> int:
+    def snapshot(
+        self,
+        name: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> int:
         """Force a synchronous snapshot for a collection.
 
         Args:
             name: Collection name.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a long snapshot on
+                a large collection is never cut short. An explicit value is
+                honored verbatim. This RPC is server serialized and
+                non-idempotent, so a deadline never re-issues it.
 
         Returns:
             The LSN of the snapshot just written.
         """
         request = collection_pb2.SnapshotCollectionRequest(name=name)
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
         response = self._client._call(
-            self._client._collection_stub.SnapshotCollection, request
+            self._client._collection_stub.SnapshotCollection,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
         return int(response.last_snapshot_lsn)
 

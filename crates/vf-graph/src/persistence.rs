@@ -364,11 +364,19 @@ pub fn deserialize_base(reader: &mut impl IoRead) -> Result<(u64, VirtualGraph),
         ));
     }
 
-    // Validate version
+    // Validate version. v2 is the similarity-graph base parsed here. v3 is the
+    // typed-graph base (ADR-007 R4): recognise it and route the caller to
+    // deserialize_typed_base rather than failing as "unknown version". Reject
+    // anything that is neither v2 nor v3.
     let version = u32::from_le_bytes(envelope[4..8].try_into().unwrap());
+    if version == 3 {
+        return Err(GraphError::InvalidFormat(
+            "v3 typed graph base; load via typed_persistence::deserialize_typed_base".into(),
+        ));
+    }
     if version != BASE_FORMAT_VERSION {
         return Err(GraphError::InvalidFormat(format!(
-            "unsupported format version: {version}, expected {BASE_FORMAT_VERSION}"
+            "unsupported format version: {version}, expected 2 (v2) or 3 (v3 typed)"
         )));
     }
 
@@ -509,11 +517,12 @@ pub fn validate_graph_base(path: &Path) -> Result<(u64, u64, u64), GraphError> {
         ));
     }
 
-    // Validate version
+    // Validate version. Accept v2 (similarity base) and v3 (typed base); both
+    // share this envelope layout for the header fields read below (ADR-007 R4).
     let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    if version != BASE_FORMAT_VERSION {
+    if version != BASE_FORMAT_VERSION && version != 3 {
         return Err(GraphError::InvalidFormat(format!(
-            "unsupported format version: {version}, expected {BASE_FORMAT_VERSION}"
+            "unsupported format version: {version}, expected 2 (v2) or 3 (v3 typed)"
         )));
     }
 

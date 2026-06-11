@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use vf_core::types::{ScoredResult, SearchQuantizationParams, VectorId};
+use vf_core::types::{DistanceMetricType, ScoredResult, SearchQuantizationParams, VectorId};
 
 use crate::hnsw_delta::HnswDeltaWriter;
 use crate::hnsw_persistence::HnswTopologySnapshot;
@@ -102,6 +102,17 @@ pub trait VectorIndex: Send + Sync {
     /// Retrieve all vectors as (id, f32 data) pairs.
     fn iter_vectors(&self) -> Result<Vec<(VectorId, Vec<f32>)>, IndexError> {
         Err(IndexError::Internal("iter_vectors not supported by this index".into()))
+    }
+
+    /// The collection's configured distance metric. Used by VectorRank so it
+    /// scores a frontier identically to a normal vector search on this index.
+    fn metric_type(&self) -> DistanceMetricType;
+
+    /// True when this index scores via quantization (SQ8) and is trained, so
+    /// VectorRank must use the quantized exact-over-candidates path. Plain
+    /// indexes return false and are scored by a get_vector distance loop.
+    fn is_quantized(&self) -> bool {
+        false
     }
 }
 

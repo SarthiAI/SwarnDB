@@ -143,7 +143,8 @@ impl VectorService for VectorServiceImpl {
             coll.index_manager.index_record(assigned_id, meta);
         }
 
-        {
+        // Only populate the similarity graph when the resolved mode enables it.
+        if coll.config.graph_enabled() {
             // Reborrow the lock guard to a plain &mut CollectionState so the
             // compiler can split the disjoint field borrows of graph and index.
             let coll: &mut CollectionState = &mut *coll;
@@ -388,153 +389,219 @@ impl VectorService for VectorServiceImpl {
                     continue;
                 }
             };
-            let mut coll = metered_write(&coll_handle);
+            // Phase 1: acquire the per-collection write guard and run the
+            // store + storage inserts inside its own lexical scope so the
+            // non-Send guard is dropped at the block's closing brace, before
+            // any await. The block returns the owned values the post-build
+            // phase needs.
+            let (mut chunk_items, chunk_metas, chunk_max_lsn): (
+                Vec<(u64, Arc<Vec<f32>>, u64)>,
+                Vec<Option<vf_core::types::Metadata>>,
+                u64,
+            ) = {
+                let coll = metered_write(&coll_handle);
 
-            // Each vector is wrapped once in Arc; chunk_items and the graph
-            // compute map share Arc clones (refcount bump only, no byte copy).
-            let mut chunk_items: Vec<(u64, Arc<Vec<f32>>, u64)> = Vec::with_capacity(items.len());
-            let mut chunk_metas: Vec<Option<vf_core::types::Metadata>> = Vec::with_capacity(items.len());
-            let mut chunk_max_lsn: u64 = last_committed_lsn;
+                // Each vector is wrapped once in Arc; chunk_items and the graph
+                // compute map share Arc clones (refcount bump only, no byte copy).
+                let mut chunk_items: Vec<(u64, Arc<Vec<f32>>, u64)> = Vec::with_capacity(items.len());
+                let mut chunk_metas: Vec<Option<vf_core::types::Metadata>> = Vec::with_capacity(items.len());
+                let mut chunk_max_lsn: u64 = last_committed_lsn;
 
-            // One acquisition per (chunk, collection), held across all items in this chunk.
-            let mut cm = self.state.collection_manager.write();
-            let mut storage_coll_opt = cm.get_collection_mut(&coll_name).ok();
+                // One acquisition per (chunk, collection), held across all items in this chunk.
+                let mut cm = self.state.collection_manager.write();
+                let mut storage_coll_opt = cm.get_collection_mut(&coll_name).ok();
 
-            for it in items {
-                let proto_vec = match it.req.vector.as_ref() {
-                    Some(v) if !v.values.is_empty() => v,
-                    _ => {
-                        let tag = if it.req.id != 0 { Some(it.req.id) } else { None };
-                        pending_errors.push((Some(coll_name.clone()), tag, format!("item {}: missing or empty vector", it.item_idx)));
-                        continue;
-                    }
-                };
-
-                let values = proto_vec.values.clone();
-                let core_metadata = it.req.metadata.as_ref().map(proto_to_core_metadata);
-
-                let assigned_id = if it.req.id == 0 {
-                    match coll.store.insert_metadata_auto_id(core_metadata.clone()) {
-                        Ok(id) => {
-                            committed_ids.insert(id);
-                            assigned_ids.push(id);
-                            id
-                        }
-                        Err(e) => {
-                            pending_errors.push((Some(coll_name.clone()), None, format!("store insert failed: {}", e)));
+                for it in items {
+                    let proto_vec = match it.req.vector.as_ref() {
+                        Some(v) if !v.values.is_empty() => v,
+                        _ => {
+                            let tag = if it.req.id != 0 { Some(it.req.id) } else { None };
+                            pending_errors.push((Some(coll_name.clone()), tag, format!("item {}: missing or empty vector", it.item_idx)));
                             continue;
                         }
-                    }
-                } else {
-                    match coll.store.insert_metadata(it.req.id, core_metadata.clone()) {
-                        Ok(()) => {
-                            committed_ids.insert(it.req.id);
-                            assigned_ids.push(it.req.id);
-                            it.req.id
-                        }
-                        Err(e) => {
-                            pending_errors.push((Some(coll_name.clone()), Some(it.req.id), format!("store insert failed for id {}: {}", it.req.id, e)));
-                            continue;
-                        }
-                    }
-                };
+                    };
 
-                let lsn = match storage_coll_opt.as_mut() {
-                    Some(sc) => {
-                        if let Err(e) = sc.insert(
-                            assigned_id,
-                            VectorData::F32(values.clone()),
-                            core_metadata.clone(),
-                        ) {
-                            tracing::warn!(collection = %coll_name, id = assigned_id, "storage bulk insert failed: {}", e);
+                    let values = proto_vec.values.clone();
+                    let core_metadata = it.req.metadata.as_ref().map(proto_to_core_metadata);
+
+                    let assigned_id = if it.req.id == 0 {
+                        match coll.store.insert_metadata_auto_id(core_metadata.clone()) {
+                            Ok(id) => {
+                                committed_ids.insert(id);
+                                assigned_ids.push(id);
+                                id
+                            }
+                            Err(e) => {
+                                pending_errors.push((Some(coll_name.clone()), None, format!("store insert failed: {}", e)));
+                                continue;
+                            }
                         }
-                        sc.current_lsn().saturating_sub(1)
+                    } else {
+                        match coll.store.insert_metadata(it.req.id, core_metadata.clone()) {
+                            Ok(()) => {
+                                committed_ids.insert(it.req.id);
+                                assigned_ids.push(it.req.id);
+                                it.req.id
+                            }
+                            Err(e) => {
+                                pending_errors.push((Some(coll_name.clone()), Some(it.req.id), format!("store insert failed for id {}: {}", it.req.id, e)));
+                                continue;
+                            }
+                        }
+                    };
+
+                    let lsn = match storage_coll_opt.as_mut() {
+                        Some(sc) => {
+                            if let Err(e) = sc.insert(
+                                assigned_id,
+                                VectorData::F32(values.clone()),
+                                core_metadata.clone(),
+                            ) {
+                                tracing::warn!(collection = %coll_name, id = assigned_id, "storage bulk insert failed: {}", e);
+                            }
+                            sc.current_lsn().saturating_sub(1)
+                        }
+                        None => 0,
+                    };
+                    if lsn > chunk_max_lsn {
+                        chunk_max_lsn = lsn;
                     }
-                    None => 0,
-                };
-                if lsn > chunk_max_lsn {
-                    chunk_max_lsn = lsn;
+
+                    // Single Arc per row; the index path and the graph compute share it.
+                    let vec_arc = Arc::new(values);
+                    chunk_items.push((assigned_id, vec_arc, lsn));
+                    chunk_metas.push(core_metadata);
                 }
+                // Drop before index bulk_add to avoid deadlock against index ops.
+                drop(storage_coll_opt);
+                drop(cm);
 
-                // Single Arc per row; the index path and the graph compute share it.
-                let vec_arc = Arc::new(values);
-                chunk_items.push((assigned_id, vec_arc, lsn));
-                chunk_metas.push(core_metadata);
-            }
-            // Drop before index bulk_add to avoid deadlock against index ops.
-            drop(storage_coll_opt);
-            drop(cm);
+                (chunk_items, chunk_metas, chunk_max_lsn)
+            };
+            // <-- per-collection write guard dropped here, before the await.
 
             if !chunk_items.is_empty() {
-                if let Err(e) = coll.index.bulk_add_with_lsn(&chunk_items) {
-                    let rolled_back: std::collections::HashSet<u64> =
-                        chunk_items.iter().map(|(id, _, _)| *id).collect();
-                    for (id, _, _) in &chunk_items {
-                        let _ = coll.store.delete(*id);
-                        // Drop rolled-back ids so reconciliation does not
-                        // reclassify them as successful inserts.
-                        committed_ids.remove(id);
+                // Capture this chunk's ids for D-1 rollback, then move the items
+                // into a blocking task so the CPU-bound HNSW build does not run on
+                // a tokio worker. No guard is held across the await; the blocking
+                // task acquires its own fresh guard, and the post-build phase
+                // below acquires a separate fresh guard binding.
+                let chunk_ids_for_rollback: Vec<u64> =
+                    chunk_items.iter().map(|(id, _, _)| *id).collect();
+
+                let build_handle = coll_handle.clone();
+                let items = std::mem::take(&mut chunk_items);
+                // Move items into the blocking build and hand them back on
+                // success so the metadata + graph pass below can reuse them.
+                let build_res = tokio::task::spawn_blocking(move || {
+                    let coll = metered_write(&build_handle);
+                    match coll.index.bulk_add_with_lsn(&items) {
+                        Ok(()) => Ok(items),
+                        Err(e) => Err(e),
                     }
-                    // Symmetric pop from assigned_ids so the response excludes
-                    // rows that did not make it past the index step.
-                    assigned_ids.retain(|id| !rolled_back.contains(id));
-                    let err_str = format!(
-                        "chunk {}: bulk index insert failed: {}",
-                        chunk_idx, e
-                    );
-                    for (id, _, _) in &chunk_items {
-                        pending_errors.push((Some(coll_name.clone()), Some(*id), err_str.clone()));
+                })
+                .await;
+
+                let build_err = match build_res {
+                    Ok(Ok(returned_items)) => {
+                        chunk_items = returned_items;
+                        None
                     }
-                    // Free per-chunk vector buffers before the next iteration.
-                    drop(chunk_items);
+                    Ok(Err(e)) => Some(format!("{}", e)),
+                    Err(join_err) => Some(format!("bulk index build task join error: {join_err}")),
+                };
+                if let Some(e) = build_err {
+                    // D-1 rollback inside an inner block so the !Send guard's
+                    // region ends before the await below. An explicit drop() is
+                    // not enough to shrink the async state machine's captured
+                    // region; only a lexical block reliably scopes the guard out.
+                    {
+                        let coll_post = metered_write(&coll_handle);
+                        let rolled_back: std::collections::HashSet<u64> =
+                            chunk_ids_for_rollback.iter().copied().collect();
+                        for id in &chunk_ids_for_rollback {
+                            let _ = coll_post.store.delete(*id);
+                            // Drop rolled-back ids so reconciliation does not
+                            // reclassify them as successful inserts.
+                            committed_ids.remove(id);
+                        }
+                        // Symmetric pop from assigned_ids so the response excludes
+                        // rows that did not make it past the index step.
+                        assigned_ids.retain(|id| !rolled_back.contains(id));
+                        let err_str = format!(
+                            "chunk {}: bulk index insert failed: {}",
+                            chunk_idx, e
+                        );
+                        for id in &chunk_ids_for_rollback {
+                            pending_errors.push((Some(coll_name.clone()), Some(*id), err_str.clone()));
+                        }
+                    }
+                    // Free per-chunk metadata buffers before the next iteration.
                     drop(chunk_metas);
                     chunk_idx += 1;
+                    // Keep the runtime responsive between chunks.
+                    tokio::task::yield_now().await;
                     continue;
                 }
             }
 
-            // Single pass: index metadata, count, and seed the graph compute map.
-            let mut ids: Vec<u64> = Vec::with_capacity(chunk_items.len());
-            let mut vectors_map: std::collections::HashMap<u64, Arc<Vec<f32>>> =
-                std::collections::HashMap::with_capacity(chunk_items.len());
-            for ((assigned_id, vec_arc, _), meta_opt) in chunk_items.iter().zip(chunk_metas.into_iter()) {
-                if let Some(ref m) = meta_opt {
-                    coll.index_manager.index_record(*assigned_id, m);
-                }
-                inserted_count += 1;
-                ids.push(*assigned_id);
-                vectors_map.insert(*assigned_id, Arc::clone(vec_arc));
-            }
-            drop(chunk_items);
+            // Post-build phase: the metadata + graph work runs inside an inner
+            // block so the !Send write guard's region ends before the await
+            // below. An explicit drop() is not enough to shrink the async state
+            // machine's captured region; only a lexical block reliably scopes
+            // the guard out so the future stays Send.
+            {
+                let mut coll = metered_write(&coll_handle);
 
-            // Recompute graph edges for just this chunk while holding the same
-            // write lock. Vectors are released at end of iteration.
-            if !ids.is_empty() {
-                // Reborrow the lock guard to a plain &mut CollectionState so
-                // the compiler can split the disjoint field borrows of graph
-                // and index.
-                let coll: &mut CollectionState = &mut *coll;
-                if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
-                    &mut coll.graph,
-                    coll.index.as_vector_index(),
-                    &ids,
-                    &vectors_map,
-                    10,
-                ) {
-                    tracing::warn!(collection = %coll_name, "graph compute_batch_parallel after bulk_insert failed: {}", e);
+                // Single pass: index metadata, count, and seed the graph compute map.
+                let mut ids: Vec<u64> = Vec::with_capacity(chunk_items.len());
+                let mut vectors_map: std::collections::HashMap<u64, Arc<Vec<f32>>> =
+                    std::collections::HashMap::with_capacity(chunk_items.len());
+                for ((assigned_id, vec_arc, _), meta_opt) in chunk_items.iter().zip(chunk_metas.into_iter()) {
+                    if let Some(ref m) = meta_opt {
+                        coll.index_manager.index_record(*assigned_id, m);
+                    }
+                    inserted_count += 1;
+                    ids.push(*assigned_id);
+                    vectors_map.insert(*assigned_id, Arc::clone(vec_arc));
                 }
-            }
-            drop(vectors_map);
-            drop(ids);
+                drop(chunk_items);
 
-            // Release capacity ratchet from this collection's metadata index
-            // before dropping the write lock for the next batch.
-            coll.index_manager.compact();
+                // Recompute graph edges for just this chunk while holding the same
+                // write lock. Vectors are released at end of iteration. Skipped when
+                // the resolved mode disables the graph (vector-only).
+                if coll.config.graph_enabled() && !ids.is_empty() {
+                    // Reborrow the lock guard to a plain &mut CollectionState so
+                    // the compiler can split the disjoint field borrows of graph
+                    // and index.
+                    let coll: &mut CollectionState = &mut *coll;
+                    if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
+                        &mut coll.graph,
+                        coll.index.as_vector_index(),
+                        &ids,
+                        &vectors_map,
+                        10,
+                    ) {
+                        tracing::warn!(collection = %coll_name, "graph compute_batch_parallel after bulk_insert failed: {}", e);
+                    }
+                }
+                drop(vectors_map);
+                drop(ids);
+
+                // Release capacity ratchet from this collection's metadata index
+                // before dropping the write lock for the next batch.
+                coll.index_manager.compact();
+            }
 
             last_completed_batch_idx = chunk_idx;
             last_committed_lsn = chunk_max_lsn;
             chunk_idx += 1;
             successful_collections.insert(coll_name.clone());
+
+            // The write guard was released at the end of the block above; yield
+            // so the runtime can schedule other tasks (health probes, concurrent
+            // reads) between chunks.
+            tokio::task::yield_now().await;
         }
 
         // Reconcile pending errors against the live store per collection. A row
@@ -847,107 +914,150 @@ impl VectorService for VectorServiceImpl {
                         continue;
                     }
                 };
-                let mut coll = metered_write(&coll_handle);
-
-                // Each vector is wrapped once in Arc; chunk_items and the graph
-                // compute map share Arc clones (refcount bump only, no byte copy).
-                let mut chunk_items: Vec<(u64, Arc<Vec<f32>>, u64)> = Vec::with_capacity(items.len());
-                let mut chunk_metas: Vec<Option<vf_core::types::Metadata>> = Vec::with_capacity(items.len());
-
                 // Snapshot the global counter so we can tell if this (chunk, collection) landed any rows.
                 let pre_chunk_inserted = inserted_count;
 
-                // One acquisition per (chunk, collection), held across all items in this chunk.
-                let mut cm = self.state.collection_manager.write();
-                let mut storage_coll_opt = cm.get_collection_mut(&coll_name).ok();
+                // Phase 1: acquire the per-collection write guard and run the
+                // store + storage inserts inside its own lexical scope so the
+                // non-Send guard is dropped at the block's closing brace, before
+                // any await. The block returns the owned values the post-build
+                // phase needs.
+                let (mut chunk_items, chunk_metas): (
+                    Vec<(u64, Arc<Vec<f32>>, u64)>,
+                    Vec<Option<vf_core::types::Metadata>>,
+                ) = {
+                    let coll = metered_write(&coll_handle);
 
-                for it in items {
-                    let proto_vec = match it.req.vector.as_ref() {
-                        Some(v) if !v.values.is_empty() => v,
-                        _ => {
-                            let tag = if it.req.id != 0 { Some(it.req.id) } else { None };
-                            pending_errors.push((Some(coll_name.clone()), tag, format!(
-                                "item {}: missing or empty vector",
-                                it.item_idx
-                            )));
-                            continue;
-                        }
-                    };
+                    // Each vector is wrapped once in Arc; chunk_items and the graph
+                    // compute map share Arc clones (refcount bump only, no byte copy).
+                    let mut chunk_items: Vec<(u64, Arc<Vec<f32>>, u64)> = Vec::with_capacity(items.len());
+                    let mut chunk_metas: Vec<Option<vf_core::types::Metadata>> = Vec::with_capacity(items.len());
 
-                    let values = proto_vec.values.clone();
-                    let core_metadata = it.req.metadata.as_ref().map(proto_to_core_metadata);
+                    // One acquisition per (chunk, collection), held across all items in this chunk.
+                    let mut cm = self.state.collection_manager.write();
+                    let mut storage_coll_opt = cm.get_collection_mut(&coll_name).ok();
 
-                    let assigned_id = if it.req.id == 0 {
-                        match coll.store.insert_metadata_auto_id(core_metadata.clone()) {
-                            Ok(id) => {
-                                committed_ids.insert(id);
-                                assigned_ids.push(id);
-                                id
-                            }
-                            Err(e) => {
-                                pending_errors.push((Some(coll_name.clone()), None, format!(
-                                    "item {}: store insert failed: {}",
-                                    it.item_idx, e
+                    for it in items {
+                        let proto_vec = match it.req.vector.as_ref() {
+                            Some(v) if !v.values.is_empty() => v,
+                            _ => {
+                                let tag = if it.req.id != 0 { Some(it.req.id) } else { None };
+                                pending_errors.push((Some(coll_name.clone()), tag, format!(
+                                    "item {}: missing or empty vector",
+                                    it.item_idx
                                 )));
                                 continue;
                             }
-                        }
-                    } else {
-                        match coll.store.insert_metadata(it.req.id, core_metadata.clone()) {
-                            Ok(()) => {
-                                committed_ids.insert(it.req.id);
-                                assigned_ids.push(it.req.id);
-                                it.req.id
-                            }
-                            Err(e) => {
-                                pending_errors.push((Some(coll_name.clone()), Some(it.req.id), format!(
-                                    "item {}: store insert failed for id {}: {}",
-                                    it.item_idx, it.req.id, e
-                                )));
-                                continue;
-                            }
-                        }
-                    };
+                        };
 
-                    // Persist to storage layer first to obtain the WAL LSN.
-                    // wal_flush_every=0 now means default cadence, not skip WAL.
-                    let lsn = match storage_coll_opt.as_mut() {
-                        Some(sc) => {
-                            if let Err(e) = sc.insert(
-                                assigned_id,
-                                VectorData::F32(values.clone()),
-                                core_metadata.clone(),
-                            ) {
-                                tracing::warn!(
-                                    collection = %coll_name,
-                                    id = assigned_id,
-                                    "storage insert failed: {}",
-                                    e
-                                );
+                        let values = proto_vec.values.clone();
+                        let core_metadata = it.req.metadata.as_ref().map(proto_to_core_metadata);
+
+                        let assigned_id = if it.req.id == 0 {
+                            match coll.store.insert_metadata_auto_id(core_metadata.clone()) {
+                                Ok(id) => {
+                                    committed_ids.insert(id);
+                                    assigned_ids.push(id);
+                                    id
+                                }
+                                Err(e) => {
+                                    pending_errors.push((Some(coll_name.clone()), None, format!(
+                                        "item {}: store insert failed: {}",
+                                        it.item_idx, e
+                                    )));
+                                    continue;
+                                }
                             }
-                            sc.current_lsn().saturating_sub(1)
+                        } else {
+                            match coll.store.insert_metadata(it.req.id, core_metadata.clone()) {
+                                Ok(()) => {
+                                    committed_ids.insert(it.req.id);
+                                    assigned_ids.push(it.req.id);
+                                    it.req.id
+                                }
+                                Err(e) => {
+                                    pending_errors.push((Some(coll_name.clone()), Some(it.req.id), format!(
+                                        "item {}: store insert failed for id {}: {}",
+                                        it.item_idx, it.req.id, e
+                                    )));
+                                    continue;
+                                }
+                            }
+                        };
+
+                        // Persist to storage layer first to obtain the WAL LSN.
+                        // wal_flush_every=0 now means default cadence, not skip WAL.
+                        let lsn = match storage_coll_opt.as_mut() {
+                            Some(sc) => {
+                                if let Err(e) = sc.insert(
+                                    assigned_id,
+                                    VectorData::F32(values.clone()),
+                                    core_metadata.clone(),
+                                ) {
+                                    tracing::warn!(
+                                        collection = %coll_name,
+                                        id = assigned_id,
+                                        "storage insert failed: {}",
+                                        e
+                                    );
+                                }
+                                sc.current_lsn().saturating_sub(1)
+                            }
+                            None => 0,
+                        };
+                        if lsn > chunk_max_lsn {
+                            chunk_max_lsn = lsn;
                         }
-                        None => 0,
-                    };
-                    if lsn > chunk_max_lsn {
-                        chunk_max_lsn = lsn;
+
+                        // Single Arc per row; the index path and the graph compute share it.
+                        let vec_arc = Arc::new(values);
+                        chunk_items.push((assigned_id, vec_arc, lsn));
+                        chunk_metas.push(core_metadata);
                     }
+                    // Drop before index bulk_add to avoid deadlock against index ops.
+                    drop(storage_coll_opt);
+                    drop(cm);
 
-                    // Single Arc per row; the index path and the graph compute share it.
-                    let vec_arc = Arc::new(values);
-                    chunk_items.push((assigned_id, vec_arc, lsn));
-                    chunk_metas.push(core_metadata);
-                }
-                // Drop before index bulk_add to avoid deadlock against index ops.
-                drop(storage_coll_opt);
-                drop(cm);
+                    (chunk_items, chunk_metas)
+                };
+                // <-- per-collection write guard dropped here, before the await.
 
                 if !index_mode_deferred && !chunk_items.is_empty() {
-                    if let Err(e) = coll.index.bulk_add_with_lsn(&chunk_items) {
+                    // Capture ids for D-1 rollback and run the CPU-bound build in
+                    // spawn_blocking (which acquires its own fresh guard). No guard
+                    // is held across the await; the post-build phase acquires a
+                    // separate fresh guard binding.
+                    let chunk_ids_for_rollback: Vec<u64> =
+                        chunk_items.iter().map(|(id, _, _)| *id).collect();
+
+                    let build_handle = coll_handle.clone();
+                    let items = std::mem::take(&mut chunk_items);
+                    let build_res = tokio::task::spawn_blocking(move || {
+                        let coll = metered_write(&build_handle);
+                        match coll.index.bulk_add_with_lsn(&items) {
+                            Ok(()) => Ok(items),
+                            Err(e) => Err(e),
+                        }
+                    })
+                    .await;
+
+                    let build_err = match build_res {
+                        Ok(Ok(returned_items)) => {
+                            chunk_items = returned_items;
+                            None
+                        }
+                        Ok(Err(e)) => Some(format!("{}", e)),
+                        Err(join_err) => {
+                            Some(format!("bulk index build task join error: {join_err}"))
+                        }
+                    };
+                    if let Some(e) = build_err {
+                        // D-1 rollback under a fresh post-await guard binding.
+                        let coll_post = metered_write(&coll_handle);
                         let rolled_back: std::collections::HashSet<u64> =
-                            chunk_items.iter().map(|(id, _, _)| *id).collect();
-                        for (id, _, _) in &chunk_items {
-                            let _ = coll.store.delete(*id);
+                            chunk_ids_for_rollback.iter().copied().collect();
+                        for id in &chunk_ids_for_rollback {
+                            let _ = coll_post.store.delete(*id);
                             // Drop rolled-back ids so reconciliation does not
                             // reclassify them as successful inserts.
                             committed_ids.remove(id);
@@ -959,15 +1069,19 @@ impl VectorService for VectorServiceImpl {
                             "chunk {}: bulk index insert failed: {}",
                             chunk_idx, e
                         );
-                        for (id, _, _) in &chunk_items {
+                        for id in &chunk_ids_for_rollback {
                             pending_errors.push((Some(coll_name.clone()), Some(*id), err_str.clone()));
                         }
-                        // Free per-chunk vector buffers before moving on.
-                        drop(chunk_items);
+                        // Free per-chunk metadata buffers before moving on.
+                        drop(coll_post);
                         drop(chunk_metas);
                         continue;
                     }
                 }
+
+                // Post-build phase: a fresh guard binding for the metadata + graph
+                // work. No guard from the pre-build scope crosses the await above.
+                let mut coll = metered_write(&coll_handle);
 
                 // Single pass: index metadata, count, and seed the graph compute map.
                 let mut ids: Vec<u64> = Vec::with_capacity(chunk_items.len());
@@ -987,7 +1101,7 @@ impl VectorService for VectorServiceImpl {
                 }
                 drop(chunk_items);
 
-                if !defer_graph && !ids.is_empty() {
+                if !defer_graph && coll.config.graph_enabled() && !ids.is_empty() {
                     // Reborrow the lock guard to a plain &mut CollectionState
                     // so the compiler can split the disjoint field borrows of
                     // graph and index.
@@ -1041,6 +1155,9 @@ impl VectorService for VectorServiceImpl {
                     }
                 }
             }
+
+            // Yield between chunks so the runtime can schedule probes and reads.
+            tokio::task::yield_now().await;
         }
 
         // Release capacity ratchet from each touched collection's metadata
@@ -1208,6 +1325,12 @@ impl VectorService for VectorServiceImpl {
                 Err(e) => return Err(map_bifp_error(e)),
             };
         let _data_file = data_file;
+        // F14: own the mmap behind an Arc so the CPU-bound HNSW build can be
+        // offloaded to spawn_blocking. Each build closure takes an Arc clone
+        // (refcount bump only; the mapped pages stay shared, zero copy) and
+        // reconstructs its row slices inside the blocking thread, so no mmap
+        // borrow is ever held across an .await.
+        let mmap = std::sync::Arc::new(mmap);
 
         let coll_handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
             Status::not_found(format!("collection '{}' not found", req.collection))
@@ -1271,31 +1394,39 @@ impl VectorService for VectorServiceImpl {
         let mut inserted_count: u64 = 0;
         let mut last_committed_lsn: u64 = 0;
 
-        // Per-collection write lock for the duration of the bulk add (P08
-        // nested-lock structural fix: never hold the map lock and the
-        // collection lock together). The handle is already an Arc so the map
-        // lock has been released by `collection_handle`.
-        let mut coll = metered_write(&coll_handle);
-
         // Allocate metadata-store slots inline so each row gets a stable id
         // before we hand the batch to the index. `insert_metadata` is called
         // with `None` because path-based bulk insert does not carry metadata.
+        // `row_orig_idx` records each survivor's original dense row index so the
+        // F14 offload can reconstruct its mmap slice inside spawn_blocking
+        // without holding a borrow across the await.
         let mut row_ids: Vec<u64> = Vec::with_capacity(rows.len());
         let mut row_vecs: Vec<&[f32]> = Vec::with_capacity(rows.len());
-        for (i, vec_slice) in rows.iter().enumerate() {
-            let id_in = ids[i];
-            match coll.store.insert_metadata(id_in, None) {
-                Ok(()) => {
-                    committed_ids.insert(id_in);
-                    assigned_ids.push(id_in);
-                    row_ids.push(id_in);
-                    row_vecs.push(*vec_slice);
-                }
-                Err(e) => {
-                    pending_errors.push((
-                        Some(id_in),
-                        format!("row {}: store insert failed for id {}: {}", i, id_in, e),
-                    ));
+        let mut row_orig_idx: Vec<usize> = Vec::with_capacity(rows.len());
+        // Per-collection write lock for the metadata-store inserts (P08
+        // nested-lock structural fix: never hold the map lock and the
+        // collection lock together). The handle is already an Arc so the map
+        // lock has been released by `collection_handle`. The guard lives only
+        // inside this block so the non-Send parking_lot guard is dropped at the
+        // closing brace, well before any spawn_blocking().await below.
+        {
+            let coll = metered_write(&coll_handle);
+            for (i, vec_slice) in rows.iter().enumerate() {
+                let id_in = ids[i];
+                match coll.store.insert_metadata(id_in, None) {
+                    Ok(()) => {
+                        committed_ids.insert(id_in);
+                        assigned_ids.push(id_in);
+                        row_ids.push(id_in);
+                        row_vecs.push(*vec_slice);
+                        row_orig_idx.push(i);
+                    }
+                    Err(e) => {
+                        pending_errors.push((
+                            Some(id_in),
+                            format!("row {}: store insert failed for id {}: {}", i, id_in, e),
+                        ));
+                    }
                 }
             }
         }
@@ -1350,64 +1481,170 @@ impl VectorService for VectorServiceImpl {
             req.total_count_hint as usize
         };
 
-        if !index_mode_deferred && !items.is_empty() {
-            if req.chunk_size == 0 {
-                // Non-chunked path: preserve existing behavior, single bulk_add
-                // under the already-held write guard.
-                if let Err(e) = coll.index.bulk_add_from_slice_iter(&items, total_hint) {
-                    let rolled_back: std::collections::HashSet<u64> =
-                        items.iter().map(|(id, _, _)| *id).collect();
-                    for (id, _, _) in &items {
-                        let _ = coll.store.delete(*id);
-                        committed_ids.remove(id);
-                    }
-                    assigned_ids.retain(|id| !rolled_back.contains(id));
-                    let err_str = format!("bulk_insert_from_path: index insert failed: {}", e);
-                    for (id, _, _) in &items {
-                        pending_errors.push((Some(*id), err_str.clone()));
-                    }
-                } else {
-                    inserted_count = items.len() as u64;
-                }
-            } else {
-                // Chunked path: drop the outer write guard, then for each chunk
-                // re-acquire a fresh write guard, run bulk_add, drop the guard,
-                // snapshot, prune WAL, and release memory back to the OS. This
-                // keeps resident memory bounded across very large bulk inserts.
-                drop(coll);
+        // F14: capture the row layout as owned, mmap-independent data so the
+        // CPU-bound HNSW build can move into spawn_blocking. `items` only
+        // borrows the mmap; the offloaded build instead carries (id, orig_idx,
+        // lsn) triples plus an Arc<Mmap> clone and rebuilds the &[f32] slices
+        // inside the blocking thread. Dimension and header offset are plain
+        // usize copies. We keep bulk_add_from_slice_iter (NOT bulk_add_with_lsn)
+        // so the chunked path does not re-snapshot all prior nodes per chunk.
+        let build_rows: Vec<(vf_core::types::VectorId, usize, u64)> = row_ids
+            .iter()
+            .zip(row_orig_idx.iter())
+            .zip(lsns.iter())
+            .map(|((id, orig), lsn)| (*id, *orig, *lsn))
+            .collect();
+        // Stable count for the post-build deferred / metadata / F3 bookkeeping;
+        // build_rows itself is moved into the (non-chunked) build closure.
+        let item_count = build_rows.len();
+        let view_dim = view.dim;
+        let view_header_offset = view.header_offset;
+        // Drop the mmap-borrowing bindings before the build so only the Arc
+        // keeps the mapping alive; the closures reconstruct slices on demand.
+        drop(items);
+        drop(row_vecs);
+        drop(rows);
 
-                let chunk_sz = req.chunk_size as usize;
-                for chunk in items.chunks(chunk_sz) {
-                    let handle = self.state.collection_handle(&req.collection).ok_or_else(|| {
-                        Status::not_found(format!(
-                            "collection '{}' not found",
-                            req.collection
-                        ))
-                    })?;
-                    let coll_inner = metered_write(&handle);
-                    if let Err(e) = coll_inner.index.bulk_add_from_slice_iter(chunk, total_hint) {
-                        // Rollback the failed chunk's ids under the same guard
-                        // we already hold, then bail out of the loop.
+        if !index_mode_deferred && !build_rows.is_empty() {
+            if req.chunk_size == 0 {
+                // Non-chunked path: offload the full single bulk_add to
+                // spawn_blocking. The metadata-insert guard was already dropped
+                // at its block above, so no parking_lot guard crosses the await;
+                // the closure takes a fresh guard on the same handle and rebuilds
+                // the borrowed slices from the Arc<Mmap> clone.
+                let build_handle = coll_handle.clone();
+                let mmap_for_build = mmap.clone();
+                let rows_for_build = build_rows;
+                let build_res = tokio::task::spawn_blocking(move || {
+                    let flat: &[f32] =
+                        bytemuck::cast_slice(&mmap_for_build[view_header_offset..]);
+                    let items: Vec<(vf_core::types::VectorId, &[f32], u64)> = rows_for_build
+                        .iter()
+                        .map(|(id, orig, lsn)| {
+                            let start = orig * view_dim;
+                            (*id, &flat[start..start + view_dim], *lsn)
+                        })
+                        .collect();
+                    let coll = metered_write(&build_handle);
+                    match coll.index.bulk_add_from_slice_iter(&items, total_hint) {
+                        Ok(()) => Ok(rows_for_build),
+                        Err(e) => Err((format!("{}", e), rows_for_build)),
+                    }
+                })
+                .await;
+
+                match build_res {
+                    Ok(Ok(built_rows)) => {
+                        inserted_count = built_rows.len() as u64;
+                    }
+                    Ok(Err((e, failed_rows))) => {
+                        // Rollback under a fresh post-await guard binding.
+                        let coll_post = metered_write(&coll_handle);
                         let rolled_back: std::collections::HashSet<u64> =
-                            chunk.iter().map(|(id, _, _)| *id).collect();
-                        for (id, _, _) in chunk {
-                            let _ = coll_inner.store.delete(*id);
+                            failed_rows.iter().map(|(id, _, _)| *id).collect();
+                        for (id, _, _) in &failed_rows {
+                            let _ = coll_post.store.delete(*id);
                             committed_ids.remove(id);
                         }
-                        drop(coll_inner);
-                        drop(handle);
+                        drop(coll_post);
                         assigned_ids.retain(|id| !rolled_back.contains(id));
-                        let err_str = format!(
-                            "bulk_insert_from_path: index insert failed: {}",
-                            e
-                        );
-                        for (id, _, _) in chunk {
+                        let err_str =
+                            format!("bulk_insert_from_path: index insert failed: {}", e);
+                        for (id, _, _) in &failed_rows {
                             pending_errors.push((Some(*id), err_str.clone()));
                         }
-                        break;
                     }
-                    drop(coll_inner);
-                    drop(handle);
+                    Err(join_err) => {
+                        let err_str = format!(
+                            "bulk_insert_from_path: index build task join error: {join_err}"
+                        );
+                        // The whole batch failed to build; roll back every row.
+                        let coll_post = metered_write(&coll_handle);
+                        for id in &assigned_ids {
+                            let _ = coll_post.store.delete(*id);
+                            committed_ids.remove(id);
+                        }
+                        drop(coll_post);
+                        for id in &assigned_ids {
+                            pending_errors.push((Some(*id), err_str.clone()));
+                        }
+                        assigned_ids.clear();
+                    }
+                }
+            } else {
+                // Chunked path: no parking_lot guard is live here (the
+                // metadata-insert guard was dropped at its block above); for
+                // each chunk, offload the bulk_add to spawn_blocking (fresh guard
+                // inside, slices rebuilt from an Arc<Mmap> clone), then snapshot,
+                // prune WAL, and release memory back to the OS on the async side.
+                let chunk_sz = req.chunk_size as usize;
+                for chunk in build_rows.chunks(chunk_sz) {
+                    let build_handle = coll_handle.clone();
+                    let mmap_for_build = mmap.clone();
+                    let chunk_rows: Vec<(vf_core::types::VectorId, usize, u64)> =
+                        chunk.to_vec();
+                    let build_res = tokio::task::spawn_blocking(move || {
+                        let flat: &[f32] =
+                            bytemuck::cast_slice(&mmap_for_build[view_header_offset..]);
+                        let items: Vec<(vf_core::types::VectorId, &[f32], u64)> = chunk_rows
+                            .iter()
+                            .map(|(id, orig, lsn)| {
+                                let start = orig * view_dim;
+                                (*id, &flat[start..start + view_dim], *lsn)
+                            })
+                            .collect();
+                        let coll_inner = metered_write(&build_handle);
+                        match coll_inner.index.bulk_add_from_slice_iter(&items, total_hint) {
+                            Ok(()) => Ok(chunk_rows),
+                            Err(e) => Err((format!("{}", e), chunk_rows)),
+                        }
+                    })
+                    .await;
+
+                    match build_res {
+                        Ok(Ok(built_rows)) => {
+                            inserted_count += built_rows.len() as u64;
+                        }
+                        Ok(Err((e, failed_rows))) => {
+                            // Rollback the failed chunk under a fresh guard, then
+                            // bail out of the loop.
+                            let coll_inner = metered_write(&coll_handle);
+                            let rolled_back: std::collections::HashSet<u64> =
+                                failed_rows.iter().map(|(id, _, _)| *id).collect();
+                            for (id, _, _) in &failed_rows {
+                                let _ = coll_inner.store.delete(*id);
+                                committed_ids.remove(id);
+                            }
+                            drop(coll_inner);
+                            assigned_ids.retain(|id| !rolled_back.contains(id));
+                            let err_str = format!(
+                                "bulk_insert_from_path: index insert failed: {}",
+                                e
+                            );
+                            for (id, _, _) in &failed_rows {
+                                pending_errors.push((Some(*id), err_str.clone()));
+                            }
+                            break;
+                        }
+                        Err(join_err) => {
+                            let err_str = format!(
+                                "bulk_insert_from_path: index build task join error: {join_err}"
+                            );
+                            let coll_inner = metered_write(&coll_handle);
+                            let rolled_back: std::collections::HashSet<u64> =
+                                chunk.iter().map(|(id, _, _)| *id).collect();
+                            for (id, _, _) in chunk {
+                                let _ = coll_inner.store.delete(*id);
+                                committed_ids.remove(id);
+                            }
+                            drop(coll_inner);
+                            assigned_ids.retain(|id| !rolled_back.contains(id));
+                            for (id, _, _) in chunk {
+                                pending_errors.push((Some(*id), err_str.clone()));
+                            }
+                            break;
+                        }
+                    }
 
                     if let Err(e) = crate::snapshot::force_snapshot_collection(
                         &self.state,
@@ -1427,27 +1664,45 @@ impl VectorService for VectorServiceImpl {
                         );
                     }
                     vf_index::release_to_os();
-
-                    inserted_count += chunk.len() as u64;
                 }
-
-                // Re-acquire the write guard on the SAME collection handle so
-                // the trailing compact / deferred-flag bookkeeping below can
-                // proceed under a held write lock, mirroring the non-chunked
-                // path.
-                coll = metered_write(&coll_handle);
             }
         } else if index_mode_deferred {
-            inserted_count = items.len() as u64;
-            if !items.is_empty() {
-                coll.deferred_index.store(true, Ordering::Release);
-            }
+            inserted_count = item_count as u64;
+        }
+
+        // I12 (ADR-025): the file mapping is no longer needed once the build is
+        // done. Drop our Arc and purge the allocator arenas so the build-time
+        // heap freed inside bulk_add_from_slice_iter returns to the OS now.
+        drop(mmap);
+        vf_index::purge_allocator_arenas();
+
+        // Post-build bookkeeping under one fresh write guard, acquired AFTER all
+        // spawn_blocking().await points so no parking_lot guard ever crosses an
+        // await. Mirrors the post-build fresh-guard binding in
+        // bulk_insert_with_options (~grpc_vector.rs:1084). `mut` is required
+        // because IndexManager::compact takes &mut self.
+        let mut coll = metered_write(&coll_handle);
+
+        if index_mode_deferred && item_count > 0 {
+            coll.deferred_index.store(true, Ordering::Release);
         }
 
         if !skip_metadata_index {
             coll.index_manager.compact();
-        } else if !items.is_empty() {
+        } else if item_count > 0 {
             coll.deferred_metadata.store(true, Ordering::Release);
+        }
+
+        // F3: when anything was deferred, flip the collection to
+        // PendingOptimization so searches surface the stale-results warning and
+        // do not silently return 0 over an unbuilt index. Mirrors
+        // bulk_insert_with_options (~grpc_vector.rs:1191-1194).
+        let any_deferred = (index_mode_deferred && item_count > 0)
+            || (skip_metadata_index && item_count > 0);
+        if any_deferred {
+            if let Ok(mut status) = coll.status.write() {
+                *status = CollectionStatus::PendingOptimization;
+            }
         }
 
         drop(coll);
@@ -1515,7 +1770,7 @@ impl VectorService for VectorServiceImpl {
             .require_collection_ready(&req.collection)
             .map_err(status_from_availability)?;
 
-        match self.state.optimize_collection(&req.collection, req.rebuild_graph) {
+        match self.state.optimize_collection(&req.collection, req.rebuild_graph).await {
             Ok(result) => Ok(Response::new(OptimizeResponse {
                 status: result.status,
                 message: result.message,
@@ -1569,7 +1824,21 @@ impl VectorService for VectorServiceImpl {
         let min_segments = if req.min_segments == 0 { 4 } else { req.min_segments as usize };
         let remove_deleted = req.remove_deleted;
 
-        match self.state.compact_collection(&req.collection, min_segments, remove_deleted) {
+        // F7: the on-disk segment merge inside compact_collection holds the
+        // global collection_manager write lock for its whole duration. Running
+        // it inline would pin a runtime worker (and stall /readyz) for the full
+        // merge. Offload to spawn_blocking on a cheap AppState clone (Arc bumps);
+        // the global write lock is acquired inside the closure and released the
+        // moment the merge returns. No parking_lot guard crosses the await.
+        let state = self.state.clone();
+        let coll_name = req.collection.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            state.compact_collection(&coll_name, min_segments, remove_deleted)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("compact task join error: {e}")))?;
+
+        match result {
             Ok(result) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 Ok(Response::new(CompactResponse {

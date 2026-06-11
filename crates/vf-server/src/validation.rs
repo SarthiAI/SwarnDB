@@ -90,6 +90,9 @@ pub enum ValidationError {
     #[error("collection name '{name}' contains invalid characters (allowed pattern: {pattern})")]
     CollectionNameInvalidChars { name: String, pattern: String },
 
+    #[error("collection name '{name}' is reserved (leading '_' is reserved for internal directories such as '{reserved}')")]
+    CollectionNameReserved { name: String, reserved: String },
+
     #[error("vector dimension is zero")]
     DimensionZero,
 
@@ -176,6 +179,18 @@ pub fn validate_collection_name(
         return Err(ValidationError::CollectionNameInvalidChars {
             name: name.to_string(),
             pattern: config.allowed_collection_name_pattern.clone(),
+        });
+    }
+
+    // Reserve the leading-underscore namespace for internal directories. A
+    // collection named `_extraction_cache` would map to the shared cache dir
+    // (vf_extraction::GLOBAL_CACHE_DIR), so creating it would corrupt the cache
+    // and dropping it would delete it. Rejecting any leading '_' covers that and
+    // any future internal dir without name-by-name drift.
+    if name.starts_with('_') {
+        return Err(ValidationError::CollectionNameReserved {
+            name: name.to_string(),
+            reserved: vf_extraction::GLOBAL_CACHE_DIR.to_string(),
         });
     }
 

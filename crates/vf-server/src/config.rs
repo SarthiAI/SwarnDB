@@ -81,6 +81,12 @@ pub struct ServerConfig {
     #[serde(default = "default_max_ef_construction")]
     pub max_ef_construction: u32,
 
+    /// Maximum gRPC message size in bytes for decode and encode (ADR-013).
+    /// Defaults to 128 MB to match the SDK client cap; tonic's own default is
+    /// only 4 MB, which silently rejects large extraction submissions.
+    #[serde(default = "default_max_grpc_message_bytes")]
+    pub max_grpc_message_bytes: usize,
+
     /// How often the snapshot scheduler checks for triggers (seconds).
     #[serde(default = "default_snapshot_check_interval_secs")]
     pub snapshot_check_interval_secs: u64,
@@ -123,6 +129,26 @@ pub struct ServerConfig {
     /// absolute paths.
     #[serde(default)]
     pub bulk_insert_allowed_roots: Vec<PathBuf>,
+
+    /// Number of extraction worker tasks consuming the job queue. Default 4.
+    #[serde(default = "default_extraction_worker_concurrency")]
+    pub extraction_worker_concurrency: usize,
+
+    /// Max in-memory extraction-cache entries, global across collections. Default 10000.
+    #[serde(default = "default_extraction_cache_max_entries")]
+    pub extraction_cache_max_entries: usize,
+
+    /// Cores reserved for the async runtime during a parallel index build.
+    /// The global build pool is capped at max(1, num_cpus - reserve) so health
+    /// and readiness probes stay schedulable while a large build saturates the
+    /// rest of the cores. Default 1.
+    #[serde(default = "default_index_build_core_reserve")]
+    pub index_build_core_reserve: usize,
+
+    /// Optional path to a JSON pricing override for cost previews. Unset uses
+    /// the built-in pricing table.
+    #[serde(default)]
+    pub extraction_pricing_path: Option<String>,
 }
 
 fn default_host() -> String {
@@ -189,6 +215,10 @@ fn default_max_ef_construction() -> u32 {
     2000
 }
 
+fn default_max_grpc_message_bytes() -> usize {
+    128 * 1024 * 1024
+}
+
 fn default_snapshot_check_interval_secs() -> u64 {
     30
 }
@@ -225,6 +255,18 @@ fn default_max_concurrent_collection_loads() -> usize {
         .unwrap_or(2)
 }
 
+fn default_extraction_worker_concurrency() -> usize {
+    4
+}
+
+fn default_extraction_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_index_build_core_reserve() -> usize {
+    1
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -245,6 +287,7 @@ impl Default for ServerConfig {
             max_batch_lock_size: default_max_batch_lock_size(),
             max_wal_flush_interval: default_max_wal_flush_interval(),
             max_ef_construction: default_max_ef_construction(),
+            max_grpc_message_bytes: default_max_grpc_message_bytes(),
             snapshot_check_interval_secs: default_snapshot_check_interval_secs(),
             snapshot_mutation_threshold: default_snapshot_mutation_threshold(),
             snapshot_interval_secs: default_snapshot_interval_secs(),
@@ -254,6 +297,10 @@ impl Default for ServerConfig {
             compaction_min_segments: default_compaction_min_segments(),
             max_concurrent_collection_loads: default_max_concurrent_collection_loads(),
             bulk_insert_allowed_roots: Vec::new(),
+            extraction_worker_concurrency: default_extraction_worker_concurrency(),
+            extraction_cache_max_entries: default_extraction_cache_max_entries(),
+            index_build_core_reserve: default_index_build_core_reserve(),
+            extraction_pricing_path: None,
         }
     }
 }
@@ -319,6 +366,7 @@ impl ServerConfig {
     /// - `SWARNDB_AUTO_COMPACT_AFTER_OPTIMIZE` -> auto_compact_after_optimize
     /// - `SWARNDB_COMPACTION_MIN_SEGMENTS` -> compaction_min_segments
     /// - `SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS` -> max_concurrent_collection_loads
+    /// - `SWARNDB_INDEX_BUILD_CORE_RESERVE` -> index_build_core_reserve (cores held back for the runtime during a build)
     /// - `SWARNDB_BULK_INSERT_ALLOWED_ROOTS` -> bulk_insert_allowed_roots (comma-separated absolute paths)
     /// - `SWARNDB_WAL_FSYNC_MODE` -> WAL fsync mode (read at WAL construction time, not stored in Config):
     ///   - `per_write` (default): fsync every WAL append. Maximum durability.
@@ -445,6 +493,14 @@ impl ServerConfig {
             }
         }
 
+        if let Ok(val) = env::var("SWARNDB_MAX_GRPC_MESSAGE_BYTES") {
+            if let Ok(n) = val.parse::<usize>() {
+                self.max_grpc_message_bytes = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_MAX_GRPC_MESSAGE_BYTES value: {}", val);
+            }
+        }
+
         if let Ok(val) = env::var("SWARNDB_SNAPSHOT_CHECK_INTERVAL_SECS") {
             if let Ok(n) = val.parse::<u64>() {
                 self.snapshot_check_interval_secs = n;
@@ -544,6 +600,48 @@ impl ServerConfig {
                 if self.bulk_insert_allowed_roots.is_empty() {
                     self.bulk_insert_allowed_roots = vec![PathBuf::from(&self.data_dir)];
                 }
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_EXTRACTION_WORKER_CONCURRENCY") {
+            if let Ok(n) = val.parse::<usize>() {
+                if n == 0 {
+                    tracing::warn!("Invalid SWARNDB_EXTRACTION_WORKER_CONCURRENCY value: 0, ignoring");
+                } else {
+                    self.extraction_worker_concurrency = n;
+                }
+            } else {
+                tracing::warn!("Invalid SWARNDB_EXTRACTION_WORKER_CONCURRENCY value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_EXTRACTION_CACHE_MAX_ENTRIES") {
+            if let Ok(n) = val.parse::<usize>() {
+                if n == 0 {
+                    tracing::warn!("Invalid SWARNDB_EXTRACTION_CACHE_MAX_ENTRIES value: 0, ignoring");
+                } else {
+                    self.extraction_cache_max_entries = n;
+                }
+            } else {
+                tracing::warn!("Invalid SWARNDB_EXTRACTION_CACHE_MAX_ENTRIES value: {}", val);
+            }
+        }
+
+        // 0 is allowed and means no reserve (the build may use every core).
+        if let Ok(val) = env::var("SWARNDB_INDEX_BUILD_CORE_RESERVE") {
+            if let Ok(n) = val.parse::<usize>() {
+                self.index_build_core_reserve = n;
+            } else {
+                tracing::warn!("Invalid SWARNDB_INDEX_BUILD_CORE_RESERVE value: {}", val);
+            }
+        }
+
+        if let Ok(val) = env::var("SWARNDB_EXTRACTION_PRICING_PATH") {
+            let trimmed = val.trim();
+            if trimmed.is_empty() {
+                self.extraction_pricing_path = None;
+            } else {
+                self.extraction_pricing_path = Some(trimmed.to_string());
             }
         }
     }

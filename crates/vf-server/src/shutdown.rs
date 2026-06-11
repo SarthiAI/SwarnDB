@@ -122,8 +122,29 @@ pub async fn graceful_shutdown(state: AppState) {
                 }
             };
 
-            // 1. Snapshot and persist HNSW topology.
-            {
+            // Orphan guard (must run before any base/marker write): a deferred or
+            // never-optimized collection can hold an empty live index over
+            // non-empty storage. Writing an empty hnsw.base plus a clean-shutdown
+            // marker would steer the next boot down the CleanShutdown path, which
+            // trusts the empty base as good and never rebuilds. When that shape is
+            // seen, skip the empty-base write, the sidecar serialize, and the
+            // clean-shutdown marker so the next boot replays/rebuilds from storage
+            // (where the recovery orphan guard backstops it). Mirrors the
+            // index.len()==0 over non-empty storage condition in state.rs recovery.
+            let index_empty_over_storage =
+                coll_state.store.len() > 0 && coll_state.index.len() == 0;
+            if index_empty_over_storage {
+                tracing::warn!(
+                    collection = %name,
+                    stored = coll_state.store.len(),
+                    "shutdown: empty index over non-empty storage; skipping empty base \
+                     and clean-shutdown marker so next boot rebuilds from storage"
+                );
+            }
+
+            // 1. Snapshot and persist HNSW topology (skip if the index is empty
+            //    over non-empty storage; see the orphan guard above).
+            if !index_empty_over_storage {
                 let snapshot = coll_state.index.snapshot_topology(current_lsn);
                 let hnsw_path = collection_dir.join("hnsw.base");
                 let res = vf_storage::atomic_write::atomic_write_with_callback(
@@ -155,18 +176,18 @@ pub async fn graceful_shutdown(state: AppState) {
                         continue;
                     }
                 }
-            }
 
-            // Persist any index-specific sidecars via the PersistableIndex trait.
-            // On plain HNSW this rewrites hnsw.base (redundant but cheap).
-            // On SQ8 this writes quantizer.json + codes.bin + vectors.mmap.
-            if let Err(e) = coll_state.index.serialize_state_to_dir(&collection_dir) {
-                tracing::error!(
-                    collection = %name,
-                    "failed to persist index sidecars via trait: {}", e
-                );
-                // Continue: hnsw.base was already written by the manual path above, so
-                // the collection is at least partially persisted on a sidecar error.
+                // Persist any index-specific sidecars via the PersistableIndex trait.
+                // On plain HNSW this rewrites hnsw.base (redundant but cheap).
+                // On SQ8 this writes quantizer.json + codes.bin + vectors.mmap.
+                if let Err(e) = coll_state.index.serialize_state_to_dir(&collection_dir) {
+                    tracing::error!(
+                        collection = %name,
+                        "failed to persist index sidecars via trait: {}", e
+                    );
+                    // Continue: hnsw.base was already written by the manual path above, so
+                    // the collection is at least partially persisted on a sidecar error.
+                }
             }
 
             // G1 ordering invariant: hnsw.base MUST be fsynced before
@@ -222,11 +243,52 @@ pub async fn graceful_shutdown(state: AppState) {
                 }
             }
 
+            // 2b. Serialize the typed graph base for Hybrid collections (ADR-007 R4).
+            if let Some(ref gs) = coll_state.graph_store {
+                let typed_path = collection_dir.join("graph_typed.base");
+                let res = vf_storage::atomic_write::atomic_write_with_callback(
+                    &typed_path,
+                    |file| {
+                        vf_graph::serialize_typed_base(gs, current_lsn, file).map_err(|e| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("typed graph serialize error: {}", e),
+                            )
+                        })?;
+                        Ok(())
+                    },
+                );
+                match res {
+                    Ok(()) => {
+                        tracing::info!(collection = %name, "typed graph snapshot persisted")
+                    }
+                    Err(e) => {
+                        tracing::error!(collection = %name, "failed to persist typed graph: {}", e)
+                    }
+                }
+                // Sync the typed delta tail so post-snapshot edge writes survive a crash.
+                if let Err(e) = gs.sync_delta() {
+                    tracing::warn!(
+                        collection = %name,
+                        "failed to sync typed graph delta on shutdown: {}", e
+                    );
+                }
+            }
+
             // 3. Update wal_meta.json with the final LSN.
             //    Both next_lsn and last_snapshot_lsn advance to current_lsn:
             //    the hnsw.base and graph.base writes above embed current_lsn,
             //    so last_snapshot_lsn must mirror that. Loading the existing
             //    meta first preserves the wal_format_version field.
+            //
+            //    Orphan guard: when the index is empty over non-empty storage,
+            //    no fresh hnsw.base was written above, so advancing
+            //    last_snapshot_lsn to current_lsn would understate the work the
+            //    next boot has to redo and could mask a stale base as current.
+            //    Leave last_snapshot_lsn untouched in that case (only next_lsn
+            //    advances) so recovery treats the collection as needing a
+            //    rebuild from storage rather than trusting a snapshot envelope
+            //    that does not exist.
             {
                 let mut meta = match vf_storage::wal::load_wal_meta(&collection_dir) {
                     Ok(m) => m,
@@ -239,7 +301,9 @@ pub async fn graceful_shutdown(state: AppState) {
                     }
                 };
                 meta.next_lsn = current_lsn;
-                meta.last_snapshot_lsn = current_lsn;
+                if !index_empty_over_storage {
+                    meta.last_snapshot_lsn = current_lsn;
+                }
                 if let Err(e) = vf_storage::wal::save_wal_meta(&collection_dir, &meta) {
                     tracing::error!(
                         collection = %name,
@@ -256,7 +320,25 @@ pub async fn graceful_shutdown(state: AppState) {
             }
 
             // 4. Write clean shutdown marker (LAST, after all snapshots).
-            if let Err(e) = vf_storage::collection::write_shutdown_marker(&collection_dir) {
+            //    Orphan guard: skip the marker when the index is empty over
+            //    non-empty storage. plan_recovery() picks CleanShutdown only
+            //    when both the marker and hnsw.base are present; without the
+            //    marker the next boot falls through to IncrementalReplay or
+            //    FullRebuild, which rebuilds the index from storage (and the
+            //    recovery orphan guard in state.rs backstops the same shape).
+            //    Writing the marker here would steer the next boot down the
+            //    CleanShutdown path and trust a stale/empty base as good.
+            if index_empty_over_storage {
+                // Remove any stale marker from a prior clean shutdown so a
+                // leftover marker plus a stale hnsw.base cannot still trip the
+                // CleanShutdown path on the next boot.
+                vf_storage::collection::remove_shutdown_marker(&collection_dir);
+                tracing::warn!(
+                    collection = %name,
+                    "shutdown: empty index over non-empty storage; clean-shutdown \
+                     marker skipped so next boot rebuilds from storage"
+                );
+            } else if let Err(e) = vf_storage::collection::write_shutdown_marker(&collection_dir) {
                 tracing::error!(
                     collection = %name,
                     "failed to write shutdown marker: {}",

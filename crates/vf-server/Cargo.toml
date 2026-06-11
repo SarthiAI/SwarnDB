@@ -13,6 +13,7 @@ vf-storage = { path = "../vf-storage" }
 vf-index = { path = "../vf-index" }
 vf-query = { path = "../vf-query" }
 vf-graph = { path = "../vf-graph" }
+vf-extraction = { path = "../vf-extraction" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -34,6 +35,12 @@ memmap2 = { workspace = true }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 base64 = "0.22"
+
+# ADR-025: jemalloc global allocator plus the ctl surface for the
+# post-optimize arena purge. Gated to non-MSVC x86_64 / aarch64.
+[target.'cfg(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

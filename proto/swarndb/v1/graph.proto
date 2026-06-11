@@ -7,6 +7,32 @@ service GraphService {
   rpc GetRelated(GetRelatedRequest) returns (GetRelatedResponse);
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
   rpc SetThreshold(SetThresholdRequest) returns (SetThresholdResponse);
+
+  // Typed graph (Hybrid mode). Additive RPCs only; the three above and all
+  // existing field numbers are frozen (ADR-007 R5).
+  rpc PutNode(PutNodeRequest) returns (PutNodeResponse);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc DeleteNode(DeleteNodeRequest) returns (DeleteNodeResponse);
+  rpc PutEdge(PutEdgeRequest) returns (PutEdgeResponse);
+  rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
+  rpc DeleteEdge(DeleteEdgeRequest) returns (DeleteEdgeResponse);
+  rpc ListEdges(ListEdgesRequest) returns (ListEdgesResponse);
+
+  // Hybrid query engine (P02). Additive; all field numbers fresh.
+  rpc HybridQuery(HybridQueryRequest) returns (HybridQueryResponse);
+
+  // P16. Additive mutable-node update (properties + audit trail).
+  rpc UpdateNode(UpdateNodeRequest) returns (UpdateNodeResponse);
+
+  // P04. Additive manual-edge lifecycle and bulk import.
+  rpc UpdateEdge(UpdateEdgeRequest) returns (UpdateEdgeResponse);
+  rpc VerifyEdge(VerifyEdgeRequest) returns (VerifyEdgeResponse);
+  rpc RejectEdge(RejectEdgeRequest) returns (RejectEdgeResponse);
+  rpc BulkImportEdges(BulkImportEdgesRequest) returns (BulkImportEdgesResponse);
+
+  // ADR-014. Paginated whole-graph enumeration, cursor over sorted ids.
+  rpc EnumerateNodes(EnumerateNodesRequest) returns (EnumerateNodesResponse);
+  rpc EnumerateEdges(EnumerateEdgesRequest) returns (EnumerateEdgesResponse);
 }
 
 message GetRelatedRequest {
@@ -52,4 +78,507 @@ message SetThresholdRequest {
 
 message SetThresholdResponse {
   bool success = 1;
+}
+
+// ── Typed graph (Hybrid mode), ADR-007 R4. All additive. ──
+
+enum TypedNodeKind {
+  TYPED_NODE_CONTENT = 0;
+  TYPED_NODE_ENTITY = 1;
+}
+
+message NodeAudit {
+  string action = 1;
+  string actor = 2;
+  uint64 at = 3;
+}
+
+message TypedNode {
+  uint64 id = 1;
+  TypedNodeKind kind = 2;
+  string label = 3;              // entity type label; empty for content nodes
+  string properties_json = 4;    // JSON object of properties
+  repeated float embedding = 5;  // present for content nodes that carry one
+  string source = 6;             // "manual" | "ingested" | "extracted"
+  uint64 created_at = 7;
+  string created_by = 8;
+  repeated NodeAudit history = 9;  // P16. Additive audit trail.
+  uint64 updated_at = 10;          // P16. Last mutation time; 0 if never updated.
+}
+
+message EdgeAudit {
+  string action = 1;
+  string actor = 2;
+  uint64 at = 3;
+}
+
+message TypedEdge {
+  uint64 id = 1;
+  uint64 source = 2;
+  uint64 target = 3;
+  string edge_type = 4;
+  string properties_json = 5;    // JSON object of properties
+  string provenance_json = 6;    // JSON object of provenance fields
+  float confidence = 7;
+  bool verified = 8;
+  bool is_manual = 9;
+  uint64 created_at = 10;
+  repeated EdgeAudit history = 11;  // P04. Additive audit trail.
+  optional uint64 valid_from = 12;        // P17. unix-epoch millis; absent = unbounded start
+  optional uint64 valid_until = 13;       // P17. unix-epoch millis EXCLUSIVE; absent = unbounded end
+  optional string temporal_context = 14;  // P17. regime/version label; absent = none
+}
+
+message PutNodeRequest {
+  string collection = 1;
+  TypedNodeKind kind = 2;
+  string label = 3;
+  string properties_json = 4;
+  // Present for ENTITY nodes that carry an inline embedding (used by graph-scoped
+  // vector_rank). For a searchable CONTENT vector use vectors.insert instead. A content
+  // node supplied with an embedding via PutNode is rejected (not searchable, breaks the
+  // NodeId==VectorId bridge).
+  repeated float embedding = 5;
+  string source = 6;             // optional; defaults to "manual"
+  string created_by = 7;
+}
+
+message PutNodeResponse {
+  uint64 id = 1;
+}
+
+message GetNodeRequest {
+  string collection = 1;
+  uint64 id = 2;
+}
+
+message GetNodeResponse {
+  bool found = 1;
+  TypedNode node = 2;
+}
+
+message DeleteNodeRequest {
+  string collection = 1;
+  uint64 id = 2;
+}
+
+message DeleteNodeResponse {
+  bool deleted = 1;
+}
+
+message PutEdgeRequest {
+  string collection = 1;
+  uint64 source = 2;
+  uint64 target = 3;
+  string edge_type = 4;
+  string properties_json = 5;
+  string provenance_json = 6;
+  float confidence = 7;          // <= 0 defaults to 1.0
+  bool verified = 8;
+  bool is_manual = 9;
+  optional uint64 valid_from = 10;        // P17. unix-epoch millis; absent = unbounded start
+  optional uint64 valid_until = 11;       // P17. unix-epoch millis EXCLUSIVE; absent = unbounded end
+  optional string temporal_context = 12;  // P17. regime/version label; absent = none
+}
+
+message PutEdgeResponse {
+  uint64 id = 1;
+}
+
+message GetEdgeRequest {
+  string collection = 1;
+  uint64 id = 2;
+}
+
+message GetEdgeResponse {
+  bool found = 1;
+  TypedEdge edge = 2;
+}
+
+message DeleteEdgeRequest {
+  string collection = 1;
+  uint64 id = 2;
+}
+
+message DeleteEdgeResponse {
+  bool deleted = 1;
+}
+
+message ListEdgesRequest {
+  string collection = 1;
+  uint64 node = 2;
+  string direction = 3;          // "outgoing" | "incoming" | "both"
+  string edge_type = 4;          // optional filter; empty = all types
+}
+
+message ListEdgesResponse {
+  repeated TypedEdge edges = 1;
+}
+
+// ── Hybrid query engine (P02). All additive, fresh field numbers. ──
+
+enum HybridDirection {
+  HYBRID_DIR_OUTGOING = 0;
+  HYBRID_DIR_INCOMING = 1;
+  HYBRID_DIR_BOTH = 2;
+}
+
+enum HybridReturnKind {
+  HYBRID_RETURN_NODES = 0;
+  HYBRID_RETURN_EDGES = 1;
+  HYBRID_RETURN_PATHS = 2;
+}
+
+enum HybridCompareOp {
+  HYBRID_CMP_EQ = 0;
+  HYBRID_CMP_NE = 1;
+  HYBRID_CMP_LT = 2;
+  HYBRID_CMP_LE = 3;
+  HYBRID_CMP_GT = 4;
+  HYBRID_CMP_GE = 5;
+}
+
+// Node-only structural field: the count of incident edges, optionally
+// constrained by edge type and direction. Resolves to an integer count.
+// Additive (P16). Reuses HybridDirection for direction.
+message HybridIncidentEdgeCount {
+  string edge_type = 1;            // empty = any edge type
+  // Canonical default direction is OUTGOING on every surface (proto/gRPC/SDK
+  // and REST/serde); BOTH counts either side.
+  HybridDirection direction = 2;
+}
+
+// Which field a predicate reads. property = property-bag key; label/kind flags;
+// incident_edge_count is a node-only structural source (P16).
+message HybridPropertyRef {
+  oneof ref {
+    string property = 1;
+    bool label = 2;
+    bool kind = 3;
+    HybridIncidentEdgeCount incident_edge_count = 4;
+  }
+}
+
+// field <op> value_json (scalar JSON literal as a string).
+message HybridCompare {
+  HybridPropertyRef field = 1;
+  HybridCompareOp op = 2;
+  string value_json = 3;
+}
+
+// field IN / NOT IN values_json (each a scalar JSON literal as a string).
+message HybridInList {
+  HybridPropertyRef field = 1;
+  repeated string values_json = 2;
+}
+
+message HybridPredicateList {
+  repeated HybridPredicate preds = 1;
+}
+
+message HybridPredicate {
+  oneof pred {
+    HybridCompare compare = 1;
+    HybridInList in_list = 2;
+    HybridInList not_in_list = 3;
+    HybridPropertyRef exists = 4;
+    HybridPredicateList and = 5;
+    HybridPredicateList or = 6;
+    HybridPredicate not = 7;
+    bool always = 8;
+  }
+}
+
+message HybridVectorSimilar {
+  repeated float vector = 1;
+  uint32 k = 2;
+  optional uint32 ef_search = 3;
+}
+
+// Policy for frontier nodes that have no vector when ranking with VectorRank.
+enum HybridOnMissingVector {
+  HYBRID_ON_MISSING_SKIP = 0;   // default: drop unrankable nodes, counted in a metric
+  HYBRID_ON_MISSING_ERROR = 1;  // fail the query if any frontier node has no vector
+}
+
+// Rank the current node frontier by similarity to `vector`, keep top-k.
+// Frontier-consuming graph -> vector ranking. Exact scoring (recall 1.0,
+// no ANN, no ef_search). Returns nodes in ascending-distance order.
+message HybridVectorRank {
+  repeated float vector = 1;
+  uint32 k = 2;
+  HybridOnMissingVector on_missing = 3;
+}
+
+// P17. A frontier-consuming vector-math step. Reuses HybridOnMissingVector.
+// HybridVector wraps a float vector so a repeated-of-repeated (isolation
+// centroids) can be expressed, which proto3 cannot do directly.
+message HybridVector { repeated float values = 1; }
+
+message HybridAnalogy     { repeated float a = 1; repeated float b = 2; repeated float c = 3; }
+message HybridDiversity   { repeated float query = 1; float lambda = 2; }
+message HybridCone        { repeated float direction = 1; float aperture_radians = 2; }
+message HybridIsolation   { repeated HybridVector centroids = 1; }
+message HybridCentroid    {}
+message HybridInterpolate { repeated float a = 1; repeated float b = 2; float t = 3; }
+
+message HybridVectorMath {
+  oneof op {
+    HybridAnalogy     analogy     = 1;
+    HybridDiversity   diversity   = 2;
+    HybridCone        cone        = 3;
+    HybridIsolation   isolation   = 4;
+    HybridCentroid    centroid    = 5;
+    HybridInterpolate interpolate = 6;
+  }
+  uint32 k = 7;
+  HybridOnMissingVector on_missing = 8;
+}
+
+message HybridFromNodes {
+  repeated uint64 nodes = 1;
+}
+
+// Seed the node frontier by scanning the graph for nodes matching an optional
+// kind / entity label / property condition (P16). A SOURCE step: no vector, no
+// explicit ids. Reuses HybridPredicate for the property part. filter_by_kind
+// gates the kind flag (TYPED_NODE_ENTITY vs TYPED_NODE_CONTENT); label empty =
+// no label filter; predicate absent = no property condition.
+message HybridScanByFilter {
+  bool filter_by_kind = 1;
+  TypedNodeKind kind = 2;
+  string label = 3;
+  HybridPredicate predicate = 4;
+}
+
+// P17. Opt-in time-and-context traversal filter. Absent on a step = no filtering
+// (byte-identical to today). as_of absent = server uses "now".
+message HybridTemporalFilter {
+  optional uint64 as_of = 1;          // unix-epoch millis; absent = now
+  bool include_unbounded = 2;         // whether edges with no window pass the time check
+  optional string context = 3;        // required regime; absent = context ignored
+}
+
+// empty edge_type = no filter
+message HybridTraverse {
+  string edge_type = 1;
+  HybridDirection direction = 2;
+  HybridTemporalFilter temporal = 3;  // P17. Absent = no time/context filtering.
+}
+
+// Edge quality weighting (P13). Absent on a step = no-op (every edge weighs
+// 1.0); a pinned older client that omits it is unaffected. Additive only.
+message HybridWeightSpec {
+  bool use_confidence = 1;          // fold edge confidence into the weight
+  float min_confidence = 2;         // drop edges below this confidence
+  uint64 recency_half_life_ms = 3;  // 0 = no recency decay
+  bool use_explicit_weight = 4;     // read a numeric weight from properties
+  string explicit_weight_key = 5;   // property key; empty falls back to "weight"
+}
+
+// predicate absent = None
+message HybridKHop {
+  string edge_type = 1;
+  uint32 max = 2;
+  HybridPredicate predicate = 3;
+  HybridWeightSpec weight = 4;  // P13. Absent = unweighted hops.
+  bool order_by_weight = 5;     // P13. Order frontier by accumulated weight.
+  HybridTemporalFilter temporal = 6;  // P17. Absent = no time/context filtering.
+}
+
+message HybridShortestPath {
+  repeated string edge_types = 1;
+  uint64 target = 2;
+  bool weighted = 3;            // P13. Cost-weighted path instead of hop count.
+  HybridWeightSpec weight = 4;  // P13. Edge cost source when weighted.
+  HybridTemporalFilter temporal = 5;  // P17. Absent = no time/context filtering.
+}
+
+// empty edge_type = no filter
+message HybridCollectEdges {
+  string edge_type = 1;
+  HybridDirection direction = 2;
+}
+
+message HybridStep {
+  oneof step {
+    HybridVectorSimilar vector_similar = 1;
+    HybridFromNodes from_nodes = 2;
+    HybridTraverse traverse = 3;
+    HybridKHop k_hop = 4;
+    HybridShortestPath shortest_path = 5;
+    HybridQueryPlan mutual_neighbors = 6;
+    HybridQueryPlan intersect = 7;
+    HybridQueryPlan union = 8;
+    HybridPredicate filter = 9;
+    HybridCollectEdges collect_edges = 10;
+    uint64 limit = 11;
+    HybridVectorRank vector_rank = 12;
+    HybridScanByFilter scan_by_filter = 13;
+    HybridVectorMath vector_math = 14;  // P17. Frontier-consuming vector-math step.
+  }
+}
+
+message HybridQueryPlan {
+  repeated HybridStep steps = 1;
+  HybridReturnKind return_kind = 2;
+}
+
+message HybridPath {
+  repeated uint64 nodes = 1;
+}
+
+// Optional graph-aware RRF ranking spec (P07). Absent = feature OFF; the plan
+// runs unchanged with no proximity work and zero added latency. Additive only.
+//
+// When present, the server fuses two rankings of the candidate pool with
+// standard Reciprocal Rank Fusion (canonical rrf_k=60, equal weight): the
+// vector seed in similarity order, and a graph-proximity ranking by the count
+// of distinct bridge routes from the vector seed to each candidate. The top-k
+// (by k) fused nodes are returned. Computes proximity, so it adds latency: it
+// is opt-in and off by default.
+message RrfRankSpec {
+  int32 k = 1;                          // final top-k cut; <= 0 means no cut
+  int32 rrf_k = 2;                      // RRF constant; <= 0 defaults to 60
+  int32 k_hop_max = 3;                  // bridge hop bound; <= 0 defaults to 2
+  repeated string relation_edge_types = 4;  // entity-bridge relations; empty = structural
+  // Hub-aware damping (ADR-019). 0.0 = OFF = unchanged behavior (each bridge
+  // route counts a flat 1). > 0.0 weights each route by the product over the
+  // bridging entity nodes of 1 / (1 + hub_damping * ln(1 + degree)), so routes
+  // through high-degree hub entities contribute less. Helps hub-dense graphs
+  // (e.g. conversational memory) where bridges flood through a few hubs.
+  double hub_damping = 5;
+  // P13. Quality-weight the bridge routes (confidence / recency / explicit).
+  // Absent = unweighted route counting, unchanged behavior.
+  HybridWeightSpec edge_weight = 6;
+}
+
+message HybridQueryRequest {
+  string collection = 1;
+  HybridQueryPlan plan = 2;
+  // Absent = ranking OFF (default behavior, byte-identical, zero added latency).
+  optional RrfRankSpec rrf_rank = 3;
+}
+
+message HybridQueryResponse {
+  repeated TypedNode nodes = 1;
+  repeated TypedEdge edges = 2;
+  repeated HybridPath paths = 3;
+}
+
+// ── Mutable nodes (P16). All additive. ──
+
+message UpdateNodeRequest {
+  string collection = 1;
+  uint64 node_id = 2;
+  optional string properties_json = 3;  // if set, replaces the properties bag
+  string actor = 4;                      // optional audit actor
+}
+
+message UpdateNodeResponse {
+  TypedNode node = 1;
+}
+
+// ── Manual-edge lifecycle and bulk import (P04). All additive. ──
+
+message UpdateEdgeRequest {
+  string collection = 1;
+  uint64 edge_id = 2;
+  optional string properties_json = 3;  // if set, replaces the properties bag
+  optional float confidence = 4;        // if set, replaces confidence
+  optional bool verified = 5;           // if set, replaces verified flag
+  string actor = 6;                     // optional audit actor
+}
+
+message UpdateEdgeResponse {
+  TypedEdge edge = 1;
+}
+
+message VerifyEdgeRequest {
+  string collection = 1;
+  uint64 edge_id = 2;
+  string actor = 3;
+}
+
+message VerifyEdgeResponse {
+  TypedEdge edge = 1;
+}
+
+message RejectEdgeRequest {
+  string collection = 1;
+  uint64 edge_id = 2;
+  string actor = 3;
+}
+
+message RejectEdgeResponse {
+  bool deleted = 1;
+  bool rule_added = 2;
+}
+
+enum BulkImportFormat {
+  BULK_IMPORT_FORMAT_CSV = 0;
+  BULK_IMPORT_FORMAT_JSONL = 1;
+}
+
+message BulkImportEdgesRequest {
+  string collection = 1;
+  BulkImportFormat format = 2;
+  string data = 3;                  // raw CSV or JSONL payload
+  bool auto_add_edge_types = 4;     // add unknown edge types to the ontology extension
+  string actor = 5;
+}
+
+message BulkImportRowError {
+  uint64 row = 1;        // 1-based row index within the payload
+  string message = 2;
+}
+
+message BulkImportEdgesResponse {
+  uint64 total_rows = 1;
+  uint64 imported = 2;
+  uint64 failed = 3;
+  repeated BulkImportRowError errors = 4;
+}
+
+// ── Paginated whole-graph enumeration (ADR-014). All additive. ──
+
+message EnumerateNodesRequest {
+  string collection = 1;
+  // Cursor: return nodes with id strictly greater than after_id. 0 to start.
+  uint64 after_id = 2;
+  uint32 limit = 3;            // server-clamped page size
+  TypedNodeKind kind = 4;      // applied only when filter_by_kind is true
+  bool filter_by_kind = 5;
+  string label = 6;            // optional; empty = no label filter
+  // P16. Optional property condition over node properties (and structural
+  // incident-edge-count terms). Absent = no property filter. Reuses HybridPredicate.
+  HybridPredicate predicate = 7;
+}
+
+message EnumerateNodesResponse {
+  repeated TypedNode nodes = 1;
+  uint64 next_cursor = 2;      // last id in the page; 0 when exhausted
+  bool has_more = 3;
+}
+
+message EnumerateEdgesRequest {
+  string collection = 1;
+  // Cursor: return edges with id strictly greater than after_id. 0 to start.
+  uint64 after_id = 2;
+  uint32 limit = 3;            // server-clamped page size
+  string edge_type = 4;        // optional; empty = no type filter
+  // P16. Optional property condition over edge properties. Absent = no filter.
+  HybridPredicate predicate = 5;
+  // P16. Optional endpoint-node constraints: an edge passes when an endpoint
+  // (source or target) node matches. endpoint_label empty = no label constraint;
+  // endpoint_kind applies only when filter_by_endpoint_kind is true.
+  string endpoint_label = 6;
+  TypedNodeKind endpoint_kind = 7;
+  bool filter_by_endpoint_kind = 8;
+}
+
+message EnumerateEdgesResponse {
+  repeated TypedEdge edges = 1;
+  uint64 next_cursor = 2;      // last id in the page; 0 when exhausted
+  bool has_more = 3;
 }

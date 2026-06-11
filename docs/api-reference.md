@@ -191,6 +191,7 @@ Creates a new vector collection.
 | distance_metric   | string | No       | `"cosine"` | One of: `"cosine"`, `"euclidean"`, `"dot_product"`, `"manhattan"`    |
 | default_threshold | float  | No       | `0.0`      | Default similarity threshold for the virtual graph. 0 means no graph edges are auto-computed. |
 | max_vectors       | uint64 | No       | `0`        | Maximum number of vectors. 0 means unlimited.                        |
+| mode              | string | No       | `"vector_only"` | Collection mode: `"vector_only"`, `"auto_similarity"`, or `"hybrid"`. Omitting it defaults to vector-only. See [Graph as a First-Class Layer](graph-first-class.md). |
 
 **Response:**
 
@@ -1327,6 +1328,54 @@ curl -X POST http://localhost:8080/api/v1/collections/documents/graph/threshold 
 }
 ```
 
+### Typed Graph (hybrid mode)
+
+These routes are available on `hybrid` collections only. They manage the first-class typed graph of nodes and edges. See [Graph as a First-Class Layer](graph-first-class.md) for the concepts and field meanings.
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| POST   | `/api/v1/collections/{collection}/graph/nodes` | Create a typed node. Returns the node id. |
+| GET    | `/api/v1/collections/{collection}/graph/nodes/{node_id}` | Get a typed node. |
+| DELETE | `/api/v1/collections/{collection}/graph/nodes/{node_id}` | Delete a node and its incident edges. |
+| GET    | `/api/v1/collections/{collection}/graph/nodes/{node_id}/edges` | List edges incident to a node (query params: `direction`, `edge_type`). |
+| POST   | `/api/v1/collections/{collection}/graph/edges` | Create a typed edge. Returns the edge id. |
+| GET    | `/api/v1/collections/{collection}/graph/edges/{edge_id}` | Get a typed edge. |
+| PATCH  | `/api/v1/collections/{collection}/graph/edges/{edge_id}` | Update a manual edge's properties, confidence, or verified flag. |
+| DELETE | `/api/v1/collections/{collection}/graph/edges/{edge_id}` | Delete a typed edge. |
+| POST   | `/api/v1/collections/{collection}/graph/edges/{edge_id}/verify` | Verify an edge (locks it against re-extraction). |
+| POST   | `/api/v1/collections/{collection}/graph/edges/{edge_id}/reject` | Reject an edge (deletes it and remembers the pattern). |
+| POST   | `/api/v1/collections/{collection}/graph/bulk-import-edges` | Bulk import edges from CSV or JSONL. |
+| POST   | `/api/v1/collections/{collection}/hybrid_query` | Run a composable hybrid query plan. |
+
+A node body carries `kind` (`content` or `entity`), `label`, `properties`, optional `embedding`, `source`, and `created_by`. An edge body carries `source`, `target`, `edge_type`, `properties`, `provenance`, `confidence`, `verified`, and `is_manual`. The bulk-import body carries `format` (`csv` or `jsonl`), `data` (the raw payload), and optional `auto_add_edge_types`; the response reports `total_rows`, `imported`, `failed`, and a per-row `errors` list.
+
+### Extraction (hybrid mode)
+
+These routes are available on `hybrid` collections only and drive LLM extraction. See [LLM Extraction](llm-extraction.md).
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| PUT    | `/api/v1/collections/{collection}/llm-config` | Set the LLM config (api key is write-only). |
+| GET    | `/api/v1/collections/{collection}/llm-config` | Get the redacted LLM config (never the api key). |
+| POST   | `/api/v1/collections/{collection}/llm-config/rotate` | Rotate just the api key. |
+| PUT    | `/api/v1/collections/{collection}/ontology` | Set the ontology from a template and/or extension. |
+| GET    | `/api/v1/collections/{collection}/ontology` | Get the collection's ontology. |
+| POST   | `/api/v1/collections/{collection}/extraction/cost-preview` | Estimate token usage and cost for a set of chunks. |
+| POST   | `/api/v1/collections/{collection}/extraction` | Start an async extraction job. Returns a `job_id`. |
+| GET    | `/api/v1/collections/{collection}/extraction/{job_id}` | Get an extraction job's status. |
+| POST   | `/api/v1/collections/{collection}/extraction/{job_id}/cancel` | Cancel a running extraction job. |
+| GET    | `/api/v1/collections/{collection}/proposals` | List pending ontology proposals. |
+| POST   | `/api/v1/collections/{collection}/proposals/{id}/approve` | Approve an ontology proposal. |
+| POST   | `/api/v1/collections/{collection}/proposals/{id}/reject` | Reject an ontology proposal. |
+| POST   | `/api/v1/collections/{collection}/extraction/diff` | Diff a document's chunks against the stored extraction state. |
+| POST   | `/api/v1/collections/{collection}/extraction/reextract` | Re-extract only the changed and new chunks of a document. |
+
+The LLM config body carries `base_url`, `api_key`, `model_name`, `temperature`, `max_tokens`, and `timeout_seconds`. Extraction and diff/reextract bodies carry a `chunks` array (each chunk: `doc_id`, `chunk_id`, `text`, optional `embedding`); diff and reextract also carry `doc_id`.
+
+The set-ontology body (`PUT .../ontology`) carries `base_template`, the `entity_labels` and `edge_types` of the extension, a `replace` flag, and two optional prompt fields: `system_prompt` (a full override of the generic extraction framing) and `extra_guidance` (a domain hint appended on top of the framing). An empty value for either means the default prompt is used. The get-ontology response (`GET .../ontology`) returns the same shape and echoes both fields. SwarnDB always keeps the JSON output schema and the ontology's allowed labels and edge types in the prompt regardless of these fields, so a custom prompt cannot break parsing or step outside the ontology. Both fields are additive and backward-compatible.
+
+The job-status response (`GET .../extraction/{job_id}`) reports `job_id`, `collection`, `state`, `total_chunks`, `processed_chunks`, `entities_written`, `edges_written`, `cache_hits`, `cache_misses`, and `error`, plus two partial-success fields: `failed_chunks` (the total count of chunks that failed) and `chunk_errors` (a bounded sample of failures, each with `doc_id`, `chunk_id`, and `error`). The `state` is one of `queued`, `running`, `completed`, `completed_with_errors`, `failed`, or `cancelled`; a job that extracted from most chunks but had one or more fail ends in `completed_with_errors`. Both fields are additive and backward-compatible. See [LLM Extraction](llm-extraction.md#resilience-and-partial-success).
+
 ---
 
 ## Vector Math
@@ -1939,6 +1988,77 @@ Defined in `proto/swarndb/v1/graph.proto`.
 | GetRelated   | GetRelatedRequest   | GetRelatedResponse   | Get connected vectors       |
 | Traverse     | TraverseRequest     | TraverseResponse     | Multi-hop graph traversal   |
 | SetThreshold | SetThresholdRequest | SetThresholdResponse | Set similarity threshold    |
+| PutNode         | PutNodeRequest         | PutNodeResponse         | Create a typed node (hybrid mode)             |
+| GetNode         | GetNodeRequest         | GetNodeResponse         | Get a typed node by id (hybrid mode)          |
+| DeleteNode      | DeleteNodeRequest      | DeleteNodeResponse      | Delete a typed node and its edges (hybrid)    |
+| PutEdge         | PutEdgeRequest         | PutEdgeResponse         | Create a typed edge (hybrid mode)             |
+| GetEdge         | GetEdgeRequest         | GetEdgeResponse         | Get a typed edge by id (hybrid mode)          |
+| DeleteEdge      | DeleteEdgeRequest      | DeleteEdgeResponse      | Delete a typed edge (hybrid mode)             |
+| ListEdges       | ListEdgesRequest       | ListEdgesResponse       | List edges incident to a node (hybrid mode)   |
+| UpdateEdge      | UpdateEdgeRequest      | UpdateEdgeResponse      | Update a manual edge's properties/confidence/verified |
+| VerifyEdge      | VerifyEdgeRequest      | VerifyEdgeResponse      | Lock an edge against re-extraction            |
+| RejectEdge      | RejectEdgeRequest      | RejectEdgeResponse      | Delete an edge and remember the pattern       |
+| BulkImportEdges | BulkImportEdgesRequest | BulkImportEdgesResponse | Bulk import edges from CSV or JSONL           |
+| HybridQuery     | HybridQueryRequest     | HybridQueryResponse     | Run a composable hybrid query plan            |
+
+The RPCs above `PutNode` are unchanged. Everything from `PutNode` down is additive and active only on `hybrid` collections; see [Graph as a First-Class Layer](graph-first-class.md).
+
+#### ExtractionService
+
+Defined in `proto/swarndb/v1/extraction.proto`. Every RPC is rejected on non-hybrid collections. See [LLM Extraction](llm-extraction.md).
+
+| RPC                 | Request                    | Response                    | Description                                   |
+|---------------------|----------------------------|-----------------------------|-----------------------------------------------|
+| SetLlmConfig        | SetLlmConfigRequest        | SetLlmConfigResponse        | Set the LLM config (api key is write-only)    |
+| GetLlmConfig        | GetLlmConfigRequest        | GetLlmConfigResponse        | Get the redacted LLM config (no api key)      |
+| RotateLlmConfig     | RotateLlmConfigRequest     | RotateLlmConfigResponse     | Rotate just the api key                       |
+| SetOntology         | SetOntologyRequest         | SetOntologyResponse         | Set the ontology from a template/extension    |
+| GetOntology         | GetOntologyRequest         | GetOntologyResponse         | Get the collection's ontology                 |
+| CostPreview         | CostPreviewRequest         | CostPreviewResponse         | Estimate token usage and cost                 |
+| StartExtraction     | StartExtractionRequest     | StartExtractionResponse     | Start an async extraction job                 |
+| GetExtractionStatus | GetExtractionStatusRequest | JobStatusMsg                | Snapshot of an extraction job's progress      |
+| CancelExtraction    | CancelExtractionRequest    | CancelExtractionResponse    | Cancel a running extraction job               |
+| ListProposals       | ListProposalsRequest       | ListProposalsResponse       | List pending ontology proposals               |
+| ApproveProposal     | ApproveProposalRequest     | ApproveProposalResponse     | Approve an ontology proposal                  |
+| RejectProposal      | RejectProposalRequest      | RejectProposalResponse      | Reject an ontology proposal                   |
+| DiffDocument        | DiffDocumentRequest        | DiffDocumentResponse        | Diff a document's chunks against stored state |
+| ReextractDocument   | ReextractDocumentRequest   | ReextractDocumentResponse   | Re-extract only changed/new chunks            |
+
+`SetOntology` (on `SetOntologyRequest.extension`) and `GetOntology` (on `GetOntologyResponse.ontology`) both carry an `OntologyMsg`. Besides the entity labels and edge types, it has two optional prompt fields:
+
+| Field         | Type   | Description                                                                 |
+|---------------|--------|-----------------------------------------------------------------------------|
+| system_prompt | string | Full override of the generic extraction task framing (field 3). Empty means use the default prompt. |
+| extra_guidance| string | Domain guidance appended on top of the framing (field 4). Empty means use the default prompt. |
+
+On `SetOntology` these extend the request; on `GetOntology` they are echoed back in the response. Whatever they hold, SwarnDB always keeps the JSON output schema and the ontology's allowed labels and edge types in the prompt, so a custom prompt cannot break parsing or step outside the ontology. `system_prompt` (3) and `extra_guidance` (4) are additive: a client pinned to an older proto simply does not set or read them and keeps working.
+
+`GetExtractionStatus` returns a `JobStatusMsg` snapshot of the job:
+
+| Field              | Type                      | Description                                                                 |
+|--------------------|---------------------------|-----------------------------------------------------------------------------|
+| job_id             | string                    | The job id.                                                                 |
+| collection         | string                    | The collection being extracted into.                                        |
+| state              | string                    | `queued`, `running`, `completed`, `completed_with_errors`, `failed`, or `cancelled`. |
+| total_chunks       | uint64                    | Total chunks in the job.                                                     |
+| processed_chunks   | uint64                    | Chunks processed so far.                                                     |
+| entities_written   | uint64                    | Entities written to the graph.                                              |
+| edges_written      | uint64                    | Edges written to the graph.                                                 |
+| cache_hits         | uint64                    | Chunks served from the extraction cache.                                    |
+| cache_misses       | uint64                    | Chunks that called the provider.                                            |
+| error              | string                    | Job-level error message, set when the whole job failed.                     |
+| failed_chunks      | uint64                    | Total count of chunks that failed (field 11). Zero when the job completed cleanly. |
+| chunk_errors       | repeated ChunkErrorMsg    | A bounded sample (up to 100) of the per-chunk failures (field 12). Empty when the job completed cleanly. |
+
+A single chunk's failure no longer fails the whole job: the job finishes in the `completed_with_errors` state, the graph holds everything that succeeded, and `failed_chunks` / `chunk_errors` describe what did not. A reply that was cut off at the provider's token limit is retried once automatically with a raised output budget, so most truncations never surface as a failure. The `ChunkErrorMsg` carries one failure:
+
+| Field    | Type   | Description                       |
+|----------|--------|-----------------------------------|
+| doc_id   | string | The document the chunk came from. |
+| chunk_id | uint64 | The chunk that failed.            |
+| error    | string | Why the chunk failed.             |
+
+`failed_chunks` (11), `chunk_errors` (12), and `ChunkErrorMsg` are additive: a client pinned to an older proto simply does not read the new fields and keeps working. See [LLM Extraction](llm-extraction.md#resilience-and-partial-success).
 
 #### VectorMathService
 

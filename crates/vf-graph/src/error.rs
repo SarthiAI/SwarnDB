@@ -28,6 +28,9 @@ pub enum GraphError {
     #[error("snapshot corrupted: {0}")]
     Corrupted(String),
 
+    #[error("graph store error: {0}")]
+    GraphStore(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

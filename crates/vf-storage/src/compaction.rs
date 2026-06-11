@@ -107,6 +107,8 @@ pub fn compact_segments(
 
     for seg in segments {
         let seg_id = seg.id();
+        // Read this segment's metadata region once, then do O(1) lookups.
+        let meta_map = seg.metadata_map()?;
         let count = seg.vector_count() as usize;
         for i in 0..count {
             total_input_vectors += 1;
@@ -124,7 +126,7 @@ pub fn compact_segments(
                 .map_or(false, |(existing_seg_id, _, _)| *existing_seg_id > seg_id);
 
             if !dominated {
-                let meta = seg.get_metadata(vid)?;
+                let meta = meta_map.get(&vid).cloned();
                 winner_map.insert(vid, (seg_id, data, meta));
             }
         }

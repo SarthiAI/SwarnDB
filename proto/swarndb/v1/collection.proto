@@ -36,6 +36,8 @@ message CreateCollectionRequest {
   optional uint32 m = 7;
   // Optional HNSW build parameter; when set, overrides the server default for ef_construction.
   optional uint32 ef_construction = 8;
+  // Graph mode. Unset reads as MODE_VECTOR_ONLY, the new-collection default.
+  Mode mode = 9;
 }
 
 message CreateCollectionResponse {
@@ -63,12 +65,23 @@ message GetCollectionResponse {
   float default_threshold = 5;
   string status = 6;  // "ready", "pending_optimization", "optimizing"
   string quantization_type = 7;  // "none" or "scalar"
+  // Live HNSW index node count. May be < vector_count when an index build is
+  // deferred or pending optimization; vector_count remains the stored-row count.
+  uint64 indexed_count = 8;
 }
 
 message ListCollectionsRequest {}
 
 message ListCollectionsResponse {
   repeated GetCollectionResponse collections = 1;
+}
+
+// Mode selects the per-collection graph behavior. Variant names are prefixed
+// so prost strips the prefix and generates short Rust variants (VectorOnly, etc).
+enum Mode {
+  MODE_VECTOR_ONLY = 0;
+  MODE_AUTO_SIMILARITY = 1;
+  MODE_HYBRID = 2;
 }
 
 // RecoveryPath mirrors the in-memory boot-time recovery strategy taken for

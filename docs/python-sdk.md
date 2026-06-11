@@ -1,10 +1,10 @@
 # Python SDK
 
-The SwarnDB Python SDK provides synchronous and asynchronous clients for interacting with a SwarnDB server over gRPC. It covers collections, vectors, search, virtual graph, and vector math operations.
+The SwarnDB Python SDK provides synchronous and asynchronous clients for interacting with a SwarnDB server over gRPC. It covers collections, vectors, search, the virtual graph, the first-class typed graph and hybrid queries, LLM extraction, and vector math operations.
 
 **Source:** [github.com/SarthiAI/swarndb](https://github.com/SarthiAI/swarndb)
 
-**Requirements:** Python 3.9+, grpcio>=1.60.0, protobuf>=4.25.0, numpy>=1.24.0
+**Requirements:** Python 3.9+, grpcio>=1.80.0, protobuf>=4.25.0, numpy>=1.24.0
 
 ---
 
@@ -550,7 +550,9 @@ print(f"Total batch time: {batch.total_time_us}us")
 
 ## 7. Graph Operations
 
-Access via `client.graph`. SwarnDB's virtual graph automatically connects similar vectors based on a similarity threshold.
+Access via `client.graph`. SwarnDB's virtual graph automatically connects similar vectors based on a similarity threshold. On `hybrid` collections, `client.graph` also manages a first-class typed graph and a composable hybrid query builder.
+
+For the complete, end-to-end treatment of the whole graph surface (virtual graph, typed nodes and edges, all 12 hybrid-query steps, all 3 terminals, sub-plans, all 14 predicate helpers, edge curation, the audit trail, and async patterns), see the [Graph Guide](graph-guide.md). This section is the quick reference.
 
 ### Set Collection Threshold
 
@@ -628,6 +630,211 @@ with SwarnDBClient(host="localhost", port=50051) as client:
     nodes = client.graph.traverse("articles", start_id=1, depth=2, max_results=25)
     print(f"Traversal found {len(nodes)} reachable vectors within 2 hops")
 ```
+
+### Typed Graph (hybrid mode)
+
+On a `hybrid` collection, `client.graph` also manages a first-class typed graph of nodes and edges. See [Graph as a First-Class Layer](graph-first-class.md) for the full picture.
+
+```python
+# Nodes
+node_id = client.graph.put_node(
+    "docs_graph",
+    kind="entity",            # "content" or "entity"
+    label="Person",
+    properties={"name": "Ada Lovelace"},
+    embedding=[0.0] * 1536,   # optional; used for entity dedup
+    source="manual",
+    created_by="curator",
+)
+node = client.graph.get_node("docs_graph", node_id)       # TypedNode or None
+client.graph.delete_node("docs_graph", node_id)           # also removes incident edges
+
+# Edges
+edge_id = client.graph.put_edge(
+    "docs_graph",
+    source=42, target=node_id, edge_type="AUTHORED_BY",
+    properties={"page": 1}, provenance={"doc_id": "paper-1"},
+    confidence=1.0, verified=False, is_manual=True,
+)
+edge = client.graph.get_edge("docs_graph", edge_id)       # TypedEdge or None
+edges = client.graph.list_edges("docs_graph", node=42, direction="outgoing", edge_type="AUTHORED_BY")
+client.graph.delete_edge("docs_graph", edge_id)
+
+# Curate: update (only supplied fields change), verify (keep + bless),
+# reject (delete + remember the pattern)
+client.graph.update_edge("docs_graph", edge_id, confidence=0.9, verified=True, actor="curator")
+client.graph.verify_edge("docs_graph", edge_id, actor="curator")
+result = client.graph.reject_edge("docs_graph", edge_id, actor="curator")  # .deleted, .rule_added
+
+# Audit trail: every TypedEdge carries .history, a list of EdgeAudit(action, actor, at)
+for entry in client.graph.get_edge("docs_graph", edge_id).history:
+    print(entry.action, entry.actor, entry.at)
+
+# Bulk import edges from CSV or JSONL
+csv_data = "source,target,edge_type,confidence\n42,99,CITES,1.0\n"
+report = client.graph.bulk_import_edges("docs_graph", csv_data, format="csv", auto_add_edge_types=False)
+print(report.total_rows, report.imported, report.failed, report.errors)
+```
+
+Verify and reject are not symmetric: verify keeps the edge and marks it trustworthy (and protects it from re-extraction), while reject deletes it and can record a rule so the same wrong relationship is not re-proposed later. See the [Graph Guide](graph-guide.md) for the full curation and re-extraction semantics.
+
+### Hybrid Query Builder (hybrid mode)
+
+`client.graph.query(collection)` returns a chainable builder that mixes vector similarity with graph traversal. Finish with `return_nodes()`, `return_edges()`, or `return_paths()`. Use the `Predicate` helpers and `Direction` constants for filtering and traversal direction.
+
+```python
+from swarndb import Predicate, Direction
+
+result = (
+    client.graph.query("docs_graph")
+    .vector_similar(query_vector, k=20)            # seed with nearest neighbors
+    .traverse("AUTHORED_BY", direction=Direction.OUTGOING)
+    .filter(Predicate.label_eq("Person"))
+    .limit(10)
+    .return_nodes()
+)
+for node in result.nodes:
+    print(node.id, node.label, node.properties)
+
+# Source steps: .vector_similar(vec, k, ef_search=200),
+#               .from_node(id) / .from_nodes([...])
+# Traversal:    .traverse(edge_type, direction),
+#               .k_hop(edge_type, max=2, predicate=Predicate.eq("in_stock", True)),
+#               .shortest_path(["CITES"], target=paper_b)
+# Refinement:   .filter(predicate), .edges(edge_type, direction), .limit(n)
+# Terminals:    .return_nodes() / .return_edges() / .return_paths()
+
+# Set-combination steps take another plan, built with .to_plan() (alias
+# .build_plan()): .mutual_neighbors(other_plan) keeps nodes reachable by both
+# plans, .intersect(other_plan) keeps nodes in both result sets,
+# .union(other_plan) combines both result sets.
+
+# All 14 Predicate helpers: eq, ne, gt, ge, lt, le, is_in, not_in, exists,
+# label_eq, and_, or_, not_, any_. Values are JSON-encoded on the wire;
+# a bare key references the property bag, label_eq references the node label.
+
+# A HybridQueryResult carries .nodes, .edges, and .paths; exactly one is
+# populated, matching the terminal you called.
+```
+
+The async client mirrors this; build the same chain and `await` the terminal call. For the full hybrid-query surface (every step, sub-plan composition, and the predicate JSON wire encoding) see the [Graph Guide](graph-guide.md).
+
+#### One-call graph-augmented retrieval: `graph_rag` (recommended)
+
+For graph-augmented retrieval, `client.graph.graph_rag(...)` is the recommended path. It composes the candidate pool for you (a vector seed expanded across the graph) and ranks it, so you get the result in one call instead of hand-building the chain. The seed-only form gives no lift; this helper closes that footgun by composing the graph expansion automatically. By default it uses `vector_rank` (graph-first scope-then-rank): the graph fixes the candidate set and it is ranked exactly within that set by similarity.
+
+```python
+result = client.graph.graph_rag(
+    "docs_graph", query_vector, k=10,
+    relation_edge_types=["CITES"],     # empty/None uses the structural fallback
+)
+for node in result.nodes:
+    print(node.id, node.label)
+```
+
+Signature:
+
+```python
+graph_rag(
+    collection, query_vector, k=10, *,
+    mentions_edge_type="mentions", relation_edge_types=None,
+    k_hop_max=2, rrf_k=60, hub_damping=0.0, ef_search=None,
+) -> HybridQueryResult
+```
+
+`vector_rank` is the default because, on real data at scale, it ties plain vector retrieval on overall accuracy and wins on the hard multi-hop and adversarial questions, while the older RRF fusion regressed below plain vector retrieval. RRF stays fully supported as an explicit opt-in (build the chain in the [Graph Guide](graph-guide.md) section 4.5 and call `.rank_rrf(...)`); it is just no longer the default. Plain `client.graph.query(...).vector_similar(...).return_nodes()` stays the zero-cost vector-only default. The async client mirrors it: `await client.graph.graph_rag(...)`. See the [Graph Guide](graph-guide.md) section 4.6 for the exact composed plan and the explicit equivalent.
+
+---
+
+## 7a. LLM Extraction (hybrid mode)
+
+Access via `client.extraction`. These methods work only on `hybrid` collections and turn text chunks into typed entities and edges using your own LLM. See [LLM Extraction](llm-extraction.md) for the concepts and the [Graph Guide](graph-guide.md) for the full extraction API (cost preview, jobs, proposals, partial-success, truncation auto-retry, and incremental re-extraction) with runnable examples; the server needs `SWARNDB_MASTER_KEY` set to store api keys.
+
+```python
+from swarndb import Chunk, EntityLabel, EdgeType
+
+# 1. LLM config (api key is write-only; OpenAI-compatible, e.g. OpenRouter)
+client.extraction.set_llm_config(
+    "docs_graph",
+    base_url="https://openrouter.ai/api/v1",
+    api_key="sk-or-...",
+    model_name="openai/gpt-4o-mini",
+    temperature=0.0, max_tokens=2048, timeout_seconds=30,
+)
+info = client.extraction.get_llm_config("docs_graph")   # never returns the key
+client.extraction.rotate_llm_config("docs_graph", new_api_key="sk-or-...")
+
+# 2. Ontology: template + custom extension, plus optional prompt tuning
+client.extraction.set_ontology(
+    "docs_graph",
+    base_template="research-papers",
+    entity_labels=[EntityLabel(label="Dataset", description="A named dataset")],
+    edge_types=[EdgeType(edge_type="USES_DATASET", description="Paper uses a dataset",
+                         source_labels=["Paper"], target_labels=["Dataset"])],
+    system_prompt="You are a research-paper analyst extracting a citation graph.",
+    extra_guidance="Treat 'we' as the authors of the current paper.",
+)
+ontology = client.extraction.get_ontology("docs_graph")
+# ontology.system_prompt, ontology.extra_guidance  (None when left at the default)
+
+# 3. Cost preview, run, poll
+chunks = [Chunk(doc_id="paper-1", chunk_id=0, text="...", embedding=vec)]
+estimate = client.extraction.cost_preview("docs_graph", chunks)
+job_id = client.extraction.start_extraction("docs_graph", chunks)
+status = client.extraction.extraction_status("docs_graph", job_id)  # .state, counters, .failed_chunks, .chunk_errors
+client.extraction.cancel_extraction("docs_graph", job_id)
+
+# 4. Ontology proposals from the model
+for p in client.extraction.list_proposals("docs_graph"):
+    print(p.id, p.kind, p.name)
+client.extraction.approve_proposal("docs_graph", p.id)
+client.extraction.reject_proposal("docs_graph", p.id)
+
+# 5. Document updates: diff then re-extract only what changed
+diffs = client.extraction.diff_document("docs_graph", "paper-1", new_chunks)
+summary = client.extraction.reextract_document("docs_graph", "paper-1", new_chunks)
+```
+
+The async client (`AsyncExtractionAPI` via `await async_client.extraction....`) exposes the same methods; await each call.
+
+### Customizing the extraction prompt
+
+`set_ontology` takes two optional keyword arguments that tune the prompt the model sees, per collection:
+
+- `system_prompt` fully overrides SwarnDB's generic task framing with your own. Leave it unset (or empty) to keep the built-in framing.
+- `extra_guidance` is a short domain hint appended on top of whichever framing is in effect (the default one, or your `system_prompt`). Use it to teach the model things it cannot infer from the text.
+
+In every case SwarnDB still enforces the machine contract: your ontology's allowed labels and edge types, the JSON output schema, and a fixed contract footer (output only the JSON object, stay within the allowed types or propose, cite the span and a confidence, do not invent) are always part of the prompt. A custom prompt can shape the task but cannot break parsing or your ontology. Changing either value recomputes the extraction cache, so the next run re-extracts under the new prompt.
+
+`get_ontology` returns an `OntologyInfo` whose `system_prompt` and `extra_guidance` fields read these values back; each is `None` when left at the default.
+
+```python
+client.extraction.set_ontology(
+    "contracts_graph",
+    base_template="legal-contracts",
+    system_prompt="You are a contracts analyst extracting parties, dates, and obligations.",
+    extra_guidance="Treat 'the Company' as the first party; dates are DD/MM/YYYY.",
+)
+
+ontology = client.extraction.get_ontology("contracts_graph")
+print(ontology.system_prompt)   # the override above, or None for the default
+print(ontology.extra_guidance)  # the hint above, or None
+```
+
+### Job state and partial success
+
+`extraction_status` returns an `ExtractionJob` whose `state` is one of `"queued"`, `"running"`, `"completed"`, `"completed_with_errors"`, `"failed"`, or `"cancelled"`. A single chunk failing does not fail the whole job: it finishes in `"completed_with_errors"`, keeps everything that succeeded, and records what failed on two fields. `failed_chunks` is the true total number of failed chunks; `chunk_errors` is a sample (up to 100) of `ChunkError` entries, each with `doc_id`, `chunk_id`, and `error`. (A reply cut off at the model's token limit is retried once automatically with a higher budget, so most truncations never reach `chunk_errors`.)
+
+```python
+job = client.extraction.extraction_status("docs_graph", job_id)
+
+if job.state == "completed_with_errors":
+    print(f"{job.failed_chunks} chunk(s) failed; sample of {len(job.chunk_errors)}:")
+    for e in job.chunk_errors:
+        print(f"  doc={e.doc_id} chunk={e.chunk_id}: {e.error}")
+```
+
+`ChunkError` is importable from `swarndb` alongside the other extraction types.
 
 ---
 

@@ -177,6 +177,8 @@ curl -X POST http://localhost:8080/api/v1/collections/articles/vectors \
 
 For inserting many vectors at once, use the bulk insert endpoint. This is significantly faster than inserting one at a time:
 
+> **Loading at scale?** The simple bulk insert here builds the search index inline (immediate mode), which is great for small to moderate loads. For large loads, especially high-dimension vectors such as 1536-dim embeddings, prefer deferred ingestion (store now, build the index once at the end) or the file-based path. The SDK already stretches the request deadline automatically for big immediate loads so they do not time out early, but the deferred and file-based paths are the right choice at scale. See [Bulk Ingestion](bulk-ingestion.md) for the full guidance.
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/collections/articles/vectors/bulk \
   -H "Content-Type: application/json" \
@@ -460,6 +462,9 @@ Now that you have SwarnDB running and know the basics, explore these topics:
 - **[Core Concepts](core-concepts.md)**: Understand how HNSW indexing, the virtual graph, and metadata filtering work under the hood.
 - **[API Reference](api-reference.md)**: Complete documentation for every REST and gRPC endpoint.
 - **[Python SDK](python-sdk.md)**: Full reference for the Python client, including advanced features like batch operations and graph-enriched search.
+- **[Graph as a First-Class Layer](graph-first-class.md)**: Build a typed graph of entities and relationships alongside your vectors with hybrid collections.
+- **[LLM Extraction](llm-extraction.md)**: Turn text chunks into typed entities and edges using your own LLM (bring your own key).
+- **[Bulk Ingestion](bulk-ingestion.md)**: Load vectors at scale and control when the search index is built.
 - **[Configuration](configuration.md)**: Tune SwarnDB for your workload with environment variables and runtime settings.
 - **[Deployment Guide](deployment.md)**: Run SwarnDB in production with Docker Compose, Kubernetes, or Helm.
 

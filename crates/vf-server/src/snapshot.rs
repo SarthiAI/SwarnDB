@@ -143,8 +143,11 @@ pub async fn start_snapshot_scheduler(
                 }
             };
 
-            // Perform the snapshot under a read lock on collections.
-            match snapshot_collection(name, &state, &collection_dir) {
+            // Perform the snapshot. The heavy HNSW build+serialize+fsync is
+            // offloaded to spawn_blocking so it never runs on the runtime
+            // thread; the per-collection read lock is held only long enough to
+            // clone the topology snapshot, then released before the write.
+            match snapshot_collection_offloaded(name, &state, &collection_dir).await {
                 Ok(snapshot_lsn) => {
                     last_snapshot_times.insert(name.clone(), Instant::now());
                     tracing::info!(
@@ -205,10 +208,11 @@ fn snapshot_collection(
     //    that races between the LSN read and the snapshot's internal
     //    inner.read() acquisition lands in both the snapshot AND the delta
     //    tail). On replay, those entries get re-applied from the delta;
-    //    making AddNode idempotent at the index layer is the correctness
-    //    closer and lives outside this initiative. Reversing the order
-    //    would OVERSTATE LSN coverage and silently lose inserts that
-    //    committed after the snapshot, which is the worse failure mode.
+    //    AddNode replay is now idempotent at the index layer (dedup in
+    //    hnsw_delta::apply_op), which is the correctness closer for the
+    //    re-apply. Reversing the order here would OVERSTATE LSN coverage
+    //    and silently lose inserts that committed after the snapshot, which
+    //    is the worse failure mode.
     let current_lsn = {
         let cm = state.collection_manager.read();
         match cm.get_collection(name) {
@@ -247,6 +251,78 @@ fn snapshot_collection(
         drop(snapshot);
     }
 
+    // Steps 2..6 (graph + typed snapshots, delta reset, wal_meta, prune,
+    // dirty reset) share the same body with the offloaded scheduler path.
+    snapshot_collection_tail(name, state, collection_dir, current_lsn)?;
+
+    Ok(current_lsn)
+}
+
+/// Background snapshot path used by the scheduler. Same end state as
+/// `snapshot_collection`, but the heavy HNSW build+serialize+fsync runs on a
+/// blocking thread via `spawn_blocking`. The per-collection read lock is held
+/// only long enough to clone the owned topology snapshot, then dropped before
+/// the off-runtime serialize+write so searches on the same collection are not
+/// blocked during the write.
+async fn snapshot_collection_offloaded(
+    name: &str,
+    state: &Arc<AppState>,
+    collection_dir: &Path,
+) -> Result<u64, String> {
+    // Read current_lsn BEFORE the snapshot (same safe-understatement ordering
+    // as snapshot_collection; see that function for the rationale).
+    let current_lsn = {
+        let cm = state.collection_manager.read();
+        match cm.get_collection(name) {
+            Ok(coll) => coll.current_lsn(),
+            Err(e) => return Err(format!("cannot resolve current_lsn for '{}': {}", name, e)),
+        }
+    };
+
+    // Clone the owned topology snapshot under a short read lock, then drop the
+    // lock. HnswTopologySnapshot owns all of its data, so it moves freely into
+    // the blocking task; nothing of the collection lock crosses the await.
+    let snapshot = {
+        let handle = state
+            .collection_handle(name)
+            .ok_or_else(|| format!("collection '{}' not found", name))?;
+        let coll_state = metered_read(&handle);
+        coll_state.index.snapshot_topology(current_lsn)
+    };
+
+    // Serialize + atomic_write + fsync off the runtime, off the collection
+    // lock. atomic_write_with_callback writes to .tmp, fsyncs, then renames, so
+    // a crash mid-write leaves the previous hnsw.base intact.
+    let hnsw_path = collection_dir.join("hnsw.base");
+    let write_result = tokio::task::spawn_blocking(move || {
+        vf_storage::atomic_write::atomic_write_with_callback(&hnsw_path, |file| {
+            vf_index::hnsw_persistence::serialize_topology(&snapshot, file).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("HNSW serialize error: {}", e),
+                )
+            })?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("HNSW snapshot blocking task failed: {}", e))?;
+    write_result.map_err(|e| format!("HNSW snapshot write failed: {}", e))?;
+
+    snapshot_collection_tail(name, state.as_ref(), collection_dir, current_lsn)?;
+
+    Ok(current_lsn)
+}
+
+/// Shared tail for both snapshot entry points: serialize the virtual and typed
+/// graph bases, reset the delta writers, update wal_meta, prune old WAL files,
+/// and clear the dirty flag. Steps numbered as in `snapshot_collection`.
+fn snapshot_collection_tail(
+    name: &str,
+    state: &AppState,
+    collection_dir: &Path,
+    current_lsn: u64,
+) -> Result<(), String> {
     // 2. Serialize virtual graph under a per-collection read lock (only if not deferred).
     {
         let handle = state
@@ -268,6 +344,27 @@ fn snapshot_collection(
                 Ok(())
             })
             .map_err(|e| format!("graph snapshot write failed: {}", e))?;
+        }
+    }
+
+    // 2b. Serialize the typed graph base for Hybrid collections (ADR-007 R4).
+    {
+        let handle = state
+            .collection_handle(name)
+            .ok_or_else(|| format!("collection '{}' not found", name))?;
+        let coll_state = metered_read(&handle);
+        if let Some(ref gs) = coll_state.graph_store {
+            let typed_path = collection_dir.join("graph_typed.base");
+            vf_storage::atomic_write::atomic_write_with_callback(&typed_path, |file| {
+                vf_graph::serialize_typed_base(gs, current_lsn, file).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("typed graph serialize error: {}", e),
+                    )
+                })?;
+                Ok(())
+            })
+            .map_err(|e| format!("typed graph snapshot write failed: {}", e))?;
         }
     }
 
@@ -312,6 +409,20 @@ fn snapshot_collection(
                 );
             }
         }
+
+        // Reset the typed graph delta writer (Hybrid only).
+        if let Some(ref mut gs) = coll_state.graph_store {
+            let _old = gs.take_delta_writer();
+            let typed_delta_path = collection_dir.join("graph_typed.delta");
+            match vf_graph::TypedDeltaWriter::create(&typed_delta_path) {
+                Ok(writer) => gs.set_delta_writer(writer),
+                Err(e) => tracing::warn!(
+                    collection = %name,
+                    "failed to create fresh typed graph delta writer: {}",
+                    e
+                ),
+            }
+        }
     }
 
     // 4. Update wal_meta.json with last_snapshot_lsn.
@@ -346,7 +457,7 @@ fn snapshot_collection(
         coll_state.mutation_count.store(0, Ordering::Release);
     }
 
-    Ok(current_lsn)
+    Ok(())
 }
 
 /// Prune old WAL files after a successful snapshot.

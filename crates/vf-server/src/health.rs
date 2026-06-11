@@ -157,9 +157,15 @@ async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
         let n = v.len();
         (v, n)
     };
+    // Never block on a per-collection lock here. A bulk write holds the write
+    // guard for the duration of its build; if try_read fails, count this
+    // collection as 0 for the probe rather than stalling liveness/readiness.
     let total_vectors: u64 = handles
         .iter()
-        .map(|h| h.read().store.len() as u64)
+        .map(|h| match h.try_read() {
+            Some(coll) => coll.store.len() as u64,
+            None => 0,
+        })
         .sum();
     Json(ReadyResponse {
         ready: true,

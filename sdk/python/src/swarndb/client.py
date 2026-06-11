@@ -7,12 +7,14 @@ operations behind a single connection-managed interface.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import grpc
 
@@ -34,6 +36,7 @@ from swarndb._proto import collection_pb2_grpc
 from swarndb._proto import vector_pb2_grpc
 from swarndb._proto import search_pb2_grpc
 from swarndb._proto import graph_pb2_grpc
+from swarndb._proto import extraction_pb2_grpc
 from swarndb._proto import vector_math_pb2_grpc
 from swarndb.types import HealthStatus, ReadinessStatus, RecoveryStatus
 
@@ -42,6 +45,7 @@ if TYPE_CHECKING:
     from swarndb.vectors import VectorAPI
     from swarndb.search import SearchAPI
     from swarndb.graph import GraphAPI
+    from swarndb.extraction import ExtractionAPI
     from swarndb.math_ops import MathAPI
 
 logger = logging.getLogger(__name__)
@@ -137,6 +141,29 @@ class SwarnDBClient:
             client.collections.create("my_collection", dimension=128)
             client.vectors.insert("my_collection", "v1", [0.1] * 128)
             results = client.search.query("my_collection", [0.1] * 128, k=5)
+
+    Concurrency:
+        Every call here is a blocking call: the calling thread waits for the
+        server reply. A single gRPC channel rides on a small number of HTTP/2
+        connections, each with a cap on how many requests can be in flight at
+        once; once that cap is reached, further requests queue at the channel
+        instead of going out concurrently. So a multi-thread fan-out (for
+        example a ``ThreadPoolExecutor`` running many ``search.query`` calls)
+        sharing one default client stops scaling well past a couple of
+        in-flight requests.
+
+        To genuinely run many requests at once from a thread pool, give the
+        client room with ``channels=N`` (it spreads each request across ``N``
+        independent channels, round robin), or give each worker its own client
+        via :meth:`clone`. As a rule of thumb, set ``channels`` to about the
+        number of worker threads. For an asyncio program, use
+        :class:`AsyncSwarnDBClient` instead, which is concurrent by design.
+
+    Args:
+        channels: Number of independent gRPC channels to spread requests
+            across, round robin. ``1`` (default) keeps the prior single-channel
+            behavior exactly. Raise it for multi-thread fan-out so concurrent
+            requests do not serialize behind one channel's stream limit.
     """
 
     def __init__(
@@ -151,7 +178,11 @@ class SwarnDBClient:
         timeout: float = 30.0,
         options: Optional[Sequence[Tuple[str, Any]]] = None,
         rest_port: int = _DEFAULT_REST_PORT,
+        channels: int = 1,
     ) -> None:
+        if channels < 1:
+            raise ValueError(f"channels must be >= 1, got {channels}")
+
         self._host = host
         self._port = port
         self._rest_port = rest_port
@@ -160,6 +191,8 @@ class SwarnDBClient:
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._timeout = timeout
+        self._options = tuple(options) if options else None
+        self._num_channels = channels
 
         target = f"{host}:{port}"
         channel_options: list[Tuple[str, Any]] = [
@@ -169,31 +202,122 @@ class SwarnDBClient:
         if options:
             channel_options.extend(options)
 
-        # Create channel
-        if secure:
-            credentials = grpc.ssl_channel_credentials()
-            self._channel = grpc.secure_channel(target, credentials, options=channel_options)
-        else:
-            self._channel = grpc.insecure_channel(target, options=channel_options)
+        # Build the channel pool. One channel keeps the prior behavior; more
+        # channels let concurrent blocking calls fan out instead of queueing
+        # behind a single channel's HTTP/2 stream limit.
+        #
+        # With >1 channel, each gets its own subchannel pool so identical
+        # target+options do not coalesce onto one shared HTTP/2 connection in
+        # gRPC's global pool. Single-channel callers keep byte-identical options.
+        per_channel_options = channel_options
+        if channels > 1:
+            per_channel_options = channel_options + [
+                ("grpc.use_local_subchannel_pool", 1),
+            ]
+        self._channels: List[grpc.Channel] = []
+        for _ in range(channels):
+            if secure:
+                credentials = grpc.ssl_channel_credentials()
+                ch = grpc.secure_channel(target, credentials, options=per_channel_options)
+            else:
+                ch = grpc.insecure_channel(target, options=per_channel_options)
+            if api_key:
+                ch = grpc.intercept_channel(ch, _AuthInterceptor(api_key))
+            self._channels.append(ch)
 
-        # Wrap channel with auth interceptor if api_key is provided
-        if api_key:
-            interceptor = _AuthInterceptor(api_key)
-            self._channel = grpc.intercept_channel(self._channel, interceptor)
+        # First channel kept for single-channel callers and lifecycle code.
+        self._channel = self._channels[0]
 
-        # Create all 5 service stubs
-        self._collection_stub = collection_pb2_grpc.CollectionServiceStub(self._channel)
-        self._vector_stub = vector_pb2_grpc.VectorServiceStub(self._channel)
-        self._search_stub = search_pb2_grpc.SearchServiceStub(self._channel)
-        self._graph_stub = graph_pb2_grpc.GraphServiceStub(self._channel)
-        self._vector_math_stub = vector_math_pb2_grpc.VectorMathServiceStub(self._channel)
+        # One stub set per channel, plus a round-robin cursor so each stub
+        # access lands on the next channel. Guarded by a lock because a thread
+        # pool reads these cursors concurrently.
+        self._collection_stubs = [
+            collection_pb2_grpc.CollectionServiceStub(ch) for ch in self._channels
+        ]
+        self._vector_stubs = [
+            vector_pb2_grpc.VectorServiceStub(ch) for ch in self._channels
+        ]
+        self._search_stubs = [
+            search_pb2_grpc.SearchServiceStub(ch) for ch in self._channels
+        ]
+        self._graph_stubs = [
+            graph_pb2_grpc.GraphServiceStub(ch) for ch in self._channels
+        ]
+        self._extraction_stubs = [
+            extraction_pb2_grpc.ExtractionServiceStub(ch) for ch in self._channels
+        ]
+        self._vector_math_stubs = [
+            vector_math_pb2_grpc.VectorMathServiceStub(ch) for ch in self._channels
+        ]
+        self._rr_lock = threading.Lock()
+        self._rr_counter = itertools.count()
 
         # Lazy-initialized API facades
         self._collections: Optional[CollectionAPI] = None
         self._vectors: Optional[VectorAPI] = None
         self._search: Optional[SearchAPI] = None
         self._graph: Optional[GraphAPI] = None
+        self._extraction: Optional[ExtractionAPI] = None
         self._math: Optional[MathAPI] = None
+
+    # ------------------------------------------------------------------
+    # Round-robin stub access (channel pool)
+    # ------------------------------------------------------------------
+    #
+    # The whole SDK reads these as ``client._search_stub`` etc. When the pool
+    # holds one channel they return that single stub (zero overhead, prior
+    # behavior). With more channels each read advances a shared cursor so
+    # successive calls ride different channels and run concurrently.
+
+    def _next_index(self) -> int:
+        if self._num_channels == 1:
+            return 0
+        with self._rr_lock:
+            return next(self._rr_counter) % self._num_channels
+
+    @property
+    def _collection_stub(self):
+        return self._collection_stubs[self._next_index()]
+
+    @property
+    def _vector_stub(self):
+        return self._vector_stubs[self._next_index()]
+
+    @property
+    def _search_stub(self):
+        return self._search_stubs[self._next_index()]
+
+    @property
+    def _graph_stub(self):
+        return self._graph_stubs[self._next_index()]
+
+    @property
+    def _extraction_stub(self):
+        return self._extraction_stubs[self._next_index()]
+
+    @property
+    def _vector_math_stub(self):
+        return self._vector_math_stubs[self._next_index()]
+
+    def clone(self) -> "SwarnDBClient":
+        """Return a new client with its own channel(s) and the same settings.
+
+        Use this to give each worker thread its own client when you prefer a
+        client-per-worker layout over ``channels=N``. The returned client is
+        fully independent: closing one does not close the other.
+        """
+        return SwarnDBClient(
+            self._host,
+            self._port,
+            api_key=self._api_key,
+            secure=self._secure,
+            max_retries=self._max_retries,
+            retry_delay=self._retry_delay,
+            timeout=self._timeout,
+            options=self._options,
+            rest_port=self._rest_port,
+            channels=self._num_channels,
+        )
 
     # ------------------------------------------------------------------
     # API namespace properties (lazy initialization)
@@ -232,6 +356,14 @@ class SwarnDBClient:
         return self._graph
 
     @property
+    def extraction(self) -> ExtractionAPI:
+        """Access LLM extraction operations (Hybrid mode)."""
+        if self._extraction is None:
+            from swarndb.extraction import ExtractionAPI
+            self._extraction = ExtractionAPI(self)
+        return self._extraction
+
+    @property
     def math(self) -> MathAPI:
         """Access vector math operations."""
         if self._math is None:
@@ -243,7 +375,14 @@ class SwarnDBClient:
     # Internal call helpers
     # ------------------------------------------------------------------
 
-    def _call(self, stub_method, request, *, timeout: Optional[float] = None):
+    def _call(
+        self,
+        stub_method,
+        request,
+        *,
+        timeout: Optional[float] = None,
+        retry_deadline: bool = True,
+    ):
         """Execute a gRPC call with retry logic and error handling.
 
         Wraps gRPC errors into SwarnDB exceptions. Implements exponential
@@ -253,6 +392,10 @@ class SwarnDBClient:
             stub_method: The gRPC stub method to invoke.
             request: The protobuf request object.
             timeout: Optional per-call timeout override (seconds).
+            retry_deadline: When False, a DEADLINE_EXCEEDED is treated as
+                non-retryable (UNAVAILABLE retries still apply). Use for
+                non-idempotent calls where a retry would re-run server-side
+                work. Defaults to True to preserve existing behavior.
 
         Returns:
             The protobuf response object.
@@ -273,8 +416,12 @@ class SwarnDBClient:
                 last_error = exc
                 code = exc.code()
 
+                retryable = code in _RETRYABLE_CODES
+                if not retry_deadline and code == grpc.StatusCode.DEADLINE_EXCEEDED:
+                    retryable = False
+
                 # Only retry on transient errors
-                if code in _RETRYABLE_CODES and attempt < self._max_retries:
+                if retryable and attempt < self._max_retries:
                     delay = self._retry_delay * (2 ** attempt)
                     logger.debug(
                         "Retrying gRPC call (attempt %d/%d) after %s error, "
@@ -413,8 +560,9 @@ class SwarnDBClient:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the gRPC channel."""
-        self._channel.close()
+        """Close every gRPC channel in the pool."""
+        for ch in self._channels:
+            ch.close()
 
     def __enter__(self) -> SwarnDBClient:
         return self
@@ -425,5 +573,5 @@ class SwarnDBClient:
     def __repr__(self) -> str:
         return (
             f"SwarnDBClient(host={self._host!r}, port={self._port}, "
-            f"secure={self._secure})"
+            f"secure={self._secure}, channels={self._num_channels})"
         )

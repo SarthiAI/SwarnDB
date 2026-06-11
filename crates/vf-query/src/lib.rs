@@ -6,6 +6,7 @@
 pub mod batch;
 pub mod eval;
 pub mod filter;
+pub mod hybrid;
 pub mod index_bitmap;
 pub mod index_btree;
 pub mod index_hash;
@@ -21,3 +22,8 @@ pub use index_btree::BTreeIndex;
 pub use index_hash::HashIndex;
 pub use index_manager::{IndexConfig, IndexManager, MetadataIndex};
 pub use strategy::{FilterStrategy, QueryExecutor};
+pub use hybrid::{
+    CompareOp, EdgeDirection, EdgeId, HybridExecutor, HybridQueryError, NodeId, NodeRecord,
+    OnEdges, OnEmpty, OnNodes, OnPaths, Path, Predicate, PropertyRef, QueryBuilder, QueryPlan,
+    QueryResult, ReturnKind, Step,
+};

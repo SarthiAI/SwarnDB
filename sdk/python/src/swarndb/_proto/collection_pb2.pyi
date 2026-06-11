@@ -8,12 +8,21 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class Mode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MODE_VECTOR_ONLY: _ClassVar[Mode]
+    MODE_AUTO_SIMILARITY: _ClassVar[Mode]
+    MODE_HYBRID: _ClassVar[Mode]
+
 class RecoveryPath(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     RECOVERY_UNKNOWN: _ClassVar[RecoveryPath]
     RECOVERY_CLEAN_SHUTDOWN: _ClassVar[RecoveryPath]
     RECOVERY_INCREMENTAL_REPLAY: _ClassVar[RecoveryPath]
     RECOVERY_FULL_REBUILD: _ClassVar[RecoveryPath]
+MODE_VECTOR_ONLY: Mode
+MODE_AUTO_SIMILARITY: Mode
+MODE_HYBRID: Mode
 RECOVERY_UNKNOWN: RecoveryPath
 RECOVERY_CLEAN_SHUTDOWN: RecoveryPath
 RECOVERY_INCREMENTAL_REPLAY: RecoveryPath
@@ -34,7 +43,7 @@ class QuantizationConfig(_message.Message):
     def __init__(self, scalar: _Optional[_Union[ScalarQuantization, _Mapping]] = ...) -> None: ...
 
 class CreateCollectionRequest(_message.Message):
-    __slots__ = ("name", "dimension", "distance_metric", "default_threshold", "max_vectors", "quantization", "m", "ef_construction")
+    __slots__ = ("name", "dimension", "distance_metric", "default_threshold", "max_vectors", "quantization", "m", "ef_construction", "mode")
     NAME_FIELD_NUMBER: _ClassVar[int]
     DIMENSION_FIELD_NUMBER: _ClassVar[int]
     DISTANCE_METRIC_FIELD_NUMBER: _ClassVar[int]
@@ -43,6 +52,7 @@ class CreateCollectionRequest(_message.Message):
     QUANTIZATION_FIELD_NUMBER: _ClassVar[int]
     M_FIELD_NUMBER: _ClassVar[int]
     EF_CONSTRUCTION_FIELD_NUMBER: _ClassVar[int]
+    MODE_FIELD_NUMBER: _ClassVar[int]
     name: str
     dimension: int
     distance_metric: str
@@ -51,7 +61,8 @@ class CreateCollectionRequest(_message.Message):
     quantization: QuantizationConfig
     m: int
     ef_construction: int
-    def __init__(self, name: _Optional[str] = ..., dimension: _Optional[int] = ..., distance_metric: _Optional[str] = ..., default_threshold: _Optional[float] = ..., max_vectors: _Optional[int] = ..., quantization: _Optional[_Union[QuantizationConfig, _Mapping]] = ..., m: _Optional[int] = ..., ef_construction: _Optional[int] = ...) -> None: ...
+    mode: Mode
+    def __init__(self, name: _Optional[str] = ..., dimension: _Optional[int] = ..., distance_metric: _Optional[str] = ..., default_threshold: _Optional[float] = ..., max_vectors: _Optional[int] = ..., quantization: _Optional[_Union[QuantizationConfig, _Mapping]] = ..., m: _Optional[int] = ..., ef_construction: _Optional[int] = ..., mode: _Optional[_Union[Mode, str]] = ...) -> None: ...
 
 class CreateCollectionResponse(_message.Message):
     __slots__ = ("name", "success")
@@ -80,7 +91,7 @@ class GetCollectionRequest(_message.Message):
     def __init__(self, name: _Optional[str] = ...) -> None: ...
 
 class GetCollectionResponse(_message.Message):
-    __slots__ = ("name", "dimension", "distance_metric", "vector_count", "default_threshold", "status", "quantization_type")
+    __slots__ = ("name", "dimension", "distance_metric", "vector_count", "default_threshold", "status", "quantization_type", "indexed_count")
     NAME_FIELD_NUMBER: _ClassVar[int]
     DIMENSION_FIELD_NUMBER: _ClassVar[int]
     DISTANCE_METRIC_FIELD_NUMBER: _ClassVar[int]
@@ -88,6 +99,7 @@ class GetCollectionResponse(_message.Message):
     DEFAULT_THRESHOLD_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     QUANTIZATION_TYPE_FIELD_NUMBER: _ClassVar[int]
+    INDEXED_COUNT_FIELD_NUMBER: _ClassVar[int]
     name: str
     dimension: int
     distance_metric: str
@@ -95,7 +107,8 @@ class GetCollectionResponse(_message.Message):
     default_threshold: float
     status: str
     quantization_type: str
-    def __init__(self, name: _Optional[str] = ..., dimension: _Optional[int] = ..., distance_metric: _Optional[str] = ..., vector_count: _Optional[int] = ..., default_threshold: _Optional[float] = ..., status: _Optional[str] = ..., quantization_type: _Optional[str] = ...) -> None: ...
+    indexed_count: int
+    def __init__(self, name: _Optional[str] = ..., dimension: _Optional[int] = ..., distance_metric: _Optional[str] = ..., vector_count: _Optional[int] = ..., default_threshold: _Optional[float] = ..., status: _Optional[str] = ..., quantization_type: _Optional[str] = ..., indexed_count: _Optional[int] = ...) -> None: ...
 
 class ListCollectionsRequest(_message.Message):
     __slots__ = ()

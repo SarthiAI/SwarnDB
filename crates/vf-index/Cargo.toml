@@ -24,6 +24,11 @@ dashmap = { workspace = true }
 bytemuck = { workspace = true }
 libc = { workspace = true }
 
+# ADR-025: ctl surface for the post-optimize arena purge. Gated to
+# non-MSVC x86_64 / aarch64; a no-op shim covers every other target.
+[target.'cfg(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemalloc-ctl = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = { workspace = true }

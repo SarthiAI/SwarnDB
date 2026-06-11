@@ -48,6 +48,16 @@ When you create a collection, you specify:
 | `distance_metric` | Yes | How similarity is measured: `cosine`, `euclidean`, `dot_product`, or `manhattan` |
 | `default_threshold` | No | Similarity threshold for virtual graph edges (0.0 to 1.0) |
 
+### Collection modes
+
+A collection is created in one of three modes, fixed at creation time:
+
+- **`vector_only`**: pure vector search and metadata filtering, no graph.
+- **`auto_similarity`**: the automatic similarity graph (the legacy behavior, used when no mode is specified on older collections).
+- **`hybrid`**: a first-class typed graph of nodes and edges alongside your vectors, with a composable query engine and optional LLM extraction.
+
+When you omit the mode, the collection defaults to vector-only. For what each mode does and how to choose, see [Graph as a First-Class Layer](graph-first-class.md).
+
 ### Collection status
 
 A collection moves through these states:

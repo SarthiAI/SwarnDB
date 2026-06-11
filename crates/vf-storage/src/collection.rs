@@ -343,15 +343,27 @@ impl Collection {
     pub fn load_all_vectors(
         &self,
     ) -> StorageResult<Vec<(VectorId, Vec<f32>, Option<Metadata>)>> {
-        let mut map: HashMap<VectorId, (Vec<f32>, Option<Metadata>)> = HashMap::new();
+        // Build the result vector directly to avoid holding a full second copy of
+        // every vector. `pos` maps id -> index in `result` so newer entries
+        // (newer segments, then the memtable) overwrite older ones in place.
+        let mut result: Vec<(VectorId, Vec<f32>, Option<Metadata>)> = Vec::new();
+        let mut pos: HashMap<VectorId, usize> = HashMap::new();
 
         // Read segments oldest-first (already sorted by id ascending).
         for seg in &self.segments {
+            // Read this segment's metadata region once, then do O(1) lookups.
+            let meta_map = seg.metadata_map()?;
             let count = seg.vector_count() as usize;
             for i in 0..count {
                 let (id, data) = seg.get_vector_data(i)?;
-                let meta = seg.get_metadata(id)?;
-                map.insert(id, (data, meta));
+                let meta = meta_map.get(&id).cloned();
+                match pos.get(&id) {
+                    Some(&idx) => result[idx] = (id, data, meta),
+                    None => {
+                        pos.insert(id, result.len());
+                        result.push((id, data, meta));
+                    }
+                }
             }
         }
 
@@ -359,15 +371,17 @@ impl Collection {
         for id in self.memtable.ids() {
             if let Ok(record) = self.memtable.get(id) {
                 if let Some(ref data) = record.data {
-                    map.insert(id, (data.to_f32_vec(), record.metadata.clone()));
+                    let entry = (id, data.to_f32_vec(), record.metadata.clone());
+                    match pos.get(&id) {
+                        Some(&idx) => result[idx] = entry,
+                        None => {
+                            pos.insert(id, result.len());
+                            result.push(entry);
+                        }
+                    }
                 }
             }
         }
-
-        let result: Vec<(VectorId, Vec<f32>, Option<Metadata>)> = map
-            .into_iter()
-            .map(|(id, (data, meta))| (id, data, meta))
-            .collect();
 
         Ok(result)
     }
@@ -406,8 +420,16 @@ impl CollectionManager {
                 }
 
                 let config_bytes = fs::read(&config_path).map_err(StorageError::Io)?;
-                let config: CollectionConfig = serde_json::from_slice(&config_bytes)
+                let mut config: CollectionConfig = serde_json::from_slice(&config_bytes)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                // Legacy collections predate modes: resolve to AutoSimilarity (the only mapping that
+                // preserves today's similarity graph) and re-stamp config.json once, atomically.
+                if config.mode.is_none() {
+                    config.mode = Some(vf_core::types::Mode::AutoSimilarity);
+                    let restamped = serde_json::to_string_pretty(&config)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    crate::atomic_write::atomic_write(&config_path, restamped.as_bytes())?;
+                }
 
                 let collection = Collection::open(&path, config)?;
                 let name = collection.name().to_string();

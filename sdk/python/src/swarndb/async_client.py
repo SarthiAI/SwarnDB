@@ -9,7 +9,10 @@ graph, math) are inlined as async wrapper classes.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import logging
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -28,6 +31,7 @@ from swarndb._proto import (
     collection_pb2,
     collection_pb2_grpc,
     common_pb2,
+    extraction_pb2_grpc,
     graph_pb2,
     graph_pb2_grpc,
     search_pb2,
@@ -56,23 +60,43 @@ from swarndb.exceptions import (
     VectorNotFoundError,
 )
 from swarndb.search import Filter, _to_proto_value, _scored_result_from_proto
+from swarndb.graph import (
+    _bulk_import_format_to_proto,
+    _edge_from_proto,
+    _kind_to_proto,
+    _node_from_proto,
+)
+
+if TYPE_CHECKING:
+    from swarndb.hybrid import AsyncHybridQueryBuilder
+    from swarndb.extraction import AsyncExtractionAPI
+    from swarndb.types import HybridQueryResult
 from swarndb.types import (
     BatchSearchResult,
+    BulkImportResult,
+    BulkImportRowError,
     BulkInsertOptions,
     BulkInsertResult,
     ClusterAssignment,
     ClusterResult,
     CollectionInfo,
     CollectionMetrics,
+    CompactResult,
     ConeSearchResult,
     DiversityResult,
     DriftReport,
+    EdgePage,
+    EdgeRejectResult,
     GhostVector,
     GraphEdge,
+    NodePage,
     HealthStatus,
+    TypedEdge,
+    TypedNode,
     OptimizeResult,
     PCAResult,
     PersistenceStatus,
+    PruneWALResult,
     QuantizationConfig,
     ReadinessStatus,
     RecoveryStatus,
@@ -84,7 +108,14 @@ from swarndb.types import (
     VectorRecord,
 )
 from swarndb._helpers import _to_proto_vector
-from swarndb.vectors import _from_proto_metadata, _to_proto_metadata
+from swarndb.vectors import (
+    _BULK_FROM_PATH_MIN_DEADLINE,
+    _assigned_ids_view,
+    _from_proto_metadata,
+    _scaled_bulk_timeout,
+    _to_proto_metadata,
+)
+from swarndb.collections import _MODE_TO_PROTO, _maintenance_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +190,20 @@ class AsyncSwarnDBClient:
             await client.collections.create("my_collection", dimension=128)
             vid = await client.vectors.insert("my_collection", [0.1] * 128)
             results = await client.search.query("my_collection", [0.1] * 128, k=5)
+
+    Concurrency:
+        This client is concurrent by design: many awaited calls (for example
+        via ``asyncio.gather``) are in flight at once without blocking a
+        thread. They still share the channel's HTTP/2 connection, which caps
+        how many requests can be in flight before further ones queue. For a
+        large fan-out, raise ``channels=N`` to spread requests across ``N``
+        independent channels, round robin, so they do not queue behind a
+        single channel's stream limit.
+
+    Args:
+        channels: Number of independent gRPC channels to spread requests
+            across, round robin. ``1`` (default) keeps the prior single-channel
+            behavior exactly. Raise it for a large concurrent fan-out.
     """
 
     def __init__(
@@ -173,7 +218,11 @@ class AsyncSwarnDBClient:
         timeout: float = 30.0,
         options: Optional[Sequence[Tuple[str, Any]]] = None,
         rest_port: int = _DEFAULT_REST_PORT,
+        channels: int = 1,
     ) -> None:
+        if channels < 1:
+            raise ValueError(f"channels must be >= 1, got {channels}")
+
         self._host = host
         self._port = port
         self._rest_port = rest_port
@@ -182,6 +231,8 @@ class AsyncSwarnDBClient:
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._timeout = timeout
+        self._options = tuple(options) if options else None
+        self._num_channels = channels
 
         target = f"{host}:{port}"
         channel_options: list[Tuple[str, Any]] = [
@@ -196,34 +247,123 @@ class AsyncSwarnDBClient:
         if api_key:
             interceptors.append(_AsyncAuthInterceptor(api_key))
 
-        # Create async channel
-        if secure:
-            credentials = grpc.ssl_channel_credentials()
-            self._channel = grpc.aio.secure_channel(
-                target, credentials,
-                options=channel_options,
-                interceptors=interceptors or None,
-            )
-        else:
-            self._channel = grpc.aio.insecure_channel(
-                target,
-                options=channel_options,
-                interceptors=interceptors or None,
-            )
+        # Build the channel pool. One channel keeps the prior behavior; more
+        # channels let a large concurrent fan-out spread out instead of
+        # queueing behind a single channel's HTTP/2 stream limit.
+        #
+        # With >1 channel, each gets its own subchannel pool so identical
+        # target+options do not coalesce onto one shared HTTP/2 connection in
+        # gRPC's global pool. Single-channel callers keep byte-identical options.
+        per_channel_options = channel_options
+        if channels > 1:
+            per_channel_options = channel_options + [
+                ("grpc.use_local_subchannel_pool", 1),
+            ]
+        self._channels: List[grpc.aio.Channel] = []
+        for _ in range(channels):
+            if secure:
+                credentials = grpc.ssl_channel_credentials()
+                ch = grpc.aio.secure_channel(
+                    target, credentials,
+                    options=per_channel_options,
+                    interceptors=interceptors or None,
+                )
+            else:
+                ch = grpc.aio.insecure_channel(
+                    target,
+                    options=per_channel_options,
+                    interceptors=interceptors or None,
+                )
+            self._channels.append(ch)
 
-        # Create all 5 service stubs (same stub classes work with aio channels)
-        self._collection_stub = collection_pb2_grpc.CollectionServiceStub(self._channel)
-        self._vector_stub = vector_pb2_grpc.VectorServiceStub(self._channel)
-        self._search_stub = search_pb2_grpc.SearchServiceStub(self._channel)
-        self._graph_stub = graph_pb2_grpc.GraphServiceStub(self._channel)
-        self._vector_math_stub = vector_math_pb2_grpc.VectorMathServiceStub(self._channel)
+        # First channel kept for single-channel callers and lifecycle code.
+        self._channel = self._channels[0]
+
+        # One stub set per channel, plus a round-robin cursor. The event loop
+        # runs coroutines on one thread, so the cursor needs no lock.
+        self._collection_stubs = [
+            collection_pb2_grpc.CollectionServiceStub(ch) for ch in self._channels
+        ]
+        self._vector_stubs = [
+            vector_pb2_grpc.VectorServiceStub(ch) for ch in self._channels
+        ]
+        self._search_stubs = [
+            search_pb2_grpc.SearchServiceStub(ch) for ch in self._channels
+        ]
+        self._graph_stubs = [
+            graph_pb2_grpc.GraphServiceStub(ch) for ch in self._channels
+        ]
+        self._extraction_stubs = [
+            extraction_pb2_grpc.ExtractionServiceStub(ch) for ch in self._channels
+        ]
+        self._vector_math_stubs = [
+            vector_math_pb2_grpc.VectorMathServiceStub(ch) for ch in self._channels
+        ]
+        self._rr_counter = itertools.count()
 
         # Lazy-initialized API facades
         self._collections: Optional[AsyncCollectionAPI] = None
         self._vectors: Optional[AsyncVectorAPI] = None
         self._search: Optional[AsyncSearchAPI] = None
         self._graph: Optional[AsyncGraphAPI] = None
+        self._extraction: Optional["AsyncExtractionAPI"] = None
         self._math: Optional[AsyncMathAPI] = None
+
+    # ------------------------------------------------------------------
+    # Round-robin stub access (channel pool)
+    # ------------------------------------------------------------------
+    #
+    # The whole async SDK reads these as ``client._search_stub`` etc. With one
+    # channel they return that single stub (prior behavior). With more channels
+    # each read advances a cursor so successive calls ride different channels.
+
+    def _next_index(self) -> int:
+        if self._num_channels == 1:
+            return 0
+        return next(self._rr_counter) % self._num_channels
+
+    @property
+    def _collection_stub(self):
+        return self._collection_stubs[self._next_index()]
+
+    @property
+    def _vector_stub(self):
+        return self._vector_stubs[self._next_index()]
+
+    @property
+    def _search_stub(self):
+        return self._search_stubs[self._next_index()]
+
+    @property
+    def _graph_stub(self):
+        return self._graph_stubs[self._next_index()]
+
+    @property
+    def _extraction_stub(self):
+        return self._extraction_stubs[self._next_index()]
+
+    @property
+    def _vector_math_stub(self):
+        return self._vector_math_stubs[self._next_index()]
+
+    def clone(self) -> "AsyncSwarnDBClient":
+        """Return a new async client with its own channel(s) and same settings.
+
+        The returned client is fully independent: closing one does not close
+        the other.
+        """
+        return AsyncSwarnDBClient(
+            self._host,
+            self._port,
+            api_key=self._api_key,
+            secure=self._secure,
+            max_retries=self._max_retries,
+            retry_delay=self._retry_delay,
+            timeout=self._timeout,
+            options=self._options,
+            rest_port=self._rest_port,
+            channels=self._num_channels,
+        )
 
     # ------------------------------------------------------------------
     # API namespace properties (lazy initialization)
@@ -258,6 +398,14 @@ class AsyncSwarnDBClient:
         return self._graph
 
     @property
+    def extraction(self) -> "AsyncExtractionAPI":
+        """Access async LLM extraction operations (Hybrid mode)."""
+        if self._extraction is None:
+            from swarndb.extraction import AsyncExtractionAPI
+            self._extraction = AsyncExtractionAPI(self)
+        return self._extraction
+
+    @property
     def math(self) -> AsyncMathAPI:
         """Access async vector math operations."""
         if self._math is None:
@@ -268,7 +416,14 @@ class AsyncSwarnDBClient:
     # Internal call helpers
     # ------------------------------------------------------------------
 
-    async def _call(self, stub_method, request, *, timeout: Optional[float] = None):
+    async def _call(
+        self,
+        stub_method,
+        request,
+        *,
+        timeout: Optional[float] = None,
+        retry_deadline: bool = True,
+    ):
         """Execute an async gRPC call with retry logic and error handling.
 
         Wraps gRPC errors into SwarnDB exceptions. Implements exponential
@@ -278,6 +433,10 @@ class AsyncSwarnDBClient:
             stub_method: The gRPC stub method to invoke.
             request: The protobuf request object.
             timeout: Optional per-call timeout override (seconds).
+            retry_deadline: When False, a DEADLINE_EXCEEDED is treated as
+                non-retryable (UNAVAILABLE retries still apply). Use for
+                non-idempotent calls where a retry would re-run server-side
+                work. Defaults to True to preserve existing behavior.
 
         Returns:
             The protobuf response object.
@@ -298,8 +457,12 @@ class AsyncSwarnDBClient:
                 last_error = exc
                 code = exc.code()
 
+                retryable = code in _RETRYABLE_CODES
+                if not retry_deadline and code == grpc.StatusCode.DEADLINE_EXCEEDED:
+                    retryable = False
+
                 # Only retry on transient errors
-                if code in _RETRYABLE_CODES and attempt < self._max_retries:
+                if retryable and attempt < self._max_retries:
                     delay = self._retry_delay * (2 ** attempt)
                     logger.debug(
                         "Retrying async gRPC call (attempt %d/%d) after %s "
@@ -445,8 +608,9 @@ class AsyncSwarnDBClient:
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close the async gRPC channel."""
-        await self._channel.close()
+        """Close every async gRPC channel in the pool."""
+        for ch in self._channels:
+            await ch.close()
 
     async def __aenter__(self) -> AsyncSwarnDBClient:
         return self
@@ -457,7 +621,7 @@ class AsyncSwarnDBClient:
     def __repr__(self) -> str:
         return (
             f"AsyncSwarnDBClient(host={self._host!r}, port={self._port}, "
-            f"secure={self._secure})"
+            f"secure={self._secure}, channels={self._num_channels})"
         )
 
 
@@ -483,6 +647,7 @@ class AsyncCollectionAPI:
         quantization: Optional[QuantizationConfig] = None,
         m: Optional[int] = None,
         ef_construction: Optional[int] = None,
+        mode: Optional[str] = None,
     ) -> CollectionInfo:
         """Create a new collection.
 
@@ -497,12 +662,15 @@ class AsyncCollectionAPI:
                 uses its default.
             ef_construction: Optional HNSW ef_construction override. When
                 None, the server uses its default.
+            mode: Optional graph mode ("vector_only", "auto_similarity",
+                "hybrid"). When None, the server defaults to vector-only.
 
         Returns:
             CollectionInfo with the created collection's metadata.
 
         Raises:
             CollectionExistsError: If a collection with this name already exists.
+            ValueError: If mode is not a recognized value.
         """
         request = collection_pb2.CreateCollectionRequest(
             name=name,
@@ -523,6 +691,14 @@ class AsyncCollectionAPI:
             request.m = m
         if ef_construction is not None:
             request.ef_construction = ef_construction
+        if mode is not None:
+            try:
+                request.mode = _MODE_TO_PROTO[mode]
+            except KeyError:
+                raise ValueError(
+                    f"unknown mode: {mode!r}; expected one of "
+                    "'vector_only', 'auto_similarity', 'hybrid'"
+                ) from None
         await self._client._call(
             self._client._collection_stub.CreateCollection, request
         )
@@ -560,6 +736,7 @@ class AsyncCollectionAPI:
             vector_count=response.vector_count,
             default_threshold=response.default_threshold,
             quantization_type=qt,
+            indexed_count=getattr(response, 'indexed_count', 0),
         )
 
     async def delete(self, name: str) -> bool:
@@ -598,6 +775,7 @@ class AsyncCollectionAPI:
                 vector_count=c.vector_count,
                 default_threshold=c.default_threshold,
                 quantization_type=getattr(c, 'quantization_type', '') or None,
+                indexed_count=getattr(c, 'indexed_count', 0),
             )
             for c in response.collections
         ]
@@ -617,7 +795,13 @@ class AsyncCollectionAPI:
         except CollectionNotFoundError:
             return False
 
-    async def optimize(self, collection: str) -> OptimizeResult:
+    async def optimize(
+        self,
+        collection: str,
+        rebuild_graph: bool = False,
+        *,
+        timeout: Optional[float] = None,
+    ) -> OptimizeResult:
         """Rebuild deferred indexes, graph, and metadata indexes.
 
         Call this after bulk inserting with ``defer_graph=True`` or
@@ -625,6 +809,12 @@ class AsyncCollectionAPI:
 
         Args:
             collection: Collection name to optimize.
+            rebuild_graph: If True, also rebuild the virtual graph. Default False.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a multi-minute
+                index rebuild on a large collection is never cut short. An
+                explicit value is honored verbatim. This RPC is server
+                serialized and non-idempotent, so a deadline never re-issues it.
 
         Returns:
             An OptimizeResult with status, message, duration, and
@@ -633,9 +823,16 @@ class AsyncCollectionAPI:
         Raises:
             CollectionNotFoundError: If the collection does not exist.
         """
-        request = vector_pb2.OptimizeRequest(collection=collection)
+        request = vector_pb2.OptimizeRequest(
+            collection=collection,
+            rebuild_graph=rebuild_graph,
+        )
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
         response = await self._client._call(
-            self._client._vector_stub.Optimize, request
+            self._client._vector_stub.Optimize,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
         return OptimizeResult(
             status=response.status,
@@ -644,18 +841,106 @@ class AsyncCollectionAPI:
             vectors_processed=response.vectors_processed,
         )
 
-    async def snapshot(self, name: str) -> int:
+    async def prune_wal(
+        self,
+        collection: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> PruneWALResult:
+        """Prune old WAL files for a collection.
+
+        Removes write-ahead log files that are no longer needed after
+        data has been flushed to segments.
+
+        Args:
+            collection: Collection name.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a long prune on a
+                large collection is never cut short. An explicit value is
+                honored verbatim. This RPC is server serialized and
+                non-idempotent, so a deadline never re-issues it.
+        """
+        request = vector_pb2.PruneWALRequest(collection=collection)
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
+        response = await self._client._call(
+            self._client._vector_stub.PruneWAL,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
+        )
+        return PruneWALResult(
+            status=response.status,
+            files_deleted=response.files_deleted,
+            bytes_freed=response.bytes_freed,
+            duration_ms=response.duration_ms,
+        )
+
+    async def compact(
+        self,
+        collection: str,
+        min_segments: int = 0,
+        remove_deleted: bool = True,
+        *,
+        timeout: Optional[float] = None,
+    ) -> CompactResult:
+        """Compact collection segments into fewer, larger files.
+
+        Args:
+            collection: Collection name.
+            min_segments: Minimum segment count to trigger compaction. 0 = use server default (4).
+            remove_deleted: Whether to remove deleted vectors during compaction. Default True.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a multi-minute
+                compaction on a large collection is never cut short. An
+                explicit value is honored verbatim. This RPC is server
+                serialized and non-idempotent, so a deadline never re-issues it.
+        """
+        request = vector_pb2.CompactRequest(
+            collection=collection,
+            min_segments=min_segments,
+            remove_deleted=remove_deleted,
+        )
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
+        response = await self._client._call(
+            self._client._vector_stub.Compact,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
+        )
+        return CompactResult(
+            status=response.status,
+            segments_merged=response.segments_merged,
+            vectors_written=response.vectors_written,
+            vectors_removed=response.vectors_removed,
+            duration_ms=response.duration_ms,
+        )
+
+    async def snapshot(
+        self,
+        name: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> int:
         """Force a synchronous snapshot for a collection.
 
         Args:
             name: Collection name.
+            timeout: optional per-call deadline in seconds. When None
+                (default), a generous deadline is derived so a long snapshot on
+                a large collection is never cut short. An explicit value is
+                honored verbatim. This RPC is server serialized and
+                non-idempotent, so a deadline never re-issues it.
 
         Returns:
             The LSN of the snapshot just written.
         """
         request = collection_pb2.SnapshotCollectionRequest(name=name)
+        call_timeout = _maintenance_timeout(timeout, self._client._timeout)
         response = await self._client._call(
-            self._client._collection_stub.SnapshotCollection, request
+            self._client._collection_stub.SnapshotCollection,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
         return int(response.last_snapshot_lsn)
 
@@ -847,6 +1132,7 @@ class AsyncVectorAPI:
         parallel_build: bool = False,
         checkpoint_every: Optional[int] = None,
         resume_token: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> BulkInsertResult:
         """Bulk insert vectors using async streaming RPC.
 
@@ -886,6 +1172,12 @@ class AsyncVectorAPI:
             resume_token: optional, opaque token from a prior partial bulk
                 insert response; the server validates it against its
                 on-disk checkpoint and skips already-committed batches.
+            timeout: optional per-call deadline in seconds for this bulk
+                insert RPC. When None (default), the client default timeout
+                is used, preserving prior behavior. Pass a larger value for
+                large immediate-index loads that would otherwise exceed the
+                default deadline; for very large loads prefer the
+                server-side ``bulk_insert_from_path`` path instead.
 
         Returns:
             A BulkInsertResult with inserted_count and any errors.
@@ -976,10 +1268,35 @@ class AsyncVectorAPI:
         # BulkInsert is stream_unary: stream requests, get one response.
         # Cannot use _call (unary-unary), so call stub directly with retry.
         metadata = self._client._metadata()
-        call_timeout = self._client._timeout
+        # Auto-scale the deadline with the workload when the caller did not pass
+        # an explicit timeout; an explicit timeout is honored verbatim. Pass the
+        # vector dimension so high-dim loads (e.g. 1536) get a deadline that
+        # reflects their heavier per-vector cost instead of timing out early.
+        insert_dim = len(vectors[0]) if total > 0 else 0
+        call_timeout = _scaled_bulk_timeout(
+            timeout, self._client._timeout, num_vectors=total, dim=insert_dim
+        )
+
+        # Streaming bulk_insert is NOT safely retryable once a single message
+        # has left the client: the server is non-idempotent on explicit ids, so
+        # re-streaming the same ids after a partial commit collides with the
+        # committed prefix and yields a misleading inserted_count plus a wall of
+        # "already exists" errors. A DEADLINE_EXCEEDED only ever fires after
+        # streaming has begun, so it is never re-streamed. We retry ONLY genuine
+        # pre-stream transient failures (connection setup), where nothing could
+        # have been committed; the marker flips true at the first yielded
+        # message.
+        stream_started = {"v": False}
+
+        async def _marking_iter(inner: AsyncIterator) -> AsyncIterator:
+            async for item in inner:
+                stream_started["v"] = True
+                yield item
+
         last_error: Optional[grpc.RpcError] = None
 
         for attempt in range(self._client._max_retries + 1):
+            stream_started["v"] = False
             try:
                 if use_optimized_rpc:
                     logger.info(
@@ -999,13 +1316,13 @@ class AsyncVectorAPI:
                         options.resume_token,
                     )
                     response = await self._client._vector_stub.BulkInsertWithOptions(
-                        _options_request_iterator(),
+                        _marking_iter(_options_request_iterator()),
                         timeout=call_timeout,
                         metadata=metadata,
                     )
                 else:
                     response = await self._client._vector_stub.BulkInsert(
-                        _request_iterator(),
+                        _marking_iter(_request_iterator()),
                         timeout=call_timeout,
                         metadata=metadata,
                     )
@@ -1025,11 +1342,31 @@ class AsyncVectorAPI:
                 last_error = exc
                 code = exc.code()
 
-                if code in _RETRYABLE_CODES and attempt < self._client._max_retries:
+                # A deadline that still trips after auto-scaling means the load
+                # genuinely outran the deadline. Do not re-stream: surface one
+                # clear, actionable error instead of a misleading partial count.
+                if code == grpc.StatusCode.DEADLINE_EXCEEDED:
+                    raise SwarnDBError(
+                        f"bulk_insert exceeded the {call_timeout:.0f}s deadline "
+                        f"for {total} vectors. The streaming insert cannot be "
+                        "auto-retried because re-sending the same ids would "
+                        "collide with the partially committed prefix. Retry "
+                        "with a larger timeout= (or pass checkpoint_every= and "
+                        "resume with the returned resume_token), or use "
+                        "bulk_insert_from_path for very large loads."
+                    ) from exc
+
+                # Only a pre-stream transient (e.g. UNAVAILABLE during connection
+                # setup, before any message was sent) is safe to retry.
+                if (
+                    code == grpc.StatusCode.UNAVAILABLE
+                    and not stream_started["v"]
+                    and attempt < self._client._max_retries
+                ):
                     delay = self._client._retry_delay * (2 ** attempt)
                     logger.debug(
-                        "Retrying async BulkInsert (attempt %d/%d) after %s, "
-                        "backoff %.2fs",
+                        "Retrying async BulkInsert (attempt %d/%d) after "
+                        "pre-stream %s, backoff %.2fs",
                         attempt + 1,
                         self._client._max_retries,
                         code.name,
@@ -1057,6 +1394,7 @@ class AsyncVectorAPI:
         index_mode: str = "immediate",
         ef_construction: int = 0,
         chunk_size: int = 0,
+        timeout: Optional[float] = None,
     ) -> BulkInsertResult:
         """Bulk insert vectors from a server-side file via mmap.
 
@@ -1093,6 +1431,16 @@ class AsyncVectorAPI:
                 for memory-tight boxes willing to accept a slower
                 one-time load. Resume mid-call is not supported in this
                 release; callers must restart the full call on failure.
+            timeout: optional per-call deadline in seconds. When None
+                (default), the deadline is derived from a client-known
+                signal and never collapses to the bare client default: it
+                scales from ``expected_count`` when that is given, refines by
+                the on-disk file size if ``path`` happens to be locally
+                visible (a shared filesystem), and otherwise falls back to a
+                generous from-path floor so a large server-side load is not
+                cut short. An explicit value is honored verbatim. The call
+                does not retry on DEADLINE_EXCEEDED, because the server-side
+                mmap ingest is non-idempotent and a retry would re-ingest.
 
         Returns:
             A BulkInsertResult with inserted_count, assigned_ids, and
@@ -1108,6 +1456,47 @@ class AsyncVectorAPI:
                 f"got {index_mode!r}"
             )
 
+        # Derive the deadline from whatever signal the client actually has,
+        # never the bare default. An explicit timeout always wins. With
+        # expected_count we scale from the vector count (same model as the
+        # streaming path). Otherwise, if the path is locally visible (client
+        # and server share a filesystem), refine by file size. With no signal
+        # at all (the normal server-side path) we use a generous from-path
+        # floor rather than guessing, since this API is the very-large-load
+        # path and must over-provision.
+        if timeout is not None:
+            call_timeout = timeout
+        elif expected_count > 0:
+            # from-path is the very-large-load path; the server-side index
+            # build dominates and is far slower than a file read, so never let
+            # a count/byte estimate drop the deadline below the generous floor.
+            # The estimate may only raise it (for multi-million loads).
+            call_timeout = max(
+                _BULK_FROM_PATH_MIN_DEADLINE,
+                _scaled_bulk_timeout(
+                    None,
+                    self._client._timeout,
+                    num_vectors=expected_count,
+                    dim=dim if dim > 0 else None,
+                ),
+            )
+        else:
+            file_bytes: Optional[int] = None
+            try:
+                file_bytes = os.path.getsize(path)
+            except OSError:
+                file_bytes = None
+            if file_bytes is not None:
+                call_timeout = max(
+                    _BULK_FROM_PATH_MIN_DEADLINE,
+                    _scaled_bulk_timeout(
+                        None, self._client._timeout, num_bytes=file_bytes
+                    ),
+                )
+            else:
+                # No client-side signal: over-provision via the floor.
+                call_timeout = _BULK_FROM_PATH_MIN_DEADLINE
+
         request = vector_pb2.BulkInsertFromPathRequest(
             collection=collection,
             path=path,
@@ -1122,9 +1511,18 @@ class AsyncVectorAPI:
             chunk_size=chunk_size,
         )
 
+        # Do not retry DEADLINE_EXCEEDED: the server-side mmap ingest is
+        # non-idempotent, so a retry would re-ingest the file and corrupt the
+        # client-visible count. UNAVAILABLE (connection setup) may still retry.
         response = await self._client._call(
-            self._client._vector_stub.BulkInsertFromPath, request
+            self._client._vector_stub.BulkInsertFromPath,
+            request,
+            timeout=call_timeout,
+            retry_deadline=False,
         )
+        # Avoid rebuilding the full 1M id list the from-path API exists to skip:
+        # keep a plain list for small results, lazily view the proto field for
+        # large ones. inserted_count carries the count without touching ids.
         return BulkInsertResult(
             inserted_count=response.inserted_count,
             errors=list(response.errors),
@@ -1135,7 +1533,7 @@ class AsyncVectorAPI:
                 response, "last_committed_lsn", 0
             ),
             resume_token=getattr(response, "resume_token", ""),
-            assigned_ids=list(getattr(response, "assigned_ids", []) or []),
+            assigned_ids=_assigned_ids_view(response),
         )
 
 
@@ -1448,6 +1846,436 @@ class AsyncGraphAPI:
             self._client._graph_stub.SetThreshold, request
         )
         return bool(response.success)
+
+    # ── Typed graph (Hybrid mode) ──
+
+    async def put_node(
+        self,
+        collection: str,
+        *,
+        kind: str = "content",
+        label: str = "",
+        properties: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None,
+        source: str = "manual",
+        created_by: str = "",
+    ) -> int:
+        """Create a typed node (Hybrid collections only). Returns the node id."""
+        request = graph_pb2.PutNodeRequest(
+            collection=collection,
+            kind=_kind_to_proto(kind),
+            label=label,
+            properties_json=json.dumps(properties or {}),
+            embedding=list(embedding or []),
+            source=source,
+            created_by=created_by,
+        )
+        response = await self._client._call(self._client._graph_stub.PutNode, request)
+        return int(response.id)
+
+    async def get_node(self, collection: str, node_id: int) -> Optional[TypedNode]:
+        """Fetch a typed node by id, or None if absent."""
+        request = graph_pb2.GetNodeRequest(collection=collection, id=node_id)
+        response = await self._client._call(self._client._graph_stub.GetNode, request)
+        return _node_from_proto(response.node) if response.found else None
+
+    async def delete_node(self, collection: str, node_id: int) -> bool:
+        """Delete a typed node and its incident edges. True if it existed."""
+        request = graph_pb2.DeleteNodeRequest(collection=collection, id=node_id)
+        response = await self._client._call(
+            self._client._graph_stub.DeleteNode, request
+        )
+        return bool(response.deleted)
+
+    async def update_node(
+        self,
+        collection: str,
+        node_id: int,
+        *,
+        properties: Optional[Dict[str, Any]] = None,
+        actor: str = "",
+    ) -> TypedNode:
+        """Update a typed node's properties, recording an audit entry.
+
+        Only the property bag is mutable; provenance and the embedding are
+        immutable. Omitting ``properties`` leaves them unchanged.
+        """
+        request = graph_pb2.UpdateNodeRequest(
+            collection=collection,
+            node_id=node_id,
+            actor=actor,
+        )
+        if properties is not None:
+            request.properties_json = json.dumps(properties)
+        response = await self._client._call(
+            self._client._graph_stub.UpdateNode, request
+        )
+        return _node_from_proto(response.node)
+
+    async def put_edge(
+        self,
+        collection: str,
+        source: int,
+        target: int,
+        edge_type: str,
+        *,
+        properties: Optional[Dict[str, Any]] = None,
+        provenance: Optional[Dict[str, Any]] = None,
+        confidence: float = 1.0,
+        verified: bool = False,
+        is_manual: bool = True,
+        valid_from: Optional[int] = None,
+        valid_until: Optional[int] = None,
+        temporal_context: Optional[str] = None,
+    ) -> int:
+        """Create a typed edge (Hybrid collections only). Returns the edge id.
+
+        ``valid_from`` / ``valid_until`` (unix-epoch millis, ``valid_until``
+        exclusive) and ``temporal_context`` set an optional validity window and
+        regime label (P17); omit them for an always-valid, context-free edge.
+        """
+        request = graph_pb2.PutEdgeRequest(
+            collection=collection,
+            source=source,
+            target=target,
+            edge_type=edge_type,
+            properties_json=json.dumps(properties or {}),
+            provenance_json=json.dumps(provenance or {}),
+            confidence=confidence,
+            verified=verified,
+            is_manual=is_manual,
+        )
+        if valid_from is not None:
+            request.valid_from = valid_from
+        if valid_until is not None:
+            request.valid_until = valid_until
+        if temporal_context is not None:
+            request.temporal_context = temporal_context
+        response = await self._client._call(self._client._graph_stub.PutEdge, request)
+        return int(response.id)
+
+    async def get_edge(self, collection: str, edge_id: int) -> Optional[TypedEdge]:
+        """Fetch a typed edge by id, or None if absent."""
+        request = graph_pb2.GetEdgeRequest(collection=collection, id=edge_id)
+        response = await self._client._call(self._client._graph_stub.GetEdge, request)
+        return _edge_from_proto(response.edge) if response.found else None
+
+    async def delete_edge(self, collection: str, edge_id: int) -> bool:
+        """Delete a typed edge. True if it existed."""
+        request = graph_pb2.DeleteEdgeRequest(collection=collection, id=edge_id)
+        response = await self._client._call(
+            self._client._graph_stub.DeleteEdge, request
+        )
+        return bool(response.deleted)
+
+    async def list_edges(
+        self,
+        collection: str,
+        node: int,
+        *,
+        direction: str = "outgoing",
+        edge_type: str = "",
+    ) -> List[TypedEdge]:
+        """List typed edges incident to a node, optionally filtered by type."""
+        request = graph_pb2.ListEdgesRequest(
+            collection=collection,
+            node=node,
+            direction=direction,
+            edge_type=edge_type,
+        )
+        response = await self._client._call(self._client._graph_stub.ListEdges, request)
+        return [_edge_from_proto(e) for e in response.edges]
+
+    async def update_edge(
+        self,
+        collection: str,
+        edge_id: int,
+        *,
+        properties: Optional[Dict[str, Any]] = None,
+        confidence: Optional[float] = None,
+        verified: Optional[bool] = None,
+        actor: str = "",
+    ) -> TypedEdge:
+        """Update a typed edge's properties, confidence, or verified flag.
+
+        Only the supplied fields are changed; omitted fields keep their value.
+        """
+        request = graph_pb2.UpdateEdgeRequest(
+            collection=collection,
+            edge_id=edge_id,
+            actor=actor,
+        )
+        if properties is not None:
+            request.properties_json = json.dumps(properties)
+        if confidence is not None:
+            request.confidence = confidence
+        if verified is not None:
+            request.verified = verified
+        response = await self._client._call(
+            self._client._graph_stub.UpdateEdge, request
+        )
+        return _edge_from_proto(response.edge)
+
+    async def verify_edge(
+        self,
+        collection: str,
+        edge_id: int,
+        *,
+        actor: str = "",
+    ) -> TypedEdge:
+        """Mark a typed edge as verified. Returns the updated edge."""
+        request = graph_pb2.VerifyEdgeRequest(
+            collection=collection,
+            edge_id=edge_id,
+            actor=actor,
+        )
+        response = await self._client._call(
+            self._client._graph_stub.VerifyEdge, request
+        )
+        return _edge_from_proto(response.edge)
+
+    async def reject_edge(
+        self,
+        collection: str,
+        edge_id: int,
+        *,
+        actor: str = "",
+    ) -> EdgeRejectResult:
+        """Reject a typed edge, deleting it and optionally adding a rule."""
+        request = graph_pb2.RejectEdgeRequest(
+            collection=collection,
+            edge_id=edge_id,
+            actor=actor,
+        )
+        response = await self._client._call(
+            self._client._graph_stub.RejectEdge, request
+        )
+        return EdgeRejectResult(
+            deleted=bool(response.deleted),
+            rule_added=bool(response.rule_added),
+        )
+
+    async def bulk_import_edges(
+        self,
+        collection: str,
+        data: str,
+        *,
+        format: str = "csv",
+        auto_add_edge_types: bool = False,
+        actor: str = "",
+    ) -> BulkImportResult:
+        """Bulk-import typed edges from CSV or JSONL data."""
+        request = graph_pb2.BulkImportEdgesRequest(
+            collection=collection,
+            format=_bulk_import_format_to_proto(format),
+            data=data,
+            auto_add_edge_types=auto_add_edge_types,
+            actor=actor,
+        )
+        response = await self._client._call(
+            self._client._graph_stub.BulkImportEdges, request
+        )
+        return BulkImportResult(
+            total_rows=int(response.total_rows),
+            imported=int(response.imported),
+            failed=int(response.failed),
+            errors=[
+                BulkImportRowError(row=int(e.row), message=e.message)
+                for e in response.errors
+            ],
+        )
+
+    # ── Paginated whole-graph enumeration (ADR-014) ──
+
+    async def enumerate_nodes(
+        self,
+        collection: str,
+        *,
+        after_id: int = 0,
+        limit: int = 1000,
+        kind: Optional[str] = None,
+        label: str = "",
+    ) -> NodePage:
+        """Fetch one page of nodes in ascending id order (Hybrid mode)."""
+        request = graph_pb2.EnumerateNodesRequest(
+            collection=collection,
+            after_id=after_id,
+            limit=limit,
+            label=label,
+        )
+        if kind is not None:
+            request.filter_by_kind = True
+            request.kind = _kind_to_proto(kind)
+        response = await self._client._call(
+            self._client._graph_stub.EnumerateNodes, request
+        )
+        return NodePage(
+            nodes=[_node_from_proto(n) for n in response.nodes],
+            next_cursor=int(response.next_cursor),
+            has_more=bool(response.has_more),
+        )
+
+    async def enumerate_edges(
+        self,
+        collection: str,
+        *,
+        after_id: int = 0,
+        limit: int = 1000,
+        edge_type: str = "",
+    ) -> EdgePage:
+        """Fetch one page of edges in ascending id order (Hybrid mode)."""
+        request = graph_pb2.EnumerateEdgesRequest(
+            collection=collection,
+            after_id=after_id,
+            limit=limit,
+            edge_type=edge_type,
+        )
+        response = await self._client._call(
+            self._client._graph_stub.EnumerateEdges, request
+        )
+        return EdgePage(
+            edges=[_edge_from_proto(e) for e in response.edges],
+            next_cursor=int(response.next_cursor),
+            has_more=bool(response.has_more),
+        )
+
+    async def iter_nodes(
+        self,
+        collection: str,
+        *,
+        page_size: int = 1000,
+        kind: Optional[str] = None,
+        label: str = "",
+    ) -> AsyncIterator[TypedNode]:
+        """Iterate every node in the graph, walking pages to exhaustion."""
+        after = 0
+        while True:
+            page = await self.enumerate_nodes(
+                collection,
+                after_id=after,
+                limit=page_size,
+                kind=kind,
+                label=label,
+            )
+            for node in page.nodes:
+                yield node
+            if not page.has_more or page.next_cursor == 0:
+                break
+            after = page.next_cursor
+
+    async def iter_edges(
+        self,
+        collection: str,
+        *,
+        page_size: int = 1000,
+        edge_type: str = "",
+    ) -> AsyncIterator[TypedEdge]:
+        """Iterate every edge in the graph, walking pages to exhaustion."""
+        after = 0
+        while True:
+            page = await self.enumerate_edges(
+                collection,
+                after_id=after,
+                limit=page_size,
+                edge_type=edge_type,
+            )
+            for edge in page.edges:
+                yield edge
+            if not page.has_more or page.next_cursor == 0:
+                break
+            after = page.next_cursor
+
+    # ── Hybrid query engine (Hybrid mode) ──
+
+    def query(self, collection: str) -> "AsyncHybridQueryBuilder":
+        """Start a composable hybrid query against a collection.
+
+        Returns a chainable builder; finish by awaiting a terminal
+        ``return_nodes()`` / ``return_edges()`` / ``return_paths()``.
+        """
+        from swarndb.hybrid import AsyncHybridQueryBuilder
+
+        return AsyncHybridQueryBuilder(self._client, collection)
+
+    async def graph_rag(
+        self,
+        collection: str,
+        query_vector: List[float],
+        k: int = 10,
+        *,
+        fusion: str = "vector_rank",
+        mentions_edge_type: str = "mentions",
+        relation_edge_types: Optional[List[str]] = None,
+        k_hop_max: int = 2,
+        rrf_k: int = 60,
+        hub_damping: float = 0.0,
+        ef_search: Optional[int] = None,
+    ) -> "HybridQueryResult":
+        """One-call graph-aware GraphRAG retrieval (the documented composed plan).
+
+        Async twin of ``GraphAPI.graph_rag``. It composes the proven GraphRAG
+        plan for you: a vector seed expanded across the graph so the candidate
+        pool includes graph-reached passages, then ranked within that pool. The
+        composed plan is exactly::
+
+            seed = vector_similar(query_vector, k)
+            for each relation R in relation_edge_types:
+                bridge_R = vector_similar(query_vector, k)
+                            .traverse(mentions_edge_type, outgoing)
+                            .k_hop(R, max=k_hop_max)
+                            .traverse(mentions_edge_type, incoming)
+                seed = seed.union(bridge_R)
+            seed.<ranking step from fusion>.return_nodes()
+
+        When ``relation_edge_types`` is empty/None it falls back to the
+        structural form for content-to-content graphs::
+
+            seed = vector_similar(query_vector, k)
+            bridge = vector_similar(query_vector, k).k_hop(any, max=k_hop_max)
+            seed.union(bridge).<ranking step from fusion>.return_nodes()
+
+        The default ``fusion="vector_rank"`` is graph-first scope-then-rank: the
+        graph fixes the candidate pool, then the pool is ranked EXACTLY by
+        similarity to ``query_vector`` (recall 1.0, no ANN). Pass
+        ``fusion="rrf"`` to opt into Reciprocal Rank Fusion instead, which fuses
+        the vector and graph-proximity rankings and then applies ``rrf_k`` and
+        ``hub_damping``.
+
+        The graph expansion recovers gold the vector arm misses on multi-hop or
+        vector-dissimilar bridges. It is OPTIONAL value that ADDS LATENCY; plain
+        vector search stays the zero-cost default.
+
+        Example::
+
+            result = await client.graph.graph_rag(
+                "docs_graph", query_vector, k=10,
+                relation_edge_types=["CITES"],
+            )
+            for node in result.nodes:
+                print(node.id, node.label)
+
+        Args mirror ``GraphAPI.graph_rag`` (including ``fusion``: "vector_rank"
+        default, "rrf" to opt in). Returns a HybridQueryResult whose ``nodes``
+        hold the ranked top-k.
+        """
+        from swarndb.hybrid import AsyncHybridQueryBuilder, compose_graph_rag
+
+        seed = AsyncHybridQueryBuilder(self._client, collection)
+        bridge = AsyncHybridQueryBuilder(self._client, collection)
+        composed = compose_graph_rag(
+            seed,
+            bridge,
+            query_vector,
+            k,
+            fusion=fusion,
+            mentions_edge_type=mentions_edge_type,
+            relation_edge_types=relation_edge_types,
+            k_hop_max=k_hop_max,
+            rrf_k=rrf_k,
+            hub_damping=hub_damping,
+            ef_search=ef_search,
+        )
+        return await composed.return_nodes()
 
 
 # ---------------------------------------------------------------------------

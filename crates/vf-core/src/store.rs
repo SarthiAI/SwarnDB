@@ -115,6 +115,28 @@ impl InMemoryVectorStore {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Allocate an id from the single per-collection id authority WITHOUT
+    /// inserting a record. The returned id is not present in `vectors`, so
+    /// `contains(id)` stays false for it. Used to hand entity node ids out of
+    /// the same counter as vector/content ids so the two spaces never collide.
+    pub fn alloc_id(&self) -> VectorId {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Raise the id authority to at least `floor` (lock-free CAS, same pattern
+    /// as `insert`/`insert_metadata`). A no-op when the authority already sits
+    /// at or above `floor`. Used at recovery to seed the authority above the
+    /// max of all vector ids AND all surviving graph node ids.
+    pub fn bump_floor(&self, floor: VectorId) {
+        let mut current = self.next_id.load(Ordering::Relaxed);
+        while floor > current {
+            match self.next_id.compare_exchange_weak(current, floor, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Insert a vector with an explicit ID.
     /// Returns error if ID already exists or dimension doesn't match.
     pub fn insert(&self, record: VectorRecord) -> Result<(), StoreError> {

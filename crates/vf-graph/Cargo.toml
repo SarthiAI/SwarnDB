@@ -11,6 +11,7 @@ description = "Virtual graph layer for similarity-based vector relationships in 
 vf-core = { path = "../vf-core" }
 vf-index = { path = "../vf-index" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
@@ -18,6 +19,7 @@ log = { workspace = true }
 lz4_flex = { workspace = true }
 crc32fast = { workspace = true }
 rayon = { workspace = true }
+metrics = "0.24"
 
 [dev-dependencies]
 rand = { workspace = true }

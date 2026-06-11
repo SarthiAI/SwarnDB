@@ -7,7 +7,7 @@ the SwarnDB gRPC API.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,141 @@ class GraphEdge:
 
     target_id: int
     similarity: float
+
+
+@dataclass(frozen=True)
+class NodeAudit:
+    """A single entry in a typed node's audit trail (Hybrid mode)."""
+
+    action: str
+    actor: str = ""
+    at: int = 0
+
+
+@dataclass(frozen=True)
+class TypedNode:
+    """A node in the first-class typed graph (Hybrid mode)."""
+
+    id: int
+    kind: str  # "content" or "entity"
+    label: str = ""
+    properties: Dict[str, Any] = field(default_factory=dict)
+    embedding: List[float] = field(default_factory=list)
+    source: str = "manual"
+    created_at: int = 0
+    created_by: str = ""
+    history: List[NodeAudit] = field(default_factory=list)
+    updated_at: int = 0
+
+
+@dataclass(frozen=True)
+class EdgeAudit:
+    """A single entry in a typed edge's audit trail (Hybrid mode)."""
+
+    action: str
+    actor: str = ""
+    at: int = 0
+
+
+@dataclass(frozen=True)
+class TypedEdge:
+    """A typed, directed edge in the first-class graph (Hybrid mode)."""
+
+    id: int
+    source: int
+    target: int
+    edge_type: str
+    properties: Dict[str, Any] = field(default_factory=dict)
+    provenance: Dict[str, Any] = field(default_factory=dict)
+    confidence: float = 1.0
+    verified: bool = False
+    is_manual: bool = False
+    created_at: int = 0
+    history: List[EdgeAudit] = field(default_factory=list)
+    # Temporal validity window + context (P17). None = unbounded / no context.
+    valid_from: Optional[int] = None
+    valid_until: Optional[int] = None
+    temporal_context: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class NodePage:
+    """One page of a paginated whole-graph node enumeration (ADR-014)."""
+
+    nodes: List["TypedNode"] = field(default_factory=list)
+    # Pass as ``after_id`` to fetch the next page; 0 when exhausted.
+    next_cursor: int = 0
+    has_more: bool = False
+
+
+@dataclass(frozen=True)
+class EdgePage:
+    """One page of a paginated whole-graph edge enumeration (ADR-014)."""
+
+    edges: List["TypedEdge"] = field(default_factory=list)
+    # Pass as ``after_id`` to fetch the next page; 0 when exhausted.
+    next_cursor: int = 0
+    has_more: bool = False
+
+
+@dataclass(frozen=True)
+class EdgeRejectResult:
+    """Result of rejecting a typed edge (Hybrid mode)."""
+
+    deleted: bool
+    rule_added: bool
+
+
+@dataclass(frozen=True)
+class BulkImportRowError:
+    """A per-row failure from a bulk edge import (Hybrid mode)."""
+
+    row: int
+    message: str
+
+
+@dataclass(frozen=True)
+class BulkImportResult:
+    """Result of a bulk edge import (Hybrid mode)."""
+
+    total_rows: int
+    imported: int
+    failed: int
+    errors: List[BulkImportRowError] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ChunkDiff:
+    """A per-chunk diff result from a document re-extraction (Hybrid mode)."""
+
+    chunk_id: int
+    action: str  # "unchanged" | "changed" | "new" | "deleted"
+
+
+@dataclass(frozen=True)
+class ReextractSummary:
+    """Summary of a document re-extraction run (Hybrid mode)."""
+
+    job_id: str = ""
+    unchanged: int = 0
+    changed: int = 0
+    added: int = 0
+    deleted: int = 0
+    edges_deleted: int = 0
+    nodes_deleted: int = 0
+
+
+@dataclass(frozen=True)
+class HybridQueryResult:
+    """Result of a hybrid graph query (Hybrid mode).
+
+    Exactly one of ``nodes``, ``edges``, or ``paths`` is populated,
+    depending on the terminal return kind requested on the builder.
+    """
+
+    nodes: List["TypedNode"] = field(default_factory=list)
+    edges: List["TypedEdge"] = field(default_factory=list)
+    paths: List[List[int]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -63,6 +198,9 @@ class CollectionInfo:
     vector_count: int
     default_threshold: float
     quantization_type: Optional[str] = None
+    # Live HNSW index node count. May trail vector_count when an index build is
+    # deferred or pending optimization; vector_count is the stored-row count.
+    indexed_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -308,3 +446,166 @@ class HealthStatus:
     healthy: bool
     status: str
     checks: Dict[str, str] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Extraction (LLM-driven, Hybrid mode only)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """A client-supplied unit of extraction.
+
+    The embedding is optional and is used only for entity dedup when present.
+    """
+
+    doc_id: str
+    chunk_id: int
+    text: str
+    embedding: Tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class LlmConfigInfo:
+    """Redacted view of a collection's LLM config; never carries the api key."""
+
+    base_url: str
+    model_name: str
+    temperature: float
+    max_tokens: int
+    timeout_seconds: int
+    api_key_set: bool
+
+
+@dataclass(frozen=True)
+class EntityLabel:
+    """An ontology entity label."""
+
+    label: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class EdgeType:
+    """An ontology edge type with optional endpoint label constraints."""
+
+    edge_type: str
+    description: str = ""
+    source_labels: List[str] = field(default_factory=list)
+    target_labels: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class OntologyInfo:
+    """A collection's extraction ontology."""
+
+    entity_labels: List[EntityLabel] = field(default_factory=list)
+    edge_types: List[EdgeType] = field(default_factory=list)
+    # Custom prompt fields; None means the default prompt is used.
+    system_prompt: Optional[str] = None
+    extra_guidance: Optional[str] = None
+    # Opt-in passage-to-entity linking for GraphRAG (ADR-012).
+    link_passages: bool = False
+    # Entity-resolution mode (ADR-020): "normalized" (default) or "fuzzy".
+    entity_resolution: str = "normalized"
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    """Estimated token usage and cost for an extraction run."""
+
+    chunks: int
+    estimated_input_tokens: int
+    estimated_output_tokens: int
+    estimated_cost_usd: float
+    model: str
+    pricing_known: bool
+
+
+@dataclass(frozen=True)
+class ChunkError:
+    """One per-chunk extraction failure from a partially-successful job."""
+
+    doc_id: str
+    chunk_id: int
+    error: str
+
+
+@dataclass(frozen=True)
+class ExtractionJob:
+    """A snapshot of an extraction job's progress."""
+
+    job_id: str
+    collection: str
+    state: str  # queued | running | completed | completed_with_errors | failed | cancelled
+    total_chunks: int = 0
+    processed_chunks: int = 0
+    entities_written: int = 0
+    edges_written: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    error: str = ""
+    failed_chunks: int = 0
+    chunk_errors: List[ChunkError] = field(default_factory=list)
+    # Area 4: post-job cost actuals. Cache hits cost zero tokens; actual_cost_usd
+    # is 0.0 when the model's pricing is unknown (never fabricated).
+    actual_input_tokens: int = 0
+    actual_output_tokens: int = 0
+    actual_cost_usd: float = 0.0
+    # True only while every priced LLM call reported its own usage; False once
+    # any call's tokens had to be estimated locally.
+    usage_provider_reported: bool = True
+
+
+@dataclass(frozen=True)
+class CorpusDocProgress:
+    """Per-document progress within a corpus re-extraction run (Hybrid mode)."""
+
+    doc_id: str
+    state: str  # pending | completed | completed_with_errors | failed | skipped
+    job_id: str = ""
+    changed: int = 0
+    added: int = 0
+    deleted: int = 0
+
+
+@dataclass(frozen=True)
+class CorpusReextractionStatus:
+    """Master status of a corpus re-extraction job (Hybrid mode).
+
+    The ``corpus_job_id`` doubles as the resume token: re-issuing
+    ``start_corpus_reextraction`` with it continues the run and skips documents
+    already completed.
+    """
+
+    corpus_job_id: str
+    collection: str
+    state: str  # queued | running | completed | completed_with_errors | failed | cancelled
+    total_documents: int = 0
+    processed_documents: int = 0
+    failed_documents: int = 0
+    skipped_documents: int = 0
+    changed_chunks: int = 0
+    added_chunks: int = 0
+    deleted_chunks: int = 0
+    edges_deleted: int = 0
+    nodes_deleted: int = 0
+    entities_written: int = 0
+    edges_written: int = 0
+    documents: List[CorpusDocProgress] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class OntologyProposal:
+    """A proposed ontology entity label or edge type awaiting review."""
+
+    id: str
+    kind: str  # entity_label | edge_type
+    name: str
+    description: str = ""
+    examples: List[str] = field(default_factory=list)
+    status: str = "pending"  # pending | approved | rejected
+    source_doc: str = ""
+    source_chunk_id: int = 0

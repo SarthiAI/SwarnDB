@@ -107,6 +107,10 @@ pub struct CollectionConfig {
     pub data_type: DataTypeConfig,
     /// Optional quantization configuration for memory-efficient search
     pub quantization_config: Option<QuantizationConfig>,
+    /// Graph mode. `None` means a legacy config that predates modes; the load-time
+    /// resolver maps it to AutoSimilarity. Serde default keeps legacy config.json loading.
+    #[serde(default)]
+    pub mode: Option<Mode>,
 }
 
 impl Default for CollectionConfig {
@@ -119,8 +123,35 @@ impl Default for CollectionConfig {
             max_vectors: 0,
             data_type: DataTypeConfig::F32,
             quantization_config: None,
+            mode: Some(Mode::VectorOnly),
         }
     }
+}
+
+impl CollectionConfig {
+    /// Effective graph mode. Absence resolves to AutoSimilarity to preserve legacy behavior.
+    pub fn effective_mode(&self) -> Mode {
+        self.mode.unwrap_or(Mode::AutoSimilarity)
+    }
+
+    /// True when this collection serves a graph (AutoSimilarity or Hybrid).
+    pub fn graph_enabled(&self) -> bool {
+        self.effective_mode() != Mode::VectorOnly
+    }
+
+    /// True only for an explicit vector-only collection.
+    pub fn is_vector_only(&self) -> bool {
+        self.effective_mode() == Mode::VectorOnly
+    }
+}
+
+/// Per-collection graph mode. Absent on disk means "predates modes".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    VectorOnly,
+    AutoSimilarity,
+    Hybrid,
 }
 
 /// Distance metric type identifier (serializable, used in config)

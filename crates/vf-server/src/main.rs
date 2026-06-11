@@ -6,6 +6,25 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
+// ADR-025: jemalloc as the global allocator so freed pages return to the OS
+// after a bulk load. Gated to non-MSVC x86_64 / aarch64; the system allocator
+// is kept everywhere else.
+#[cfg(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+// Bake the decay config so a correct setting ships even when no env var is set.
+// The symbol is prefixed `_rjem_` because unprefixing is not enabled. Operators
+// may still override at runtime via MALLOC_CONF and _RJEM_MALLOC_CONF.
+#[cfg(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static _rjem_malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 use axum::middleware;
 use axum::routing::get;
 use axum::Router;
@@ -15,6 +34,7 @@ use tonic::transport::Server as TonicServer;
 use vf_server::auth::{api_key_auth, AuthState};
 use vf_server::config::ServerConfig;
 use vf_server::grpc_collection::CollectionServiceImpl;
+use vf_server::grpc_extraction::ExtractionServiceImpl;
 use vf_server::grpc_graph::GraphServiceImpl;
 use vf_server::grpc_search::SearchServiceImpl;
 use vf_server::grpc_vector::VectorServiceImpl;
@@ -23,6 +43,7 @@ use vf_server::health::health_router;
 use vf_server::logging::init_logging;
 use vf_server::metrics::{metrics_handler, setup_metrics};
 use vf_server::proto::swarndb::v1::collection_service_server::CollectionServiceServer;
+use vf_server::proto::swarndb::v1::extraction_service_server::ExtractionServiceServer;
 use vf_server::proto::swarndb::v1::graph_service_server::GraphServiceServer;
 use vf_server::proto::swarndb::v1::search_service_server::SearchServiceServer;
 use vf_server::proto::swarndb::v1::vector_math_service_server::VectorMathServiceServer;
@@ -46,6 +67,30 @@ async fn main() {
         data_dir = %config.data_dir,
         "SwarnDB server starting"
     );
+
+    // F3: cap the global rayon pool below the core count so a parallel index
+    // build cannot starve the async runtime that serves /healthz and /readyz.
+    // Every bulk-build par_iter runs on this pool, so capping it here bounds the
+    // build's parallelism. Reserve is configurable; default holds back 1 core.
+    let total_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let build_threads = total_cores.saturating_sub(config.index_build_core_reserve).max(1);
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(build_threads)
+        .thread_name(|i| format!("index-build-{}", i))
+        .build_global()
+    {
+        Ok(()) => tracing::info!(
+            total_cores,
+            reserved = config.index_build_core_reserve,
+            build_threads,
+            "global build pool capped to keep probes responsive"
+        ),
+        Err(e) => tracing::warn!(
+            "could not cap the global build pool ({e}); using rayon defaults"
+        ),
+    }
 
     // 3. Acquire data directory lock (prevents dual instances)
     let _data_lock = vf_storage::file_lock::ProcessLock::acquire(
@@ -92,21 +137,39 @@ async fn main() {
     let max_batch_lock_size = config.max_batch_lock_size;
     let max_wal_flush_interval = config.max_wal_flush_interval;
     let max_ef_construction = config.max_ef_construction;
+    // ADR-013: raise the per-service gRPC decode/encode caps off tonic's 4 MB
+    // default so large extraction submissions are accepted up to this bound.
+    let max_msg = config.max_grpc_message_bytes;
     let grpc_handle = tokio::spawn(async move {
         tracing::info!(%grpc_addr, "gRPC server listening");
 
         let collection_svc =
-            CollectionServiceServer::new(CollectionServiceImpl::new(grpc_state.clone()));
+            CollectionServiceServer::new(CollectionServiceImpl::new(grpc_state.clone()))
+                .max_decoding_message_size(max_msg)
+                .max_encoding_message_size(max_msg);
         let vector_svc = VectorServiceServer::new(VectorServiceImpl::new(
             grpc_state.clone(),
             max_batch_lock_size,
             max_wal_flush_interval,
             max_ef_construction,
-        ));
-        let search_svc = SearchServiceServer::new(SearchServiceImpl::new(grpc_state.clone(), max_ef_search));
-        let graph_svc = GraphServiceServer::new(GraphServiceImpl::new(grpc_state.clone()));
+        ))
+        .max_decoding_message_size(max_msg)
+        .max_encoding_message_size(max_msg);
+        let search_svc =
+            SearchServiceServer::new(SearchServiceImpl::new(grpc_state.clone(), max_ef_search))
+                .max_decoding_message_size(max_msg)
+                .max_encoding_message_size(max_msg);
+        let graph_svc = GraphServiceServer::new(GraphServiceImpl::new(grpc_state.clone()))
+            .max_decoding_message_size(max_msg)
+            .max_encoding_message_size(max_msg);
         let vector_math_svc =
-            VectorMathServiceServer::new(VectorMathServiceImpl::new(grpc_state.clone()));
+            VectorMathServiceServer::new(VectorMathServiceImpl::new(grpc_state.clone()))
+                .max_decoding_message_size(max_msg)
+                .max_encoding_message_size(max_msg);
+        let extraction_svc =
+            ExtractionServiceServer::new(ExtractionServiceImpl::new(grpc_state.clone()))
+                .max_decoding_message_size(max_msg)
+                .max_encoding_message_size(max_msg);
 
         if let Err(e) = TonicServer::builder()
             .add_service(collection_svc)
@@ -114,6 +177,7 @@ async fn main() {
             .add_service(search_svc)
             .add_service(graph_svc)
             .add_service(vector_math_svc)
+            .add_service(extraction_svc)
             .serve(grpc_addr)
             .await
         {
@@ -233,6 +297,11 @@ async fn main() {
         None
     };
 
+    // 10b. Start the extraction worker pool. It consumes the shared job queue
+    //      and drains on the same shutdown watch as the other background tasks.
+    let extraction_shutdown_rx = shutdown_signal.subscribe();
+    let extraction_handle = state.extraction.spawn_workers(extraction_shutdown_rx);
+
     // 11. Wait for shutdown signal
     wait_for_shutdown().await;
 
@@ -245,6 +314,9 @@ async fn main() {
     if let Some(handle) = wal_prune_handle {
         let _ = handle.await;
     }
+    // Drain the extraction worker pool so any in-flight job's graph writes and
+    // delta syncs complete before the collections are flushed below.
+    let _ = extraction_handle.await;
 
     // Abort server tasks
     // Note: recovery handle is dropped on shutdown; partial loads are discarded.

@@ -7,7 +7,9 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::convert::{build_hnsw_params, distance_metric_to_string, parse_distance_metric};
+use crate::convert::{
+    build_hnsw_params, distance_metric_to_string, parse_distance_metric, proto_mode_to_core,
+};
 use crate::proto::swarndb::v1::collection_service_server::CollectionService;
 use crate::proto::swarndb::v1::{
     CollectionRecoveryEntry, CreateCollectionRequest, CreateCollectionResponse,
@@ -21,6 +23,7 @@ use crate::snapshot::force_snapshot_collection;
 use crate::state::{
     metered_read, AppState, CollectionAvailability, CollectionState, MetadataCache, RecoveryStatus,
 };
+use crate::validation::{validate_collection_name, ValidationConfig};
 
 /// Convert a `CollectionAvailability` returned by the readiness guard into a
 /// `tonic::Status`. Recovering collections become `Unavailable` (503-equivalent
@@ -59,8 +62,11 @@ impl CollectionService for CollectionServiceImpl {
     ) -> Result<Response<CreateCollectionResponse>, Status> {
         let req = request.into_inner();
 
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("collection name must not be empty"));
+        // Full name validation (length, charset, reserved-name rejection) so the
+        // gRPC path cannot bypass the rules enforced on the REST path. Covers the
+        // empty-name case and the reserved leading-underscore namespace.
+        if let Err(e) = validate_collection_name(&req.name, &ValidationConfig::default()) {
+            return Err(Status::invalid_argument(e.to_string()));
         }
         if req.dimension == 0 {
             return Err(Status::invalid_argument("dimension must be greater than 0"));
@@ -104,6 +110,7 @@ impl CollectionService for CollectionServiceImpl {
             max_vectors: req.max_vectors as usize,
             data_type: DataTypeConfig::F32,
             quantization_config,
+            mode: Some(proto_mode_to_core(req.mode())),
         };
 
         // Check for duplicate in-memory BEFORE persisting to storage
@@ -178,12 +185,24 @@ impl CollectionService for CollectionServiceImpl {
             None => VirtualGraph::with_threshold(0.7, distance_metric),
         };
 
+        // Typed graph store for Hybrid collections (ADR-007 R4); None otherwise.
+        let graph_store = {
+            let dir = {
+                let cm = self.state.collection_manager.read();
+                cm.get_collection(&req.name)
+                    .map(|c| c.collection_dir().to_path_buf())
+                    .ok()
+            };
+            dir.and_then(|d| crate::state::AppState::create_hybrid_graph_store(&d, &config))
+        };
+
         let collection_state = CollectionState {
             config,
             store,
             index,
             index_manager,
             graph,
+            graph_store,
             metadata_cache: MetadataCache::new(),
             status: std::sync::Arc::new(std::sync::RwLock::new(
                 crate::state::CollectionStatus::Ready,
@@ -201,11 +220,17 @@ impl CollectionService for CollectionServiceImpl {
         // Map write lock is required to insert a new collection entry. The
         // CollectionState is wrapped in a per-collection RwLock so all later
         // mutation paths can run under the per-collection lock alone.
-        let mut collections = self.state.collections.write();
-        collections.insert(
-            req.name.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(collection_state)),
-        );
+        {
+            let mut collections = self.state.collections.write();
+            collections.insert(
+                req.name.clone(),
+                std::sync::Arc::new(parking_lot::RwLock::new(collection_state)),
+            );
+        }
+
+        // Register the extraction runtime for Hybrid collections now that the
+        // handle is published. A no-op for VectorOnly / AutoSimilarity.
+        self.state.register_extraction_if_hybrid(&req.name);
 
         Ok(Response::new(CreateCollectionResponse {
             name: req.name,
@@ -224,6 +249,11 @@ impl CollectionService for CollectionServiceImpl {
         self.state
             .require_collection_ready(&req.name)
             .map_err(status_from_availability)?;
+
+        // Cancel any in-flight extraction jobs for this collection and drop its
+        // extraction runtime, so a dropped collection never leaves a runaway job
+        // (ADR-016). Cooperative cancel: workers drain and skip its chunks.
+        self.state.extraction.cancel_collection_jobs(&req.name);
 
         // Remove from storage layer
         {
@@ -278,6 +308,8 @@ impl CollectionService for CollectionServiceImpl {
             default_threshold: coll.config.default_similarity_threshold.unwrap_or(0.0),
             status: status_str,
             quantization_type,
+            // Live index node count; may trail vector_count under a deferred build.
+            indexed_count: coll.index.len() as u64,
         }))
     }
 
@@ -310,6 +342,8 @@ impl CollectionService for CollectionServiceImpl {
                     default_threshold: coll.config.default_similarity_threshold.unwrap_or(0.0),
                     status: status_str,
                     quantization_type,
+                    // Live index node count; may trail vector_count under a deferred build.
+                    indexed_count: coll.index.len() as u64,
                 }
             })
             .collect();

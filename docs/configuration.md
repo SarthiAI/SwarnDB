@@ -138,6 +138,43 @@ SwarnDB persists collections to disk through a write-ahead log plus periodic sna
 
 ---
 
+## 8a. Extraction Configuration
+
+These variables apply to hybrid collections that use LLM extraction. See [LLM Extraction](llm-extraction.md) for the feature itself.
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `SWARNDB_MASTER_KEY` | *(empty)* | string | Base64 encoding of 32 random bytes. Used to seal LLM api keys at rest. Required to save extraction config; if it is unset or invalid, extraction api keys cannot be stored and extraction config cannot be saved. |
+| `SWARNDB_EXTRACTION_WORKER_CONCURRENCY` | `4` | usize | Number of extraction worker tasks processing chunks in parallel. |
+| `SWARNDB_EXTRACTION_CACHE_MAX_ENTRIES` | `10000` | usize | Maximum entries in the extraction result cache, keyed by chunk hash plus model plus prompt version. |
+| `SWARNDB_EXTRACTION_PRICING_PATH` | *(empty)* | string | Path to a model-pricing file used to turn token estimates into a dollar figure in cost previews. When unset, cost previews still report token counts but mark pricing as unknown. |
+
+Generate a master key with, for example:
+
+```bash
+openssl rand -base64 32
+```
+
+---
+
+## 8b. Observability and Metrics
+
+SwarnDB exposes Prometheus-format metrics at `GET /metrics` (no authentication required). See the [API Reference](api-reference.md) for the endpoint.
+
+Metrics are published per layer so you can watch each part of the system independently:
+
+- **Vector layer**: vector search latency.
+- **Graph layer**: graph edge writes, adjacency-cache behavior, and hybrid-query latency.
+- **Extraction layer**: LLM calls, tokens, errors, queue depth, worker utilization, cache hit rate, and truncation auto-retries.
+
+Selected extraction metrics:
+
+| Metric | Description |
+|--------|-------------|
+| `swarndb_extraction_truncation_retries_total` | Count of chunks whose LLM reply was cut off at the token limit and were automatically retried once with a higher output budget. |
+
+---
+
 ## 9. Setting Configuration
 
 ### Via Docker run

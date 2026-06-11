@@ -5,7 +5,7 @@ import warnings
 
 from . import graph_pb2 as swarndb_dot_v1_dot_graph__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.74.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in swarndb/v1/graph_pb2_grpc.py depends on'
+        + f' but the generated code in swarndb/v1/graph_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -49,6 +49,81 @@ class GraphServiceStub(object):
                 request_serializer=swarndb_dot_v1_dot_graph__pb2.SetThresholdRequest.SerializeToString,
                 response_deserializer=swarndb_dot_v1_dot_graph__pb2.SetThresholdResponse.FromString,
                 _registered_method=True)
+        self.PutNode = channel.unary_unary(
+                '/swarndb.v1.GraphService/PutNode',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.PutNodeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.PutNodeResponse.FromString,
+                _registered_method=True)
+        self.GetNode = channel.unary_unary(
+                '/swarndb.v1.GraphService/GetNode',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.GetNodeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.GetNodeResponse.FromString,
+                _registered_method=True)
+        self.DeleteNode = channel.unary_unary(
+                '/swarndb.v1.GraphService/DeleteNode',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.DeleteNodeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.DeleteNodeResponse.FromString,
+                _registered_method=True)
+        self.PutEdge = channel.unary_unary(
+                '/swarndb.v1.GraphService/PutEdge',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.PutEdgeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.PutEdgeResponse.FromString,
+                _registered_method=True)
+        self.GetEdge = channel.unary_unary(
+                '/swarndb.v1.GraphService/GetEdge',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.GetEdgeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.GetEdgeResponse.FromString,
+                _registered_method=True)
+        self.DeleteEdge = channel.unary_unary(
+                '/swarndb.v1.GraphService/DeleteEdge',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.DeleteEdgeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.DeleteEdgeResponse.FromString,
+                _registered_method=True)
+        self.ListEdges = channel.unary_unary(
+                '/swarndb.v1.GraphService/ListEdges',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.ListEdgesRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.ListEdgesResponse.FromString,
+                _registered_method=True)
+        self.HybridQuery = channel.unary_unary(
+                '/swarndb.v1.GraphService/HybridQuery',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.HybridQueryRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.HybridQueryResponse.FromString,
+                _registered_method=True)
+        self.UpdateNode = channel.unary_unary(
+                '/swarndb.v1.GraphService/UpdateNode',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.UpdateNodeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.UpdateNodeResponse.FromString,
+                _registered_method=True)
+        self.UpdateEdge = channel.unary_unary(
+                '/swarndb.v1.GraphService/UpdateEdge',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.UpdateEdgeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.UpdateEdgeResponse.FromString,
+                _registered_method=True)
+        self.VerifyEdge = channel.unary_unary(
+                '/swarndb.v1.GraphService/VerifyEdge',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.VerifyEdgeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.VerifyEdgeResponse.FromString,
+                _registered_method=True)
+        self.RejectEdge = channel.unary_unary(
+                '/swarndb.v1.GraphService/RejectEdge',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.RejectEdgeRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.RejectEdgeResponse.FromString,
+                _registered_method=True)
+        self.BulkImportEdges = channel.unary_unary(
+                '/swarndb.v1.GraphService/BulkImportEdges',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.BulkImportEdgesRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.BulkImportEdgesResponse.FromString,
+                _registered_method=True)
+        self.EnumerateNodes = channel.unary_unary(
+                '/swarndb.v1.GraphService/EnumerateNodes',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.EnumerateNodesRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.EnumerateNodesResponse.FromString,
+                _registered_method=True)
+        self.EnumerateEdges = channel.unary_unary(
+                '/swarndb.v1.GraphService/EnumerateEdges',
+                request_serializer=swarndb_dot_v1_dot_graph__pb2.EnumerateEdgesRequest.SerializeToString,
+                response_deserializer=swarndb_dot_v1_dot_graph__pb2.EnumerateEdgesResponse.FromString,
+                _registered_method=True)
 
 
 class GraphServiceServicer(object):
@@ -72,6 +147,102 @@ class GraphServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PutNode(self, request, context):
+        """Typed graph (Hybrid mode). Additive RPCs only; the three above and all
+        existing field numbers are frozen (ADR-007 R5).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetNode(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteNode(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PutEdge(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetEdge(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteEdge(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListEdges(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HybridQuery(self, request, context):
+        """Hybrid query engine (P02). Additive; all field numbers fresh.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateNode(self, request, context):
+        """P16. Additive mutable-node update (properties + audit trail).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateEdge(self, request, context):
+        """P04. Additive manual-edge lifecycle and bulk import.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def VerifyEdge(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RejectEdge(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def BulkImportEdges(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def EnumerateNodes(self, request, context):
+        """ADR-014. Paginated whole-graph enumeration, cursor over sorted ids.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def EnumerateEdges(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_GraphServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -89,6 +260,81 @@ def add_GraphServiceServicer_to_server(servicer, server):
                     servicer.SetThreshold,
                     request_deserializer=swarndb_dot_v1_dot_graph__pb2.SetThresholdRequest.FromString,
                     response_serializer=swarndb_dot_v1_dot_graph__pb2.SetThresholdResponse.SerializeToString,
+            ),
+            'PutNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.PutNode,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.PutNodeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.PutNodeResponse.SerializeToString,
+            ),
+            'GetNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetNode,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.GetNodeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.GetNodeResponse.SerializeToString,
+            ),
+            'DeleteNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteNode,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.DeleteNodeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.DeleteNodeResponse.SerializeToString,
+            ),
+            'PutEdge': grpc.unary_unary_rpc_method_handler(
+                    servicer.PutEdge,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.PutEdgeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.PutEdgeResponse.SerializeToString,
+            ),
+            'GetEdge': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetEdge,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.GetEdgeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.GetEdgeResponse.SerializeToString,
+            ),
+            'DeleteEdge': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteEdge,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.DeleteEdgeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.DeleteEdgeResponse.SerializeToString,
+            ),
+            'ListEdges': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListEdges,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.ListEdgesRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.ListEdgesResponse.SerializeToString,
+            ),
+            'HybridQuery': grpc.unary_unary_rpc_method_handler(
+                    servicer.HybridQuery,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.HybridQueryRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.HybridQueryResponse.SerializeToString,
+            ),
+            'UpdateNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateNode,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.UpdateNodeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.UpdateNodeResponse.SerializeToString,
+            ),
+            'UpdateEdge': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateEdge,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.UpdateEdgeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.UpdateEdgeResponse.SerializeToString,
+            ),
+            'VerifyEdge': grpc.unary_unary_rpc_method_handler(
+                    servicer.VerifyEdge,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.VerifyEdgeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.VerifyEdgeResponse.SerializeToString,
+            ),
+            'RejectEdge': grpc.unary_unary_rpc_method_handler(
+                    servicer.RejectEdge,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.RejectEdgeRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.RejectEdgeResponse.SerializeToString,
+            ),
+            'BulkImportEdges': grpc.unary_unary_rpc_method_handler(
+                    servicer.BulkImportEdges,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.BulkImportEdgesRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.BulkImportEdgesResponse.SerializeToString,
+            ),
+            'EnumerateNodes': grpc.unary_unary_rpc_method_handler(
+                    servicer.EnumerateNodes,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.EnumerateNodesRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.EnumerateNodesResponse.SerializeToString,
+            ),
+            'EnumerateEdges': grpc.unary_unary_rpc_method_handler(
+                    servicer.EnumerateEdges,
+                    request_deserializer=swarndb_dot_v1_dot_graph__pb2.EnumerateEdgesRequest.FromString,
+                    response_serializer=swarndb_dot_v1_dot_graph__pb2.EnumerateEdgesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -172,6 +418,411 @@ class GraphService(object):
             '/swarndb.v1.GraphService/SetThreshold',
             swarndb_dot_v1_dot_graph__pb2.SetThresholdRequest.SerializeToString,
             swarndb_dot_v1_dot_graph__pb2.SetThresholdResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PutNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/PutNode',
+            swarndb_dot_v1_dot_graph__pb2.PutNodeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.PutNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/GetNode',
+            swarndb_dot_v1_dot_graph__pb2.GetNodeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.GetNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/DeleteNode',
+            swarndb_dot_v1_dot_graph__pb2.DeleteNodeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.DeleteNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PutEdge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/PutEdge',
+            swarndb_dot_v1_dot_graph__pb2.PutEdgeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.PutEdgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetEdge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/GetEdge',
+            swarndb_dot_v1_dot_graph__pb2.GetEdgeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.GetEdgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteEdge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/DeleteEdge',
+            swarndb_dot_v1_dot_graph__pb2.DeleteEdgeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.DeleteEdgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListEdges(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/ListEdges',
+            swarndb_dot_v1_dot_graph__pb2.ListEdgesRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.ListEdgesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HybridQuery(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/HybridQuery',
+            swarndb_dot_v1_dot_graph__pb2.HybridQueryRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.HybridQueryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/UpdateNode',
+            swarndb_dot_v1_dot_graph__pb2.UpdateNodeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.UpdateNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateEdge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/UpdateEdge',
+            swarndb_dot_v1_dot_graph__pb2.UpdateEdgeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.UpdateEdgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def VerifyEdge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/VerifyEdge',
+            swarndb_dot_v1_dot_graph__pb2.VerifyEdgeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.VerifyEdgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RejectEdge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/RejectEdge',
+            swarndb_dot_v1_dot_graph__pb2.RejectEdgeRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.RejectEdgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BulkImportEdges(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/BulkImportEdges',
+            swarndb_dot_v1_dot_graph__pb2.BulkImportEdgesRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.BulkImportEdgesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EnumerateNodes(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/EnumerateNodes',
+            swarndb_dot_v1_dot_graph__pb2.EnumerateNodesRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.EnumerateNodesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EnumerateEdges(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/swarndb.v1.GraphService/EnumerateEdges',
+            swarndb_dot_v1_dot_graph__pb2.EnumerateEdgesRequest.SerializeToString,
+            swarndb_dot_v1_dot_graph__pb2.EnumerateEdgesResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -7,6 +7,7 @@ members = [
     "crates/vf-query",
     "crates/vf-quantization",
     "crates/vf-graph",
+    "crates/vf-extraction",
     "crates/vf-server",
 ]
 
@@ -59,10 +60,16 @@ uuid = { version = "1", features = ["v4", "serde"] }
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"
+unicode-normalization = "0.1"
 npyz = "0.8"
 bytemuck = "1.16"
 nix = { version = "0.29", features = ["fs"] }
 libc = "0.2"
+
+# Allocator (ADR-025): jemalloc returns freed pages to the OS after a bulk
+# load. Gated to non-MSVC x86_64 / aarch64 in the consuming crate.
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+tikv-jemalloc-ctl = { version = "0.6" }
 
 # Data structures
 roaring = "0.10"

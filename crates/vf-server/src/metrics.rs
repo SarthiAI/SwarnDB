@@ -44,6 +44,15 @@ pub const SEGMENT_COUNT: &str = "swarndb_segments_total";
 /// Histogram: per-query ef_search override values.
 pub const SEARCH_EF_USED: &str = "swarndb_search_ef_used";
 
+/// Counter: extraction jobs, labelled by lifecycle state.
+pub const EXTRACTION_JOBS_TOTAL: &str = "swarndb_extraction_jobs_total";
+
+/// Gauge: last observed extraction cache hit rate (0.0..1.0), per collection.
+pub const EXTRACTION_CACHE_HIT_RATE: &str = "swarndb_extraction_cache_hit_rate";
+
+/// Histogram: hybrid (vector + graph) query latency in seconds.
+pub const HYBRID_QUERY_LATENCY: &str = "swarndb_graph_hybrid_query_latency_seconds";
+
 // ── Setup ───────────────────────────────────────────────────────────────
 
 /// Installs the Prometheus metrics recorder and returns a handle
@@ -120,4 +129,24 @@ pub fn set_segment_count(count: u64) {
 pub fn record_ef_search(ef_value: usize, collection: &str) {
     histogram!(SEARCH_EF_USED, "collection" => collection.to_owned())
         .record(ef_value as f64);
+}
+
+// ── Extraction metrics ───────────────────────────────────────────────────
+
+/// Increments the extraction jobs counter for the given lifecycle state.
+pub fn record_extraction_job(state: &str) {
+    counter!(EXTRACTION_JOBS_TOTAL, "state" => state.to_owned()).increment(1);
+}
+
+/// Sets the per-collection extraction cache hit-rate gauge.
+pub fn set_extraction_cache_hit_rate(collection: &str, rate: f64) {
+    gauge!(EXTRACTION_CACHE_HIT_RATE, "collection" => collection.to_owned()).set(rate);
+}
+
+// ── Graph metrics ────────────────────────────────────────────────────────
+
+/// Records hybrid (vector + graph) query latency.
+pub fn record_hybrid_query_latency(start: Instant) {
+    let elapsed = start.elapsed().as_secs_f64();
+    histogram!(HYBRID_QUERY_LATENCY).record(elapsed);
 }

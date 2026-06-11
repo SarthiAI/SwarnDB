@@ -1,0 +1,390 @@
+syntax = "proto3";
+package swarndb.v1;
+
+import "swarndb/v1/common.proto";
+
+// LLM extraction service (Hybrid mode only). Additive new file; it shares the
+// swarndb.v1 package but defines no field numbers that collide with existing
+// services. Every RPC is rejected with FailedPrecondition on non-Hybrid
+// collections.
+service ExtractionService {
+  rpc SetLlmConfig(SetLlmConfigRequest) returns (SetLlmConfigResponse);
+  rpc GetLlmConfig(GetLlmConfigRequest) returns (GetLlmConfigResponse);
+  rpc RotateLlmConfig(RotateLlmConfigRequest) returns (RotateLlmConfigResponse);
+
+  rpc SetOntology(SetOntologyRequest) returns (SetOntologyResponse);
+  rpc GetOntology(GetOntologyRequest) returns (GetOntologyResponse);
+
+  rpc CostPreview(CostPreviewRequest) returns (CostPreviewResponse);
+  rpc StartExtraction(StartExtractionRequest) returns (StartExtractionResponse);
+  // ADR-013. Append more chunks to an existing job across several messages.
+  rpc AppendExtractionChunks(AppendExtractionChunksRequest) returns (AppendExtractionChunksResponse);
+  rpc GetExtractionStatus(GetExtractionStatusRequest) returns (JobStatusMsg);
+  rpc CancelExtraction(CancelExtractionRequest) returns (CancelExtractionResponse);
+
+  rpc ListProposals(ListProposalsRequest) returns (ListProposalsResponse);
+  rpc ApproveProposal(ApproveProposalRequest) returns (ApproveProposalResponse);
+  rpc RejectProposal(RejectProposalRequest) returns (RejectProposalResponse);
+
+  // P04. Additive document-update detection and re-extraction.
+  rpc DiffDocument(DiffDocumentRequest) returns (DiffDocumentResponse);
+  rpc ReextractDocument(ReextractDocumentRequest) returns (ReextractDocumentResponse);
+
+  // P16 (Area 3). Additive corpus-level, resumable re-extraction over a set of
+  // documents or a whole collection. Single-document ReextractDocument is
+  // unchanged; this drives that same path per document.
+  rpc StartCorpusReextraction(StartCorpusReextractionRequest) returns (StartCorpusReextractionResponse);
+  rpc GetCorpusReextractionStatus(GetCorpusReextractionStatusRequest) returns (CorpusReextractionStatusMsg);
+  rpc CancelCorpusReextraction(CancelCorpusReextractionRequest) returns (CancelCorpusReextractionResponse);
+}
+
+// One client-supplied unit of extraction. The embedding is optional and used
+// only for entity dedup when present.
+message Chunk {
+  string doc_id = 1;
+  uint64 chunk_id = 2;
+  string text = 3;
+  repeated float embedding = 4;
+}
+
+// ── LLM config ───────────────────────────────────────────────────────
+
+message SetLlmConfigRequest {
+  string collection = 1;
+  string base_url = 2;
+  // Plaintext only on SET; never returned on GET.
+  string api_key = 3;
+  string model_name = 4;
+  float temperature = 5;
+  uint32 max_tokens = 6;
+  uint64 timeout_seconds = 7;
+}
+
+message SetLlmConfigResponse {
+  bool success = 1;
+}
+
+message GetLlmConfigRequest {
+  string collection = 1;
+}
+
+// Redacted view: never carries the api key, only whether one is set.
+message GetLlmConfigResponse {
+  string base_url = 1;
+  string model_name = 2;
+  float temperature = 3;
+  uint32 max_tokens = 4;
+  uint64 timeout_seconds = 5;
+  bool api_key_set = 6;
+}
+
+message RotateLlmConfigRequest {
+  string collection = 1;
+  string new_api_key = 2;
+}
+
+message RotateLlmConfigResponse {
+  bool success = 1;
+}
+
+// ── Ontology ─────────────────────────────────────────────────────────
+
+message OntologyEntityLabel {
+  string label = 1;
+  string description = 2;
+}
+
+message OntologyEdgeType {
+  string edge_type = 1;
+  string description = 2;
+  // Empty means any label is allowed at that endpoint.
+  repeated string source_labels = 3;
+  repeated string target_labels = 4;
+}
+
+// Entity-resolution mode for dedup matching (ADR-020). Additive; default 0 is
+// the prior ADR-015 normalized behavior, so existing collections are unchanged.
+enum EntityResolutionMode {
+  ENTITY_RESOLUTION_NORMALIZED = 0;
+  ENTITY_RESOLUTION_FUZZY = 1;
+}
+
+message OntologyMsg {
+  repeated OntologyEntityLabel entity_labels = 1;
+  repeated OntologyEdgeType edge_types = 2;
+  // Full override of the generic extraction task framing. Empty means use the default prompt.
+  string system_prompt = 3;
+  // Domain guidance appended on top of the framing. Empty means use the default prompt.
+  string extra_guidance = 4;
+  // ADR-012. When true, guarantee a passage-to-entity edge type referencing
+  // @chunk is present so GraphRAG works without hand-authoring the relation.
+  bool link_passages = 5;
+  // ADR-020. Entity-resolution mode. Default (0) is the normalized exact match;
+  // FUZZY opts in to conservative deterministic alias / abbreviation / typo
+  // resolution. Additive field; absent on old clients decodes to NORMALIZED.
+  EntityResolutionMode entity_resolution = 6;
+}
+
+message SetOntologyRequest {
+  string collection = 1;
+  // Kebab-case template name, e.g. "research-papers"; empty means no template.
+  string base_template = 2;
+  OntologyMsg extension = 3;
+  // When true the extension replaces the template entirely.
+  bool replace = 4;
+}
+
+message SetOntologyResponse {
+  bool success = 1;
+}
+
+message GetOntologyRequest {
+  string collection = 1;
+}
+
+message GetOntologyResponse {
+  OntologyMsg ontology = 1;
+}
+
+// ── Cost preview and extraction ──────────────────────────────────────
+
+message CostPreviewRequest {
+  string collection = 1;
+  repeated Chunk chunks = 2;
+}
+
+message CostPreviewResponse {
+  uint64 chunks = 1;
+  uint64 estimated_input_tokens = 2;
+  uint64 estimated_output_tokens = 3;
+  double estimated_cost_usd = 4;
+  string model = 5;
+  bool pricing_known = 6;
+}
+
+message StartExtractionRequest {
+  string collection = 1;
+  repeated Chunk chunks = 2;
+}
+
+message StartExtractionResponse {
+  string job_id = 1;
+}
+
+// ADR-013. Append a batch of chunks to an existing job; last_batch seals it.
+message AppendExtractionChunksRequest {
+  string collection = 1;
+  string job_id = 2;
+  repeated Chunk chunks = 3;
+  bool last_batch = 4;
+}
+
+message AppendExtractionChunksResponse {
+  uint64 total_chunks = 1;
+  bool accepted = 2;
+}
+
+message GetExtractionStatusRequest {
+  string collection = 1;
+  string job_id = 2;
+}
+
+// A snapshot of an extraction job's progress.
+message JobStatusMsg {
+  string job_id = 1;
+  string collection = 2;
+  // queued | running | completed | completed_with_errors | failed | cancelled
+  string state = 3;
+  uint64 total_chunks = 4;
+  uint64 processed_chunks = 5;
+  uint64 entities_written = 6;
+  uint64 edges_written = 7;
+  uint64 cache_hits = 8;
+  uint64 cache_misses = 9;
+  string error = 10;
+  // Partial-success detail: count of chunks that failed and their per-chunk
+  // errors. Zero / empty when the job completed cleanly.
+  uint64 failed_chunks = 11;
+  repeated ChunkErrorMsg chunk_errors = 12;
+  // Area 4. Post-job cost ACTUALS. Additive; old clients decode these to 0 /
+  // false. Cache hits cost zero tokens, so the actuals reflect only the LLM
+  // calls that ran. actual_cost_usd is 0 when the model's pricing is unknown.
+  uint64 actual_input_tokens = 13;
+  uint64 actual_output_tokens = 14;
+  double actual_cost_usd = 15;
+  // True only while every priced call reported its own usage; false once any
+  // call's tokens had to be estimated. Lets callers see if the actuals are
+  // fully provider-reported or partly estimated.
+  bool usage_provider_reported = 16;
+}
+
+// One per-chunk extraction failure, surfaced when a job ends in the
+// completed_with_errors state.
+message ChunkErrorMsg {
+  string doc_id = 1;
+  uint64 chunk_id = 2;
+  string error = 3;
+}
+
+message CancelExtractionRequest {
+  string collection = 1;
+  string job_id = 2;
+}
+
+message CancelExtractionResponse {
+  bool success = 1;
+}
+
+// ── Proposals ────────────────────────────────────────────────────────
+
+message ProposalMsg {
+  string id = 1;
+  // entity_label | edge_type
+  string kind = 2;
+  string name = 3;
+  string description = 4;
+  repeated string examples = 5;
+  // pending | approved | rejected
+  string status = 6;
+  string source_doc = 7;
+  uint64 source_chunk_id = 8;
+}
+
+message ListProposalsRequest {
+  string collection = 1;
+}
+
+message ListProposalsResponse {
+  repeated ProposalMsg proposals = 1;
+}
+
+message ApproveProposalRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message ApproveProposalResponse {
+  bool success = 1;
+}
+
+message RejectProposalRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message RejectProposalResponse {
+  bool success = 1;
+}
+
+// ── Document diff and re-extraction (P04). All additive. Reuses Chunk. ──
+
+enum ChunkDiffAction {
+  CHUNK_DIFF_UNCHANGED = 0;
+  CHUNK_DIFF_CHANGED = 1;
+  CHUNK_DIFF_NEW = 2;
+  CHUNK_DIFF_DELETED = 3;
+}
+
+message ChunkDiff {
+  uint64 chunk_id = 1;
+  ChunkDiffAction action = 2;
+}
+
+message DiffDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+  repeated Chunk chunks = 3;
+}
+
+message DiffDocumentResponse {
+  repeated ChunkDiff diffs = 1;
+}
+
+message ReextractDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+  repeated Chunk chunks = 3;
+}
+
+message ReextractDocumentResponse {
+  string job_id = 1;         // job for changed+new chunks; empty if none enqueued
+  uint64 unchanged = 2;
+  uint64 changed = 3;
+  uint64 added = 4;          // new chunks
+  uint64 deleted = 5;        // chunks no longer present
+  uint64 edges_deleted = 6;  // auto-edges removed for deleted chunks
+  uint64 nodes_deleted = 7;  // content nodes removed for deleted chunks
+}
+
+// ── Corpus-level re-extraction (P16, Area 3). All additive. Reuses Chunk. ──
+
+// One document to re-extract: its id and its current chunks. A document with no
+// chunks is treated as a full deletion (every prior chunk pruned).
+message CorpusDocument {
+  string doc_id = 1;
+  repeated Chunk chunks = 2;
+}
+
+message StartCorpusReextractionRequest {
+  string collection = 1;
+  // The documents to re-extract.
+  repeated CorpusDocument documents = 2;
+  // Optional filter: when non-empty, only these doc ids among `documents` run.
+  // Empty means every supplied document.
+  repeated string doc_ids = 3;
+  // Optional resume token (a prior corpus_job_id). When set, the run continues
+  // that job and skips documents it already completed. Empty mints a new job.
+  string resume_token = 4;
+}
+
+message StartCorpusReextractionResponse {
+  string corpus_job_id = 1;
+}
+
+message GetCorpusReextractionStatusRequest {
+  string collection = 1;
+  string corpus_job_id = 2;
+}
+
+// Per-document progress within a corpus run.
+message CorpusDocProgressMsg {
+  string doc_id = 1;
+  // pending | completed | failed | skipped
+  string state = 2;
+  // The per-document sub-job id; empty when nothing needed re-extraction.
+  string job_id = 3;
+  uint64 changed = 4;
+  uint64 added = 5;
+  uint64 deleted = 6;
+}
+
+// The master status of a corpus re-extraction job. `state` reuses the same
+// lifecycle strings as JobStatusMsg.
+message CorpusReextractionStatusMsg {
+  string corpus_job_id = 1;
+  string collection = 2;
+  // queued | running | completed | completed_with_errors | failed | cancelled
+  string state = 3;
+  uint64 total_documents = 4;
+  uint64 processed_documents = 5;
+  uint64 failed_documents = 6;
+  uint64 skipped_documents = 7;
+  uint64 changed_chunks = 8;
+  uint64 added_chunks = 9;
+  uint64 deleted_chunks = 10;
+  uint64 edges_deleted = 11;
+  uint64 nodes_deleted = 12;
+  uint64 entities_written = 13;
+  uint64 edges_written = 14;
+  repeated CorpusDocProgressMsg documents = 15;
+  string error = 16;
+}
+
+message CancelCorpusReextractionRequest {
+  string collection = 1;
+  string corpus_job_id = 2;
+}
+
+message CancelCorpusReextractionResponse {
+  bool success = 1;
+}

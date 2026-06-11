@@ -6,5 +6,6 @@
 pub mod distance;
 pub mod simd;
 pub mod store;
+pub mod text_norm;
 pub mod vector;
 pub mod types;

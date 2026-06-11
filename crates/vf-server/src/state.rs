@@ -138,6 +138,9 @@ pub struct CollectionState {
     pub index: Box<dyn PersistableIndex>,
     pub index_manager: IndexManager,
     pub graph: VirtualGraph,
+    /// First-class typed graph store. `Some` only for Hybrid collections; `None`
+    /// for VectorOnly and AutoSimilarity, which use the v2 `graph` field above.
+    pub graph_store: Option<vf_graph::TypedGraphStore>,
     pub metadata_cache: MetadataCache,
     pub status: Arc<std::sync::RwLock<CollectionStatus>>,
     /// True if HNSW index build was deferred during bulk insert.
@@ -317,6 +320,81 @@ pub struct AppState {
     /// Number of map-level lookups served by `collection_handle`. Acts as a
     /// proxy for outer-lock pressure on the collections RwLock.
     pub map_lock_acquisitions: Arc<AtomicU64>,
+    /// LLM extraction manager. Shared across the gRPC and REST extraction
+    /// handlers; per-collection runtime is registered at create and recovery
+    /// for Hybrid collections only.
+    pub extraction: Arc<vf_extraction::ExtractionManager>,
+}
+
+/// Outcome of the optimize work phase. Shared between the public async entry
+/// point and its inner phased implementation.
+enum WorkOutcome {
+    NoOp,
+    Done(u64),
+}
+
+/// RAII guard that guarantees the Optimizing status flag is never leaked.
+///
+/// While optimize holds the Optimizing gate, any early return, error, panic,
+/// or future cancellation between taking the gate and committing the new index
+/// would otherwise leave the flag stuck at Optimizing forever (every later
+/// optimize then fails FAILED_PRECONDITION). On Drop the guard restores the
+/// status to a correct non-Optimizing state: Ready if the live index ended
+/// populated, else PendingOptimization so a later optimize self-heals.
+///
+/// The success path calls `disarm` after the index swap + flag flip have
+/// committed, so the guard does not clobber a good Ready result.
+struct OptimizeStatusGuard {
+    status: Arc<std::sync::RwLock<CollectionStatus>>,
+    coll: Arc<RwLock<CollectionState>>,
+    armed: bool,
+}
+
+impl OptimizeStatusGuard {
+    fn new(
+        status: Arc<std::sync::RwLock<CollectionStatus>>,
+        coll: Arc<RwLock<CollectionState>>,
+    ) -> Self {
+        Self { status, coll, armed: true }
+    }
+
+    /// Disarm on the success path: leave the committed status untouched.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OptimizeStatusGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Failure / cancel / panic path: derive the correct resting status from
+        // actual index population so an empty index is never left Ready.
+        //
+        // We must distinguish 'index is empty' from 'could not read the lock due
+        // to contention'. Only an OBSERVED empty index justifies downgrading to
+        // PendingOptimization (which would force a fresh, possibly 1M-vector,
+        // rebuild). If try_read fails because another holder has the lock, the
+        // index may be perfectly healthy; downgrading it then is a spurious
+        // PendingOptimization. In that case we restore Ready rather than punish
+        // a likely-good index with a needless rebuild.
+        let restored = match self.coll.try_read() {
+            Some(coll) => {
+                if coll.index.len() > 0 {
+                    CollectionStatus::Ready
+                } else {
+                    CollectionStatus::PendingOptimization
+                }
+            }
+            // Contention (or poison): cannot observe emptiness, so do not
+            // downgrade a possibly-good index. Leave it Ready.
+            None => CollectionStatus::Ready,
+        };
+        if let Ok(mut status) = self.status.write() {
+            *status = restored;
+        }
+    }
 }
 
 impl AppState {
@@ -376,6 +454,34 @@ impl AppState {
             started_at: Instant::now(),
         };
 
+        // Build the extraction manager. The master key is read from the
+        // environment; an absent key is fine (collections without a sealed
+        // api key still work), an invalid key is logged and treated as absent
+        // so boot never fails on a malformed env value.
+        let master_key = match vf_extraction::MasterKey::from_base64_env("SWARNDB_MASTER_KEY") {
+            Ok(mk) => mk,
+            Err(e) => {
+                tracing::warn!("SWARNDB_MASTER_KEY is set but invalid ({e}); extraction api keys will be unavailable");
+                None
+            }
+        };
+        let pricing = match &config.extraction_pricing_path {
+            Some(path) => match vf_extraction::PricingTable::from_json_path(path) {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    tracing::warn!("failed to load extraction pricing from {path}: {e}; using built-in pricing");
+                    Arc::new(vf_extraction::PricingTable::builtin())
+                }
+            },
+            None => Arc::new(vf_extraction::PricingTable::builtin()),
+        };
+        let extraction = vf_extraction::ExtractionManager::new(
+            master_key,
+            config.extraction_worker_concurrency,
+            config.extraction_cache_max_entries,
+            pricing,
+        );
+
         Ok(Self {
             collections: Arc::new(RwLock::new(HashMap::new())),
             collection_manager: Arc::new(RwLock::new(collection_manager)),
@@ -390,6 +496,7 @@ impl AppState {
             recovery_path: Arc::new(AtomicU8::new(RecoveryStatus::Unknown.to_u8())),
             recovery_elapsed_secs: Arc::new(AtomicU64::new(0)),
             map_lock_acquisitions: Arc::new(AtomicU64::new(0)),
+            extraction,
         })
     }
 
@@ -456,11 +563,18 @@ impl AppState {
         let loading_arc = Arc::clone(&self.loading_state);
         let cm_arc = Arc::clone(&self.collection_manager);
         let recovery_paths_arc = Arc::clone(&self.recovery_paths);
+        // Names of collections that finished loading, collected so extraction
+        // runtimes can be registered after the parallel loop drains (the
+        // registration needs `self` and the published map handle, which are not
+        // available inside the rayon closure).
+        let loaded_names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let loaded_names_outer = Arc::clone(&loaded_names);
 
         pool.install(|| {
             collection_names
                 .into_par_iter()
                 .for_each(|name| {
+                    let loaded_names_inner = Arc::clone(&loaded_names_outer);
                     // Catch panics at the per-task boundary so a single
                     // bad collection cannot poison boot for the rest.
                     // SAFETY: AssertUnwindSafe is used because the
@@ -498,6 +612,8 @@ impl AppState {
                                 let mut ls = loading_arc.write();
                                 ls.in_progress.remove(&loaded_name);
                             }
+                            // Record the name for post-loop extraction registration.
+                            loaded_names_inner.lock().push(loaded_name);
                         }
                         Ok(None) => {
                             // Loader returned None (data-level error already
@@ -529,6 +645,14 @@ impl AppState {
                 "recovered {} collection(s) from storage",
                 recovered_count
             );
+        }
+
+        // Register extraction runtimes for recovered Hybrid collections now that
+        // every loaded collection's handle is published in the map. Non-Hybrid
+        // collections are skipped inside the helper.
+        let to_register: Vec<String> = loaded_names.lock().clone();
+        for name in to_register {
+            self.register_extraction_if_hybrid(&name);
         }
 
         // Record the boot recovery summary BEFORE the boot task flips
@@ -595,6 +719,158 @@ impl AppState {
         Err(CollectionAvailability::NotFound {
             name: name.to_string(),
         })
+    }
+
+    /// Register a collection's extraction runtime if it is Hybrid. Looks up the
+    /// per-collection handle and the collection dir, builds a `GraphWriter` over
+    /// the handle, and registers + loads the runtime in the extraction manager.
+    /// A no-op for non-Hybrid collections and for collections not yet visible in
+    /// the map. Must be called AFTER the collection's `Arc<RwLock<..>>` is in the
+    /// map so the writer can hold that exact handle.
+    pub fn register_extraction_if_hybrid(&self, name: &str) {
+        let handle = match self.collection_handle(name) {
+            Some(h) => h,
+            None => return,
+        };
+        // Read the per-collection config (mode) and the on-disk dir.
+        let config = {
+            let coll = metered_read(&handle);
+            coll.config.clone()
+        };
+        if config.effective_mode() != vf_core::types::Mode::Hybrid {
+            return;
+        }
+        let collection_dir = {
+            let cm = self.collection_manager.read();
+            cm.get_collection(name)
+                .map(|c| c.collection_dir().to_path_buf())
+                .ok()
+        };
+        let collection_dir = match collection_dir {
+            Some(d) => d,
+            None => {
+                tracing::warn!(collection = %name, "extraction registration skipped: collection dir not found");
+                return;
+            }
+        };
+        let extraction_dir = collection_dir.join("extraction");
+
+        let writer: Arc<dyn vf_extraction::GraphWriter> =
+            Arc::new(crate::extraction_graph_writer::CollectionGraphWriter::new(
+                Arc::clone(&handle),
+                Arc::clone(&self.collection_manager),
+                name.to_string(),
+            ));
+
+        // load_collection creates the extraction dir, opens the cache, and folds
+        // in any persisted sidecars (llm config, ontology, proposals, reject
+        // list). For a brand-new Hybrid collection no sidecars exist yet, so it
+        // simply seeds an empty runtime; this same call covers both create and
+        // recovery, keeping the registration path single and consistent.
+        if let Err(e) = self
+            .extraction
+            .load_collection(name, writer, extraction_dir)
+        {
+            tracing::warn!(collection = %name, "extraction load_collection failed: {e}");
+        }
+    }
+
+    /// Graph store config seeded from the environment. P09.5:
+    /// SWARNDB_GRAPH_ENTITY_INDEX=0 selects the legacy O(n) scan for measurement;
+    /// default on.
+    fn graph_store_config_from_env() -> vf_graph::GraphStoreConfig {
+        let mut cfg = vf_graph::GraphStoreConfig::default();
+        if let Ok(v) = std::env::var("SWARNDB_GRAPH_ENTITY_INDEX") {
+            let off = v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off");
+            cfg.name_index_enabled = !off;
+        }
+        cfg
+    }
+
+    /// Build an empty typed graph store for a NEW Hybrid collection, attaching a
+    /// fresh typed delta writer. Returns `None` for VectorOnly / AutoSimilarity.
+    pub(crate) fn create_hybrid_graph_store(
+        collection_dir: &std::path::Path,
+        config: &CollectionConfig,
+    ) -> Option<vf_graph::TypedGraphStore> {
+        if config.effective_mode() != vf_core::types::Mode::Hybrid {
+            return None;
+        }
+        let mut store =
+            vf_graph::TypedGraphStore::new(Self::graph_store_config_from_env());
+        let typed_delta = collection_dir.join("graph_typed.delta");
+        match vf_graph::TypedDeltaWriter::create(&typed_delta) {
+            Ok(w) => store.set_delta_writer(w),
+            Err(e) => tracing::warn!("failed to create typed graph delta writer: {e}"),
+        }
+        Some(store)
+    }
+
+    /// Recover a Hybrid collection's typed graph store: load the v3 base if
+    /// present, replay the typed delta after the base LSN, then keep appending
+    /// to that same delta. Unlike the v2 graph (which truncates on recovery),
+    /// typed edges are not recomputable, so the durable delta tail is preserved
+    /// until the next snapshot. Returns `None` for non-Hybrid collections.
+    pub(crate) fn recover_hybrid_graph_store(
+        name: &str,
+        collection_dir: &std::path::Path,
+        config: &CollectionConfig,
+    ) -> Option<vf_graph::TypedGraphStore> {
+        if config.effective_mode() != vf_core::types::Mode::Hybrid {
+            return None;
+        }
+        let typed_base = collection_dir.join("graph_typed.base");
+        let typed_delta = collection_dir.join("graph_typed.delta");
+        let (mut store, base_lsn) = if typed_base.exists() {
+            match std::fs::File::open(&typed_base)
+                .map_err(|e| e.to_string())
+                .and_then(|mut f| {
+                    // Honor the env-driven entity-index switch on recovered stores.
+                    vf_graph::deserialize_typed_base_with_config(
+                        &mut f,
+                        Self::graph_store_config_from_env(),
+                    )
+                    .map_err(|e| e.to_string())
+                }) {
+                Ok((lsn, s)) => (s, lsn),
+                Err(e) => {
+                    tracing::warn!(collection = %name, "typed graph base load failed ({e}); starting empty");
+                    (
+                        vf_graph::TypedGraphStore::new(Self::graph_store_config_from_env()),
+                        0,
+                    )
+                }
+            }
+        } else {
+            (
+                vf_graph::TypedGraphStore::new(Self::graph_store_config_from_env()),
+                0,
+            )
+        };
+        if typed_delta.exists() {
+            match store.replay_delta_after_lsn(&typed_delta, base_lsn) {
+                Ok(n) => {
+                    tracing::info!(collection = %name, "replayed {n} typed graph delta entries")
+                }
+                Err(e) => {
+                    tracing::warn!(collection = %name, "typed graph delta replay failed: {e}")
+                }
+            }
+            match vf_graph::TypedDeltaWriter::open(&typed_delta) {
+                Ok(w) => store.set_delta_writer(w),
+                Err(e) => {
+                    tracing::warn!(collection = %name, "failed to open typed graph delta writer: {e}")
+                }
+            }
+        } else {
+            match vf_graph::TypedDeltaWriter::create(&typed_delta) {
+                Ok(w) => store.set_delta_writer(w),
+                Err(e) => {
+                    tracing::warn!(collection = %name, "failed to create typed graph delta writer: {e}")
+                }
+            }
+        }
+        Some(store)
     }
 
     /// Load a single collection's in-memory state from disk.
@@ -1013,15 +1289,59 @@ impl AppState {
 
         let index_manager = IndexManager::with_defaults();
 
+        // Typed graph store for Hybrid collections (ADR-007 R4). Independent of
+        // the HNSW recovery strategy: typed edges are user/LLM-created, not
+        // similarity-derived, so they load from their own base + delta.
+        let graph_store = Self::recover_hybrid_graph_store(&name, &collection_dir, &config);
+
+        // Unified id authority seeding (hybrid only). The load loop above already
+        // bumped the vector store's next_id above the max vector id via
+        // insert_metadata. For a hybrid collection the recovered graph holds
+        // surviving entity node ids drawn from that same authority, so seed the
+        // authority above max(vector_max, node_max) by raising it past the live
+        // graph max node id. This guarantees freshly allocated entity ids never
+        // collide with existing vector/content or entity ids after restart.
+        // Vector-only/legacy collections have no graph_store, so this is skipped
+        // and behaviour is identical.
+        if let Some(ref gs) = graph_store {
+            store.bump_floor(gs.max_node_id() + 1);
+        }
+
+        // Orphan guard: a clean-shutdown (or incremental-replay) restore can
+        // load an HNSW snapshot that is empty because a prior optimize never
+        // committed, while storage still holds vector_count vectors. The
+        // shutdown marker must not be trusted to imply a populated index. If the
+        // restored index is empty over non-empty storage, do NOT present the
+        // collection as Ready: mark deferred_index so the live index does not
+        // shadow storage, and set status to PendingOptimization so the next
+        // optimize() rebuilds from storage (the same FullRebuild source).
+        // FullRebuild over non-empty vectors always yields a populated index, so
+        // this never trips on that path.
+        let index_orphaned = vector_count > 0 && index.len() == 0;
+        if index_orphaned {
+            tracing::warn!(
+                collection = %name,
+                vectors = vector_count,
+                strategy = ?recovery_path,
+                "recovered an empty index over non-empty storage; marking PendingOptimization for rebuild"
+            );
+        }
+        let initial_status = if index_orphaned {
+            CollectionStatus::PendingOptimization
+        } else {
+            CollectionStatus::Ready
+        };
+
         let collection_state = CollectionState {
             config,
             store,
             index,
             index_manager,
             graph,
+            graph_store,
             metadata_cache: MetadataCache::new(),
-            status: Arc::new(std::sync::RwLock::new(CollectionStatus::Ready)),
-            deferred_index: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(std::sync::RwLock::new(initial_status)),
+            deferred_index: Arc::new(AtomicBool::new(index_orphaned)),
             deferred_graph: Arc::new(AtomicBool::new(false)),
             deferred_metadata: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(AtomicBool::new(false)),
@@ -1170,10 +1490,14 @@ impl AppState {
             }
         };
 
-        if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
-            &mut graph, &*index, &vector_ids, &vector_map, 10,
-        ) {
-            tracing::warn!(collection = %name, "graph compute_batch_parallel failed: {}", e);
+        // Vector-only collections keep the empty graph placeholder; only graph
+        // modes recompute edges during a full rebuild.
+        if config.graph_enabled() {
+            if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
+                &mut graph, &*index, &vector_ids, &vector_map, 10,
+            ) {
+                tracing::warn!(collection = %name, "graph compute_batch_parallel failed: {}", e);
+            }
         }
 
         (index, graph)
@@ -1331,8 +1655,14 @@ impl AppState {
                 "replayed hnsw delta, last LSN: {replayed}"
             );
 
-            // Rebuild arena from the merged snapshot to keep slot layout
-            // consistent (delta may have added or removed nodes).
+            // Rebuild arena from the merged snapshot, PRESERVING each node's
+            // recorded vector_slot. restore_from_topology keeps the snapshot's
+            // slot indices one-for-one, so a dense sequential push would
+            // misalign every vector_slot reference whenever the snapshot has
+            // gaps (from deletes) or duplicate slots. Mirror the slot-preserving
+            // placement from HnswIndex::populate_arena_from_snapshot: size the
+            // arena to (max_slot + 1), write each live vector at its original
+            // offset, and free the gap slots.
             let mut new_arena = VectorArena::new(dimension);
             let mut nodes_by_slot: Vec<_> = merged_snapshot
                 .nodes
@@ -1340,14 +1670,21 @@ impl AppState {
                 .map(|n| (n.vector_slot, n.id))
                 .collect();
             nodes_by_slot.sort_by_key(|(slot, _)| *slot);
-            for (_slot, id) in &nodes_by_slot {
-                match vec_map.get(id) {
-                    Some(data) => {
-                        new_arena.push(*data);
-                    }
-                    None => {
-                        let zeros = vec![0.0f32; dimension];
-                        new_arena.push(&zeros);
+            let zeros = vec![0.0f32; dimension];
+            if !nodes_by_slot.is_empty() {
+                let max_slot = nodes_by_slot.last().map(|(s, _)| *s).unwrap_or(0);
+                let total_slots = max_slot + 1;
+                new_arena.resize_to_slots(total_slots, &zeros);
+                let mut live: std::collections::HashSet<usize> =
+                    std::collections::HashSet::with_capacity(nodes_by_slot.len());
+                for (slot, id) in &nodes_by_slot {
+                    let data = vec_map.get(id).copied().unwrap_or(zeros.as_slice());
+                    new_arena.write_slot(*slot, data);
+                    live.insert(*slot);
+                }
+                for slot in 0..total_slots {
+                    if !live.contains(&slot) {
+                        new_arena.free(slot);
                     }
                 }
             }
@@ -1419,12 +1756,7 @@ impl AppState {
     ///
     /// Checks which operations were deferred (index, metadata, graph) and
     /// rebuilds each one. Returns statistics about the optimization.
-    pub fn optimize_collection(&self, collection_name: &str, rebuild_graph: bool) -> Result<OptimizeResult, String> {
-        enum WorkOutcome {
-            NoOp,
-            Done(u64),
-        }
-
+    pub async fn optimize_collection(&self, collection_name: &str, rebuild_graph: bool) -> Result<OptimizeResult, String> {
         let start = Instant::now();
 
         // Read flags, decide, perform the rebuild, and clear flags all under one per-collection
@@ -1440,156 +1772,23 @@ impl AppState {
         let coll_handle = self
             .collection_handle(collection_name)
             .ok_or_else(|| format!("collection '{}' not found", collection_name))?;
-        let result = (|| -> Result<WorkOutcome, String> {
-            let mut coll = metered_write(&coll_handle);
-
-            need_index = coll.deferred_index.load(Ordering::Acquire);
-            need_metadata = coll.deferred_metadata.load(Ordering::Acquire);
-            need_graph = coll.deferred_graph.load(Ordering::Acquire);
-            let has_quantization = coll.config.quantization_config.is_some();
-
-            // Nothing to do if no deferred ops, or only graph is deferred but rebuild_graph is false.
-            // Exception: quantized collections always need optimization to train the quantizer.
-            let effective_graph = need_graph && rebuild_graph;
-            if !need_index && !need_metadata && !effective_graph && !has_quantization {
-                return Ok(WorkOutcome::NoOp);
-            }
-
-            // Check not already optimizing.
-            {
-                let status = coll.status.read().unwrap();
-                if *status == CollectionStatus::Optimizing {
-                    return Err(format!(
-                        "collection '{}' is already being optimized",
-                        collection_name
-                    ));
-                }
-            }
-
-            // Set status to optimizing.
-            {
-                let mut status = coll.status.write().unwrap();
-                *status = CollectionStatus::Optimizing;
-            }
-            status_taken = true;
-
-            let vectors_processed = coll.store.len() as u64;
-
-            // 1. Rebuild HNSW index if deferred.
-            if need_index {
-                let vector_data = coll.index.iter_vectors_owned();
-                let refs: Vec<(VectorId, &[f32])> = vector_data
-                    .iter()
-                    .map(|(id, v)| (*id, v.as_slice()))
-                    .collect();
-
-                // Create a fresh HNSW index and rebuild via build_parallel.
-                let new_hnsw = HnswIndex::with_defaults(
-                    coll.config.dimension,
-                    coll.config.distance_metric,
-                );
-                new_hnsw.build_parallel(&refs).map_err(|e| {
-                    format!("HNSW index rebuild failed: {}", e)
-                })?;
-                new_hnsw.compact();
-
-                // Wrap in QuantizedHnswIndex if quantization is configured.
-                let new_index: Box<dyn PersistableIndex> = match &coll.config.quantization_config {
-                    Some(QuantizationConfig::Scalar(sq_config)) => {
-                        let q_index = QuantizedHnswIndex::from_existing_hnsw(
-                            new_hnsw,
-                            coll.config.distance_metric,
-                            sq_config.clone(),
-                        );
-                        // Get the real collection directory for mmap files.
-                        let data_dir = {
-                            let cm = self.collection_manager.read();
-                            cm.get_collection(collection_name)
-                                .map(|c| c.collection_dir().to_path_buf())
-                                .unwrap_or_else(|_| {
-                                    std::env::temp_dir()
-                                        .join(format!("swarndb_optimize_{}", collection_name))
-                                })
-                        };
-                        let _ = std::fs::create_dir_all(&data_dir);
-                        q_index.set_data_dir(data_dir.clone());
-                        q_index.train_quantizer(&data_dir);
-                        Box::new(q_index)
-                    }
-                    None => Box::new(new_hnsw),
-                };
-                coll.index = new_index;
-                coll.deferred_index.store(false, Ordering::Release);
-                tracing::info!(
-                    collection = %collection_name,
-                    vectors = vectors_processed,
-                    "rebuilt HNSW index"
-                );
-            }
-
-            // 2. Rebuild metadata indexes if skipped.
-            if need_metadata {
-                let mut new_manager = IndexManager::with_defaults();
-                let metadata_pairs = coll.store.iter_metadata();
-                for (id, meta) in &metadata_pairs {
-                    new_manager.index_record(*id, meta);
-                }
-                coll.index_manager = new_manager;
-                coll.deferred_metadata.store(false, Ordering::Release);
-                tracing::info!(
-                    collection = %collection_name,
-                    "rebuilt metadata indexes"
-                );
-            }
-
-            // 2.5. Train quantizer if quantized collection hasn't been trained yet.
-            if !need_index {
-                if let Some(QuantizationConfig::Scalar(_)) = &coll.config.quantization_config {
-                    coll.index.post_optimize();
-                    tracing::info!(
-                        collection = %collection_name,
-                        "trained scalar quantizer"
-                    );
-                }
-            }
-
-            // 3. Recompute virtual graph edges if deferred and rebuild_graph is requested.
-            if need_graph && rebuild_graph {
-                let vector_data = coll.index.iter_vectors_owned();
-                let vector_ids: Vec<u64> = vector_data.iter().map(|(id, _)| *id).collect();
-                // Arc-wrap so compute_batch_parallel can share clones across threads.
-                let vector_map: HashMap<u64, Arc<Vec<f32>>> = vector_data
-                    .into_iter()
-                    .map(|(id, v)| (id, Arc::new(v)))
-                    .collect();
-
-                // Reset graph and rebuild.
-                let threshold = coll.config.default_similarity_threshold.unwrap_or(0.7);
-                let mut new_graph = VirtualGraph::with_threshold(
-                    if threshold > 0.0 { threshold } else { 0.7 },
-                    coll.config.distance_metric,
-                );
-                if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
-                    &mut new_graph, coll.index.as_vector_index(), &vector_ids, &vector_map, 10,
-                ) {
-                    tracing::warn!(
-                        collection = %collection_name,
-                        "graph rebuild partially failed: {}",
-                        e
-                    );
-                }
-                coll.graph = new_graph;
-                coll.deferred_graph.store(false, Ordering::Release);
-                coll.dirty.store(true, Ordering::Release);
-                coll.mutation_count.store(50_001, Ordering::Release);
-                tracing::info!(
-                    collection = %collection_name,
-                    "rebuilt virtual graph"
-                );
-            }
-
-            Ok(WorkOutcome::Done(vectors_processed))
-        })();
+        // Phased optimize. The CPU-bound HNSW rebuild runs in spawn_blocking
+        // with NO collection write guard held across the await, so a 2-worker
+        // tokio runtime can still schedule health probes and other tasks. The
+        // status=Optimizing flag set in phase 0 is the mutual-exclusion gate:
+        // once taken, no concurrent optimize proceeds, and bulk setters only
+        // store-true on the deferred_* atomics (re-read in phase 0).
+        let result = self
+            .optimize_collection_inner(
+                collection_name,
+                &coll_handle,
+                rebuild_graph,
+                &mut need_index,
+                &mut need_metadata,
+                &mut need_graph,
+                &mut status_taken,
+            )
+            .await;
 
         // Nothing to optimize; status was never flipped, do not touch it.
         if matches!(result, Ok(WorkOutcome::NoOp)) {
@@ -1601,40 +1800,47 @@ impl AppState {
             });
         }
 
-        // Reset status back from Optimizing only if we transitioned it (preserves caller status on
-        // the already-optimizing error path, matching pre-fix behavior). Re-acquire the
-        // per-collection read lock to flip the inner status; no map write needed.
-        if status_taken {
-            if let Some(handle) = self.collection_handle(collection_name) {
-                let coll = metered_read(&handle);
-                let mut status = coll.status.write().unwrap();
-                *status = CollectionStatus::Ready;
-            }
-        }
+        // Status restoration is owned by the RAII OptimizeStatusGuard inside
+        // optimize_collection_inner: it disarms to Ready on the committed
+        // success path, and on any error / panic / cancel it restores a correct
+        // non-Optimizing status (Ready if the index ended populated, else
+        // PendingOptimization). The flag can therefore never leak as Optimizing.
 
-        // Auto-prune WAL after optimize.
-        if result.is_ok() && self.config.wal_prune_after_optimize {
-            match self.prune_wal_for_collection(collection_name) {
-                Ok((count, bytes)) => {
-                    if count > 0 {
-                        tracing::info!("Pruned {} WAL files ({} bytes) after optimize", count, bytes);
+        // Post-optimize maintenance (WAL prune + auto-compact) runs off the
+        // runtime in spawn_blocking. Both do synchronous filesystem and segment
+        // work (compact takes the global collection_manager write lock and merges
+        // segments); running them inline would pin a runtime worker after an
+        // otherwise-successful optimize. AppState is a cheap bag of Arc handles,
+        // so cloning it into the closure is just Arc bumps. No parking_lot guard
+        // is held across the .await; the closure takes its own fresh guards.
+        let do_prune = result.is_ok() && self.config.wal_prune_after_optimize;
+        let do_compact = result.is_ok() && self.config.auto_compact_after_optimize;
+        if do_prune || do_compact {
+            let maint_state = self.clone();
+            let coll_name = collection_name.to_string();
+            let min_segments = self.config.compaction_min_segments;
+            let _ = tokio::task::spawn_blocking(move || {
+                if do_prune {
+                    match maint_state.prune_wal_for_collection(&coll_name) {
+                        Ok((count, bytes)) => {
+                            if count > 0 {
+                                tracing::info!("Pruned {} WAL files ({} bytes) after optimize", count, bytes);
+                            }
+                        }
+                        Err(e) => tracing::warn!("WAL prune after optimize failed: {}", e),
                     }
                 }
-                Err(e) => tracing::warn!("WAL prune after optimize failed: {}", e),
-            }
-        }
-
-        // Auto-compact after optimize.
-        if result.is_ok() && self.config.auto_compact_after_optimize {
-            match self.compact_collection(collection_name, self.config.compaction_min_segments, true) {
-                Ok(result) => {
-                    tracing::info!("Auto-compacted {} segments into 1 ({} vectors)", result.segments_merged, result.vectors_written);
+                if do_compact {
+                    match maint_state.compact_collection(&coll_name, min_segments, true) {
+                        Ok(cr) => {
+                            tracing::info!("Auto-compacted {} segments into 1 ({} vectors)", cr.segments_merged, cr.vectors_written);
+                        }
+                        // Not an error if too few segments.
+                        Err(e) => tracing::debug!("Auto-compact skipped: {}", e),
+                    }
                 }
-                Err(e) => {
-                    // Not an error if too few segments.
-                    tracing::debug!("Auto-compact skipped: {}", e);
-                }
-            }
+            })
+            .await;
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -1656,6 +1862,407 @@ impl AppState {
             Ok(WorkOutcome::NoOp) => unreachable!("NoOp handled by early return above"),
             Err(e) => Err(e),
         }
+    }
+
+    /// Phased inner optimize. Runs the CPU-bound HNSW rebuild in spawn_blocking
+    /// with no collection write guard held across the await, then swaps the new
+    /// index in under a brief write lock. The rebuild source is the durable
+    /// storage layer (load_all_vectors), not the in-memory index arena, so a
+    /// deferred-mode collection (empty arena) rebuilds from the real vectors.
+    #[allow(clippy::too_many_arguments)]
+    async fn optimize_collection_inner(
+        &self,
+        collection_name: &str,
+        coll_handle: &Arc<RwLock<CollectionState>>,
+        rebuild_graph: bool,
+        need_index: &mut bool,
+        need_metadata: &mut bool,
+        need_graph: &mut bool,
+        status_taken: &mut bool,
+    ) -> Result<WorkOutcome, String> {
+        // Phase 0: read flags, decide, and take the Optimizing gate under a
+        // brief write lock. Capture the config fields we need later so we do
+        // not have to hold the lock across the build.
+        let dimension;
+        let distance_metric;
+        let quantization_config;
+        let graph_enabled;
+        let graph_threshold;
+        let vectors_processed;
+        let status_handle;
+        {
+            let coll = metered_write(coll_handle);
+
+            *need_index = coll.deferred_index.load(Ordering::Acquire);
+            *need_metadata = coll.deferred_metadata.load(Ordering::Acquire);
+            *need_graph = coll.deferred_graph.load(Ordering::Acquire);
+            let has_quantization = coll.config.quantization_config.is_some();
+
+            // Self-heal an orphaned index: if storage holds vectors but the live
+            // HNSW index is empty (a prior optimize whose build was dropped before
+            // commit, or a clean-shutdown restore of an empty snapshot), the
+            // deferred_index flag may read false yet the index does not reflect
+            // storage. Force a rebuild in that case so optimize cannot short-circuit
+            // over orphaned vectors. The normal up-to-date case (index populated and
+            // matching storage) is untouched, preserving the fast path.
+            let stored_count = coll.store.len();
+            let index_population = coll.index.len();
+            if !*need_index && stored_count > 0 && index_population == 0 {
+                *need_index = true;
+                tracing::warn!(
+                    collection = %collection_name,
+                    stored = stored_count,
+                    "optimize: empty index over non-empty storage, forcing HNSW rebuild"
+                );
+            }
+
+            // Nothing to do if no deferred ops, or only graph is deferred but rebuild_graph is false.
+            // Exception: quantized collections always need optimization to train the quantizer.
+            let effective_graph = *need_graph && rebuild_graph;
+            if !*need_index && !*need_metadata && !effective_graph && !has_quantization {
+                return Ok(WorkOutcome::NoOp);
+            }
+
+            // Check not already optimizing.
+            {
+                let status = coll.status.read().unwrap();
+                if *status == CollectionStatus::Optimizing {
+                    return Err(format!(
+                        "collection '{}' is already being optimized",
+                        collection_name
+                    ));
+                }
+            }
+
+            // Set status to optimizing. This is the mutual-exclusion gate held
+            // for the whole phased run. Restoration is owned by the RAII guard
+            // constructed just below, so the flag cannot leak on any exit path.
+            {
+                let mut status = coll.status.write().unwrap();
+                *status = CollectionStatus::Optimizing;
+            }
+            *status_taken = true;
+            status_handle = coll.status.clone();
+
+            dimension = coll.config.dimension;
+            distance_metric = coll.config.distance_metric;
+            quantization_config = coll.config.quantization_config.clone();
+            graph_enabled = coll.config.graph_enabled();
+            graph_threshold = coll.config.default_similarity_threshold.unwrap_or(0.7);
+            vectors_processed = coll.store.len() as u64;
+        }
+
+        // Arm the RAII status guard now that the Optimizing gate is held. On any
+        // early return, error, panic, or future cancellation from here on, Drop
+        // restores a correct non-Optimizing status (Ready if the index ended
+        // populated, else PendingOptimization). The success path disarms it after
+        // the index swap + flag flip have committed.
+        let mut status_guard = OptimizeStatusGuard::new(status_handle, coll_handle.clone());
+
+        // The durable vectors are loaded once from the storage layer and the
+        // HNSW rebuild runs off the runtime. Both the load and the build happen
+        // inside spawn_blocking so the global collection_manager read lock is
+        // never held on a runtime worker across the multi-minute load+build, and
+        // no parking_lot guard is held across an .await (which would make the
+        // future non-Send). The load source is storage, not the in-memory index
+        // arena, so a deferred-mode collection (empty arena) rebuilds from real
+        // vectors. This mirrors the recovery full_rebuild Arc/bulk_add_with_lsn
+        // idiom (see plain HNSW full rebuild, ~lines 1413-1424).
+        let graph_needs_vectors = *need_graph && rebuild_graph && graph_enabled;
+        let needs_vectors = *need_index || graph_needs_vectors;
+
+        // F10 (lost-write race): capture the storage high-water LSN as observed
+        // at load time. Writes that commit after this LSN land durably in storage
+        // but are not in the freshly built index. At swap we re-read the LSN; if
+        // it advanced we do NOT mask the gap as Ready but set PendingOptimization
+        // so a follow-up optimize covers the post-load tail.
+        let mut load_high_water_lsn: u64 = 0;
+
+        // Resolve the quantization data dir before the blocking build so the
+        // closure carries an owned PathBuf, not a manager borrow.
+        let quant_data_dir = if *need_index && quantization_config.is_some() {
+            let cm = self.collection_manager.read();
+            let dir = cm
+                .get_collection(collection_name)
+                .map(|c| c.collection_dir().to_path_buf())
+                .unwrap_or_else(|_| {
+                    std::env::temp_dir()
+                        .join(format!("swarndb_optimize_{}", collection_name))
+                });
+            Some(dir)
+        } else {
+            None
+        };
+
+        // Load + build off the runtime. The closure returns the built index (if
+        // needed), the loaded vectors (moved out for the graph phase, never
+        // cloned), and the captured high-water LSN. A fresh manager read guard is
+        // taken inside the blocking thread and dropped there.
+        let cm_for_load = self.collection_manager.clone();
+        let coll_name_owned = collection_name.to_string();
+        let quant_for_build = if *need_index { quantization_config.clone() } else { None };
+        let need_index_build = *need_index;
+        let graph_keeps_vectors = graph_needs_vectors;
+        let (built_index, mut vector_data): (Option<Box<dyn PersistableIndex>>, Vec<(VectorId, Vec<f32>)>) =
+            if needs_vectors {
+                tokio::task::spawn_blocking(move || {
+                    // Brief storage read inside the blocking thread. Capture the
+                    // high-water LSN first so it reflects the state we load.
+                    let (vector_data, high_water): (Vec<(VectorId, Vec<f32>)>, u64) = {
+                        let cm = cm_for_load.read();
+                        let sc = cm
+                            .get_collection(&coll_name_owned)
+                            .map_err(|e| format!("storage collection not found for optimize: {e}"))?;
+                        let high_water = sc.current_lsn();
+                        let loaded = sc
+                            .load_all_vectors()
+                            .map_err(|e| format!("load_all_vectors for optimize failed: {e}"))?
+                            .into_iter()
+                            .map(|(id, v, _meta)| (id, v))
+                            .collect();
+                        (loaded, high_water)
+                    };
+
+                    if !need_index_build {
+                        // Graph-only rebuild needs the vectors but no new index.
+                        return Ok::<_, String>((None, vector_data, high_water));
+                    }
+
+                    // F1 / F9: build via the migrated Arc/bulk_add_with_lsn idiom
+                    // used by recovery full_rebuild (~lines 1413-1424). Wrap each
+                    // loaded vector in an Arc once. When the graph phase does NOT
+                    // also need the vectors we MOVE them out of vector_data into
+                    // the Arcs (drain), so only one full copy exists at build time
+                    // instead of two; the build_items Arcs are then the sole copy
+                    // and drop right after the build. When the graph DOES need the
+                    // vectors we keep vector_data intact and Arc-share a clone, the
+                    // one unavoidable extra copy.
+                    let new_hnsw = HnswIndex::with_defaults(dimension, distance_metric);
+                    let (vector_data, items): (
+                        Vec<(VectorId, Vec<f32>)>,
+                        Vec<(VectorId, Arc<Vec<f32>>, u64)>,
+                    ) = if graph_keeps_vectors {
+                        let items = vector_data
+                            .iter()
+                            .map(|(id, v)| (*id, Arc::new(v.clone()), 0u64))
+                            .collect();
+                        (vector_data, items)
+                    } else {
+                        // Move each Vec into an Arc; vector_data is emptied.
+                        let items = vector_data
+                            .into_iter()
+                            .map(|(id, v)| (id, Arc::new(v), 0u64))
+                            .collect();
+                        (Vec::new(), items)
+                    };
+                    new_hnsw
+                        .bulk_add_with_lsn(&items)
+                        .map_err(|e| format!("HNSW index rebuild failed: {}", e))?;
+                    drop(items);
+                    new_hnsw.compact();
+
+                    // Wrap in QuantizedHnswIndex if quantization is configured.
+                    let boxed: Box<dyn PersistableIndex> = match &quant_for_build {
+                        Some(QuantizationConfig::Scalar(sq_config)) => {
+                            let q_index = QuantizedHnswIndex::from_existing_hnsw(
+                                new_hnsw,
+                                distance_metric,
+                                sq_config.clone(),
+                            );
+                            if let Some(dir) = quant_data_dir.as_ref() {
+                                let _ = std::fs::create_dir_all(dir);
+                                q_index.set_data_dir(dir.clone());
+                                q_index.train_quantizer(dir);
+                            }
+                            Box::new(q_index)
+                        }
+                        _ => Box::new(new_hnsw),
+                    };
+                    Ok::<_, String>((Some(boxed), vector_data, high_water))
+                })
+                .await
+                .map_err(|e| format!("optimize build task join error: {e}"))?
+                .map(|(idx, data, hw)| {
+                    load_high_water_lsn = hw;
+                    (idx, data)
+                })?
+            } else {
+                (None, Vec::new())
+            };
+
+        // Phase 1 commit: swap the freshly built index in.
+        if *need_index {
+            let new_index = built_index
+                .ok_or_else(|| "optimize: index build requested but no index produced".to_string())?;
+
+            // Refuse to commit an empty index over non-empty storage. A build
+            // that returned an empty index while storage holds vectors would
+            // otherwise be swapped in and the flag cleared, presenting an
+            // orphaned (unsearchable) collection as optimized. Returning Err
+            // here leaves the guard armed, which restores PendingOptimization so
+            // a later optimize retries from storage.
+            if vectors_processed > 0 && new_index.len() == 0 {
+                return Err(format!(
+                    "optimize built an empty HNSW index over {} stored vectors; refusing to commit",
+                    vectors_processed
+                ));
+            }
+
+            // Commit: swap the freshly built index in and clear the deferred
+            // flag together under a single brief write lock so the swap and the
+            // flag flip are atomic. A failure cannot leave a populated-but-
+            // deferred or empty-but-ready state because both happen together.
+            {
+                let mut coll = metered_write(coll_handle);
+                coll.index = new_index;
+                coll.deferred_index.store(false, Ordering::Release);
+            }
+            tracing::info!(
+                collection = %collection_name,
+                vectors = vectors_processed,
+                "rebuilt HNSW index"
+            );
+        }
+
+        // Phase 2 / 2.5: metadata rebuild + quantizer train under a brief write
+        // lock. Both are bounded by collection size and operate on resident
+        // state. The metadata rebuild iterates the store single-threaded, so the
+        // write-lock hold is kept as short as the work allows and the graph phase
+        // (the expensive part) is moved off the lock below.
+        {
+            let mut coll = metered_write(coll_handle);
+
+            // 2. Rebuild metadata indexes if skipped.
+            if *need_metadata {
+                let mut new_manager = IndexManager::with_defaults();
+                let metadata_pairs = coll.store.iter_metadata();
+                for (id, meta) in &metadata_pairs {
+                    new_manager.index_record(*id, meta);
+                }
+                coll.index_manager = new_manager;
+                coll.deferred_metadata.store(false, Ordering::Release);
+                tracing::info!(
+                    collection = %collection_name,
+                    "rebuilt metadata indexes"
+                );
+            }
+
+            // 2.5. Train quantizer if quantized collection hasn't been trained yet.
+            if !*need_index {
+                if let Some(QuantizationConfig::Scalar(_)) = &coll.config.quantization_config {
+                    coll.index.post_optimize();
+                    tracing::info!(
+                        collection = %collection_name,
+                        "trained scalar quantizer"
+                    );
+                }
+            }
+        }
+
+        // Phase 3: recompute virtual graph edges off the runtime. The graph
+        // compute does ~N index.search calls (compute_batch_parallel); running it
+        // under the per-collection WRITE lock on a runtime worker would pin the
+        // worker and block all other ops for the whole multi-minute compute.
+        // Instead we run the compute inside spawn_blocking and take only a READ
+        // lock there (so concurrent searches still proceed), build the graph into
+        // a detached VirtualGraph, then swap it in under a short WRITE lock. The
+        // read guard lives entirely on the blocking thread and never crosses the
+        // .await, so the future stays Send. Vector-only collections skip the
+        // graph entirely; the graph source is the storage vectors loaded above,
+        // so deferred-mode collections rebuild from real data, not an empty arena.
+        if *need_graph && rebuild_graph && graph_enabled {
+            let vector_ids: Vec<u64> = vector_data.iter().map(|(id, _)| *id).collect();
+            // Arc-share the loaded vectors into the compute map (no per-vector
+            // re-clone of the raw Vec data beyond the one Arc wrap).
+            let vector_map: HashMap<u64, Arc<Vec<f32>>> = std::mem::take(&mut vector_data)
+                .into_iter()
+                .map(|(id, v)| (id, Arc::new(v)))
+                .collect();
+
+            let threshold = if graph_threshold > 0.0 { graph_threshold } else { 0.7 };
+            let graph_handle = coll_handle.clone();
+            let new_graph = tokio::task::spawn_blocking(move || {
+                // Read lock taken on the blocking thread only; never held across
+                // an await. Allows concurrent reads during the compute.
+                let coll = metered_read(&graph_handle);
+                let mut g = VirtualGraph::with_threshold(threshold, distance_metric);
+                if let Err(e) = vf_graph::RelationshipComputer::compute_batch_parallel(
+                    &mut g, coll.index.as_vector_index(), &vector_ids, &vector_map, 10,
+                ) {
+                    tracing::warn!("graph rebuild partially failed: {}", e);
+                }
+                g
+            })
+            .await
+            .map_err(|e| format!("optimize graph task join error: {e}"))?;
+
+            // Swap the finished graph in under a short write lock.
+            {
+                let mut coll = metered_write(coll_handle);
+                coll.graph = new_graph;
+                coll.deferred_graph.store(false, Ordering::Release);
+                coll.dirty.store(true, Ordering::Release);
+                coll.mutation_count.store(50_001, Ordering::Release);
+            }
+            tracing::info!(
+                collection = %collection_name,
+                "rebuilt virtual graph"
+            );
+        }
+
+        // F10 (lost-write race): writes that committed to storage during the
+        // load+build window are durable but absent from the index we just built
+        // (we built from the snapshot at load_high_water_lsn). If the storage
+        // high-water LSN advanced past what we loaded, do NOT mask the gap by
+        // reporting Ready. Re-read the current LSN; on an advance we land on
+        // PendingOptimization instead so a follow-up optimize covers the
+        // post-load tail. Only the index path can drop writes; a graph-only or
+        // metadata-only run does not need this guard but the check is cheap and
+        // harmless. We chose PendingOptimization (a follow-up rebuild) over
+        // tail-replay here for correctness with minimal surface area.
+        let post_build_lsn = if needs_vectors {
+            let cm = self.collection_manager.read();
+            cm.get_collection(collection_name)
+                .map(|sc| sc.current_lsn())
+                .unwrap_or(load_high_water_lsn)
+        } else {
+            load_high_water_lsn
+        };
+        let lost_writes = *need_index && post_build_lsn > load_high_water_lsn;
+
+        // Flip status and disarm the guard so its Drop does not re-derive (and
+        // possibly clobber) the committed result. Done after the index swap so a
+        // populated index is never reported as PendingOptimization.
+        let final_status = if lost_writes {
+            tracing::warn!(
+                collection = %collection_name,
+                load_lsn = load_high_water_lsn,
+                post_lsn = post_build_lsn,
+                "optimize: writes landed during rebuild window; deferring to a follow-up optimize"
+            );
+            // Re-arm the deferred_index flag so the next optimize rebuilds the
+            // tail. Brief write lock; consistent with the swap commit above.
+            {
+                let coll = metered_write(coll_handle);
+                coll.deferred_index.store(true, Ordering::Release);
+            }
+            CollectionStatus::PendingOptimization
+        } else {
+            CollectionStatus::Ready
+        };
+        if let Ok(mut status) = status_guard.status.write() {
+            *status = final_status;
+        }
+        status_guard.disarm();
+
+        // I12 (ADR-025): the optimize rebuild allocates a full transient copy of
+        // the collection's vectors plus the build scratch. Drop the loaded vectors
+        // explicitly, then purge the allocator arenas so the freed pages return to
+        // the OS immediately instead of waiting for the background decay timer.
+        drop(vector_data);
+        vf_index::purge_allocator_arenas();
+
+        Ok(WorkOutcome::Done(vectors_processed))
     }
 
     /// Snapshot of the global recovery summary captured during boot.
@@ -1768,7 +2375,7 @@ mod tests {
         use tracing::subscriber::with_default;
         use tracing_subscriber::fmt::MakeWriter;
 
-        use vf_core::types::{CollectionConfig, DataTypeConfig, DistanceMetricType};
+        use vf_core::types::{CollectionConfig, DataTypeConfig, DistanceMetricType, Mode};
 
         // Build a default ServerConfig with the configured parallel-loader knob.
         fn server_config_with(max_loads: usize) -> crate::config::ServerConfig {
@@ -1791,6 +2398,7 @@ mod tests {
                     max_vectors: 0,
                     data_type: DataTypeConfig::F32,
                     quantization_config: None,
+                    mode: Some(Mode::AutoSimilarity),
                 };
                 manager.create_collection(config).expect("create collection");
             }

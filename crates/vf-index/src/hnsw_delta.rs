@@ -471,12 +471,23 @@ fn apply_op(snapshot: &mut HnswTopologySnapshot, op: &HnswDeltaOp) {
             vector_slot,
             neighbors_per_layer,
         } => {
-            snapshot.nodes.push(TopologyNode {
-                id: *id,
-                level: *level as usize,
-                vector_slot: *vector_slot as usize,
-                neighbors: neighbors_per_layer.clone(),
-            });
+            // Dedup on replay: the snapshot may already carry this node when
+            // the embedded snapshot LSN is deliberately understated (a node
+            // that landed in both the base snapshot and the delta tail).
+            // Pushing again would inflate `nodes` with a duplicate. Overwrite
+            // in place with the replayed topology so replay is idempotent.
+            if let Some(node) = snapshot.nodes.iter_mut().find(|n| n.id == *id) {
+                node.level = *level as usize;
+                node.vector_slot = *vector_slot as usize;
+                node.neighbors = neighbors_per_layer.clone();
+            } else {
+                snapshot.nodes.push(TopologyNode {
+                    id: *id,
+                    level: *level as usize,
+                    vector_slot: *vector_slot as usize,
+                    neighbors: neighbors_per_layer.clone(),
+                });
+            }
         }
         HnswDeltaOp::RemoveNode { id } => {
             // Remove the node itself.

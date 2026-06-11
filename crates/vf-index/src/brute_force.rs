@@ -95,6 +95,10 @@ impl VectorIndex for BruteForceIndex {
             .ok_or(IndexError::NotFound(id))
     }
 
+    fn metric_type(&self) -> DistanceMetricType {
+        self.distance_fn.metric_type()
+    }
+
     fn search(&self, query: &[f32], k: usize, _ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError> {
         if query.len() != self.dimension {
             return Err(IndexError::DimensionMismatch {

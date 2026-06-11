@@ -133,6 +133,7 @@ impl SearchService for SearchServiceImpl {
             .collect();
 
         let search_time_us = timer.elapsed().as_micros() as u64;
+        metrics::record_search_latency_grpc(timer, &req.collection);
 
         // Check if collection is pending optimization and add warning
         let warning = if let Ok(status) = collection.status.read() {
@@ -295,6 +296,7 @@ impl SearchServiceImpl {
             // Non-uniform: execute each query individually
             let mut responses = Vec::with_capacity(queries.len());
             for q in queries {
+                let query_timer = Instant::now();
                 let query_vector = q
                     .query
                     .as_ref()
@@ -334,6 +336,7 @@ impl SearchServiceImpl {
                 } else {
                     HashMap::new()
                 };
+                metrics::record_search_latency_grpc(query_timer, &q.collection);
                 responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map, warning.clone()));
             }
             Ok(responses)
@@ -347,6 +350,7 @@ impl SearchServiceImpl {
         let mut responses = Vec::with_capacity(queries.len());
 
         for q in queries {
+            let query_timer = Instant::now();
             let coll_handle = self.state.collection_handle(&q.collection).ok_or_else(|| {
                 Status::not_found(format!("collection '{}' not found", q.collection))
             })?;
@@ -404,6 +408,7 @@ impl SearchServiceImpl {
             } else {
                 HashMap::new()
             };
+            metrics::record_search_latency_grpc(query_timer, &q.collection);
             responses.push(to_search_response(results, &metadata_store, q.include_metadata, &graph_edges_map, warning));
         }
 

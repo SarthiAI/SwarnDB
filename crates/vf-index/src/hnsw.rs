@@ -113,23 +113,36 @@ thread_local! {
         RefCell::new(BinaryHeap::new());
 }
 
-// Ask glibc to return freed per-batch scratch back to the OS. Cheap on glibc
-// (a single allocator state walk, sub-millisecond); a no-op everywhere else.
-// Re-exported at the crate root as `vf_index::release_to_os` so chunked
-// ingest paths outside this crate can call it between batches.
+// Return freed per-batch scratch to the OS. Under jemalloc (ADR-025) this is an
+// explicit arena purge; on every other target it is a no-op (background decay or
+// the system allocator handles release). Re-exported at the crate root as
+// `vf_index::release_to_os` so chunked ingest paths outside this crate can call
+// it between batches. The intent of the former glibc-only malloc_trim is now
+// carried by purge_allocator_arenas below.
 #[inline]
-#[cfg(target_env = "gnu")]
 pub fn release_to_os() {
-    // SAFETY: malloc_trim is thread-safe and reads only allocator-internal
-    // state; it does not touch any live allocation owned by us.
+    purge_allocator_arenas();
+}
+
+// Purge all jemalloc arenas so freed pages return to the OS immediately rather
+// than waiting for the decay timer. Invoked right after the optimize step on the
+// bulk paths. A no-op on non-jemalloc targets.
+//
+// 4096 == MALLCTL_ARENAS_ALL (the special index meaning "every arena").
+#[inline]
+#[cfg(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn purge_allocator_arenas() {
+    // SAFETY: the mallctl reads only allocator-internal state and never touches
+    // any live allocation owned by us. Errors are ignored; a failed purge just
+    // leaves the pages for the background decay thread.
     unsafe {
-        libc::malloc_trim(0);
+        tikv_jemalloc_ctl::raw::write(b"arena.4096.purge\0", ()).ok();
     }
 }
 
 #[inline]
-#[cfg(not(target_env = "gnu"))]
-pub fn release_to_os() {}
+#[cfg(not(all(not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64"))))]
+pub fn purge_allocator_arenas() {}
 
 pub struct HnswIndex {
     inner: RwLock<HnswInner>,
@@ -929,6 +942,107 @@ impl HnswIndex {
         Ok(())
     }
 
+    // F1: repair connectivity for one already-present node against the live graph.
+    //
+    // The parallel bulk builders skip the very first item when the index starts
+    // empty (it seeds the entry point), and the next few items search against a
+    // still-empty graph, so the earliest nodes can end up with empty neighbor
+    // lists and become unreachable. This pass re-derives a node's neighbors from
+    // the fully built graph and installs bidirectional edges, mirroring the
+    // reconnection logic in `delete_node` (above) and the connect phase of
+    // `insert_node`. It runs under the same write lock as Phase 3 and is invoked
+    // only for the handful of nodes that need it, so it does not affect recall or
+    // build time materially. Modified neighbor ids are appended to `modified` so
+    // the caller can refresh `flat_adj` for them.
+    fn repair_node_connectivity(
+        &self,
+        inner: &mut HnswInner,
+        id: VectorId,
+        modified: &mut Vec<VectorId>,
+    ) {
+        // The node must exist and the graph must have at least one other node to
+        // connect to. A query vector copy is taken so no borrow of the arena is
+        // held across the mutations below.
+        let (node_level, query_vec): (usize, Vec<f32>) = match inner.nodes.get(&id) {
+            Some(node) => (node.max_level(), inner.vectors.get(node.vector_slot).to_vec()),
+            None => return,
+        };
+        let entry_point = match inner.entry_point {
+            Some(ep) => ep,
+            None => return,
+        };
+
+        // Greedy descent from the top layer down to node_level + 1 (ef=1), exactly
+        // as insert_node does, so the search enters the node's own layers near its
+        // true neighborhood rather than at an arbitrary point.
+        let mut current_ep = entry_point;
+        let top = inner.max_level;
+        if top > node_level {
+            for layer in (node_level + 1..=top).rev() {
+                let results = self.search_layer(inner, &query_vec, &[current_ep], 1, layer);
+                if let Some(&(_, closest)) = results.iter().filter(|&&(_, c)| c != id).min_by_key(|&&(d, _)| d) {
+                    current_ep = closest;
+                }
+            }
+        }
+
+        // Connect from min(node_level, max_level) down to 0.
+        let start_layer = node_level.min(inner.max_level);
+        for layer in (0..=start_layer).rev() {
+            let results =
+                self.search_layer(inner, &query_vec, &[current_ep], self.params.ef_construction, layer);
+            // Exclude self from both the descent hint and the candidate set.
+            let candidates: Vec<(OrderedFloat<f32>, VectorId)> =
+                results.iter().copied().filter(|&(_, c)| c != id).collect();
+            if let Some(&(_, closest)) = candidates.iter().min_by_key(|&&(d, _)| d) {
+                current_ep = closest;
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let m = self.max_connections(layer);
+            let neighbors = self.select_neighbors_heuristic(inner, &query_vec, &candidates, m);
+
+            // Merge into the node's existing list at this layer (do not drop links
+            // it may already hold), dedup, then set.
+            if let Some(node) = inner.nodes.get_mut(&id) {
+                if layer < node.neighbors.len() {
+                    for &nid in &neighbors {
+                        if nid != id && !node.neighbors[layer].contains(&nid) {
+                            node.neighbors[layer].push(nid);
+                        }
+                    }
+                }
+            }
+
+            // Add the reciprocal edge on each chosen neighbor and prune on overflow.
+            let max_conn = self.max_connections(layer);
+            for &neighbor_id in &neighbors {
+                if neighbor_id == id {
+                    continue;
+                }
+                let needs_pruning = if let Some(neighbor_node) = inner.nodes.get_mut(&neighbor_id) {
+                    if layer < neighbor_node.neighbors.len()
+                        && !neighbor_node.neighbors[layer].contains(&id)
+                    {
+                        neighbor_node.neighbors[layer].push(id);
+                        neighbor_node.neighbors[layer].len() > max_conn
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if needs_pruning {
+                    self.prune_neighbors(inner, neighbor_id, layer, max_conn);
+                }
+                modified.push(neighbor_id);
+            }
+        }
+        modified.push(id);
+    }
+
     /// Build the HNSW index in parallel using rayon with fine-grained locking.
     ///
     /// Uses a two-phase approach for true parallelism:
@@ -1295,6 +1409,39 @@ impl HnswIndex {
             .unwrap_or((entry_point_atomic.load(Ordering::Acquire), 0));
         inner.entry_point = Some(final_ep);
         inner.max_level = final_max;
+
+        // F1: same seed-skip orphan as the bulk_add paths. On the empty-index
+        // case the first vector connected nothing and the next few searched an
+        // empty graph; repair the seed, the entry point, and any node left with an
+        // empty layer-0 list against the now-complete graph. flat_adj is None here
+        // and no delta is emitted, so the repaired neighbor ids need no further
+        // bookkeeping.
+        if initial_ep.is_none() {
+            let mut to_repair: Vec<VectorId> = Vec::new();
+            let mut seen: HashSet<VectorId> = HashSet::new();
+            if seen.insert(vectors[0].0) {
+                to_repair.push(vectors[0].0);
+            }
+            if let Some(ep) = inner.entry_point {
+                if seen.insert(ep) {
+                    to_repair.push(ep);
+                }
+            }
+            for &(id, _) in vectors {
+                let empty_l0 = inner
+                    .nodes
+                    .get(&id)
+                    .map(|n| n.neighbors.first().map(|l| l.is_empty()).unwrap_or(true))
+                    .unwrap_or(false);
+                if empty_l0 && seen.insert(id) {
+                    to_repair.push(id);
+                }
+            }
+            let mut scratch: Vec<VectorId> = Vec::new();
+            for id in to_repair {
+                self.repair_node_connectivity(&mut inner, id, &mut scratch);
+            }
+        }
 
         Ok(())
     }
@@ -1693,6 +1840,42 @@ impl HnswIndex {
             // Return capacity ratchet from the arena to the allocator now that
             // the bulk write burst is done.
             inner.vectors.compact();
+
+            // F1: repair the earliest nodes. When the index started empty the
+            // seed item connected nothing and the next few items searched an empty
+            // graph, so those nodes can be unreachable. Repair the seed, the entry
+            // point, and any new node left with an empty layer-0 list, against the
+            // now-complete graph. Only runs on the empty-index case; the few
+            // repaired nodes are folded into modified_existing for flat_adj refresh
+            // and into the delta below (every node here is a new node, so each gets
+            // an AddNode delta with its repaired list).
+            if initial_ep.is_none() {
+                let mut to_repair: Vec<VectorId> = Vec::new();
+                let mut seen: HashSet<VectorId> = HashSet::new();
+                // Always repair the seed and the final entry point.
+                if seen.insert(items[0].0) {
+                    to_repair.push(items[0].0);
+                }
+                if let Some(ep) = inner.entry_point {
+                    if seen.insert(ep) {
+                        to_repair.push(ep);
+                    }
+                }
+                // Plus any new node left with an empty layer-0 list.
+                for (id, _, _) in items {
+                    let empty_l0 = inner
+                        .nodes
+                        .get(id)
+                        .map(|n| n.neighbors.first().map(|l| l.is_empty()).unwrap_or(true))
+                        .unwrap_or(false);
+                    if empty_l0 && seen.insert(*id) {
+                        to_repair.push(*id);
+                    }
+                }
+                for id in to_repair {
+                    self.repair_node_connectivity(&mut inner, id, &mut modified_existing);
+                }
+            }
 
             // Incrementally update flat_adj for every touched node, mirroring insert_node.
             if inner.flat_adj.is_some() {
@@ -2171,6 +2354,39 @@ impl HnswIndex {
 
             // Return arena capacity slack to the allocator.
             inner.vectors.compact();
+
+            // F1: repair the earliest nodes against the now-complete graph. Same
+            // rationale and gate as bulk_add_with_lsn: only on the empty-index
+            // case, where the seed connected nothing and the next items searched
+            // an empty graph. Repaired ids fold into modified_existing for flat_adj
+            // and into the delta (every node here is new, so each gets an AddNode).
+            if initial_ep.is_none() {
+                let mut to_repair: Vec<VectorId> = Vec::new();
+                let mut seen: HashSet<VectorId> = HashSet::new();
+                // Always repair the seed and the final entry point.
+                if seen.insert(items[0].0) {
+                    to_repair.push(items[0].0);
+                }
+                if let Some(ep) = inner.entry_point {
+                    if seen.insert(ep) {
+                        to_repair.push(ep);
+                    }
+                }
+                // Plus any new node left with an empty layer-0 list.
+                for (id, _, _) in items {
+                    let empty_l0 = inner
+                        .nodes
+                        .get(id)
+                        .map(|n| n.neighbors.first().map(|l| l.is_empty()).unwrap_or(true))
+                        .unwrap_or(false);
+                    if empty_l0 && seen.insert(*id) {
+                        to_repair.push(*id);
+                    }
+                }
+                for id in to_repair {
+                    self.repair_node_connectivity(&mut inner, id, &mut modified_existing);
+                }
+            }
 
             // Incrementally update flat_adj for every touched node.
             if inner.flat_adj.is_some() {
@@ -2913,6 +3129,10 @@ impl VectorIndex for HnswIndex {
         self.delete_node(&mut inner, id)
     }
 
+    fn metric_type(&self) -> DistanceMetricType {
+        self.metric
+    }
+
     fn search(&self, query: &[f32], k: usize, ef_search: Option<usize>) -> Result<Vec<ScoredResult>, IndexError> {
         let inner = self.inner.read();
         self.search_knn(&inner, query, k, ef_search)
@@ -3028,7 +3248,15 @@ impl PersistableIndex for HnswIndex {
     }
 
     fn build_parallel(&self, vectors: &[(VectorId, &[f32])]) -> Result<(), IndexError> {
-        self.build_parallel(vectors)
+        // Route the trait entry point through the Arc/bulk_add_with_lsn builder
+        // so no caller reaches the deprecated double-copy inherent build_parallel
+        // via the trait. Each vector is wrapped in an Arc once; LSN=0 is
+        // unobservable here (no delta writer attached at build time).
+        let items: Vec<(VectorId, Arc<Vec<f32>>, u64)> = vectors
+            .iter()
+            .map(|(id, v)| (*id, Arc::new(v.to_vec()), 0u64))
+            .collect();
+        self.bulk_add_with_lsn(&items)
     }
 
     fn cold_build_parallel(
@@ -3036,12 +3264,14 @@ impl PersistableIndex for HnswIndex {
         vectors: &[(VectorId, &[f32])],
         _config: crate::traits::ParallelBuildConfig,
     ) -> Result<(), IndexError> {
-        // Delegate to the existing parallel HNSW build. Parallel HNSW
-        // graph build is out of scope for P03; quantized indices are
-        // the priority for the new contract. The legacy build_parallel
-        // is still on the trait and remains the working entry point
-        // for plain HNSW.
-        self.build_parallel(vectors)
+        // Route through the Arc/bulk_add_with_lsn builder, same as the trait
+        // build_parallel above, so the deprecated double-copy path is never
+        // reached through this trait method.
+        let items: Vec<(VectorId, Arc<Vec<f32>>, u64)> = vectors
+            .iter()
+            .map(|(id, v)| (*id, Arc::new(v.to_vec()), 0u64))
+            .collect();
+        self.bulk_add_with_lsn(&items)
     }
 
     fn set_delta_writer(&self, writer: HnswDeltaWriter) {

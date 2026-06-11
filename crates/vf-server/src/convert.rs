@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::proto::swarndb::v1 as pb;
 use vf_core::types::{
-    DistanceMetricType, Metadata as CoreMetadata, MetadataValue as CoreMetadataValue,
+    DistanceMetricType, Metadata as CoreMetadata, MetadataValue as CoreMetadataValue, Mode,
 };
 use vf_index::hnsw::HnswParams;
 
@@ -68,6 +68,16 @@ pub fn parse_distance_metric(s: &str) -> Option<DistanceMetricType> {
         "dot_product" | "dotproduct" => Some(DistanceMetricType::DotProduct),
         "manhattan" => Some(DistanceMetricType::Manhattan),
         _ => None,
+    }
+}
+
+/// Convert a proto Mode into the core Mode. An unset proto field reads as the
+/// zero value (VectorOnly), the new-collection default.
+pub fn proto_mode_to_core(m: pb::Mode) -> Mode {
+    match m {
+        pb::Mode::VectorOnly => Mode::VectorOnly,
+        pb::Mode::AutoSimilarity => Mode::AutoSimilarity,
+        pb::Mode::Hybrid => Mode::Hybrid,
     }
 }
 

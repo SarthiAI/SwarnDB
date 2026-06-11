@@ -38,6 +38,35 @@ use crate::traits::{
     VectorIndex,
 };
 
+// Cap on the number of vectors used to TRAIN the scalar quantizer.
+//
+// Quantile bounds are statistically stable, so a deterministic strided
+// sample of this many vectors yields the same min/max bounds (and hence
+// materially identical SQ8 codes) as training on the full dataset, while
+// avoiding the transient per-dimension f32 buffers the quantizer allocates
+// over every vector. Encoding still runs over ALL vectors; only the bound
+// estimation is sampled. At or below the cap, every vector is used.
+const QUANTIZER_TRAIN_SAMPLE_CAP: usize = 262_144;
+
+/// Build a deterministic, evenly strided sample of borrowed training slices.
+///
+/// Borrows directly from `vectors`, so no second owned f32 copy is made.
+/// At or below `QUANTIZER_TRAIN_SAMPLE_CAP` every vector is returned; above
+/// it, a fixed stride picks an even spread so the result is reproducible.
+fn sampled_train_refs(vectors: &[(VectorId, Vec<f32>)]) -> Vec<&[f32]> {
+    let n = vectors.len();
+    if n <= QUANTIZER_TRAIN_SAMPLE_CAP {
+        return vectors.iter().map(|(_, v)| v.as_slice()).collect();
+    }
+    let stride = n / QUANTIZER_TRAIN_SAMPLE_CAP;
+    vectors
+        .iter()
+        .step_by(stride)
+        .take(QUANTIZER_TRAIN_SAMPLE_CAP)
+        .map(|(_, v)| v.as_slice())
+        .collect()
+}
+
 // ── Main struct ─────────────────────────────────────────────────────────
 
 /// HNSW index with SQ8 quantized codes for memory-efficient search.
@@ -179,9 +208,14 @@ impl QuantizedHnswIndex {
         let mmap_store = MmapVectorStore::build(&mmap_path, &vectors, self.dimension)
             .expect("failed to build mmap vector store");
 
-        // 3. Train ScalarQuantizer on the training data.
+        // 3. Train ScalarQuantizer on a borrowed, deterministically sampled
+        //    view of the data. The refs borrow `vectors`, so training adds no
+        //    owned f32 copy, and sampling caps the quantizer's transient
+        //    per-dimension buffers so peak RSS right after the build no longer
+        //    doubles. Quantile bounds are stable under sampling, so the codes
+        //    are materially unchanged.
         let mut quantizer = ScalarQuantizer::new(self.dimension);
-        let vec_refs: Vec<&[f32]> = vectors.iter().map(|(_, v)| v.as_slice()).collect();
+        let vec_refs: Vec<&[f32]> = sampled_train_refs(&vectors);
         quantizer
             .train_with_quantile(&vec_refs, self.config.quantile)
             .expect("failed to train scalar quantizer");
@@ -561,6 +595,14 @@ impl VectorIndex for QuantizedHnswIndex {
         Ok(())
     }
 
+    fn metric_type(&self) -> DistanceMetricType {
+        self.metric
+    }
+
+    fn is_quantized(&self) -> bool {
+        self.trained.load(Ordering::Acquire)
+    }
+
     fn remove(&self, id: VectorId) -> Result<(), IndexError> {
         self.hnsw.remove(id)?;
 
@@ -824,16 +866,16 @@ impl PersistableIndex for QuantizedHnswIndex {
         let mut sorted_vectors: Vec<(VectorId, &[f32])> = vectors.to_vec();
         sorted_vectors.sort_by_key(|(id, _)| *id);
 
-        // 4. Build the inner HNSW graph sequentially into a LOCAL HnswIndex
+        // 4. Build the inner HNSW graph in PARALLEL into a LOCAL HnswIndex
         //    so that any failure does not leave `self.hnsw` partially
-        //    populated. Parallel HNSW build is out of scope for P03; the
-        //    parallel win for SQ8 cold-build comes from the encode step,
-        //    which is the dominant cost.
+        //    populated. Mirrors the plain HNSW cold path
+        //    (hnsw.rs HnswIndex::cold_build_parallel -> build_parallel):
+        //    build_parallel fully populates a fresh inner index (arena,
+        //    topology, entry point, max level) using all cores, so the
+        //    graph build no longer single-threads while encode workers idle.
         let local_hnsw =
             HnswIndex::new(self.dimension, self.metric, self.hnsw.params().clone());
-        for (id, vec) in sorted_vectors.iter() {
-            local_hnsw.add(*id, vec)?;
-        }
+        local_hnsw.build_parallel(&sorted_vectors)?;
 
         // 5. Resolve the data directory before any disk work.
         let dir_guard = self.data_dir.read();
@@ -862,10 +904,23 @@ impl PersistableIndex for QuantizedHnswIndex {
                 ))
             })?;
 
-        // 7. Train the scalar quantizer, single-threaded inside, on the
-        //    sorted slice. Stays local until atomic publication.
+        // 7. Train the scalar quantizer on a deterministically sampled,
+        //    borrowed view of the sorted slice. Capping the training set keeps
+        //    the quantizer's transient per-dimension buffers small (no doubling
+        //    of peak RSS); quantile bounds are stable under sampling, so the
+        //    codes are materially unchanged. Stays local until publication.
         let mut local_quantizer = ScalarQuantizer::new(self.dimension);
-        let vec_refs: Vec<&[f32]> = sorted_vectors.iter().map(|(_, v)| *v).collect();
+        let vec_refs: Vec<&[f32]> = if sorted_vectors.len() <= QUANTIZER_TRAIN_SAMPLE_CAP {
+            sorted_vectors.iter().map(|(_, v)| *v).collect()
+        } else {
+            let stride = sorted_vectors.len() / QUANTIZER_TRAIN_SAMPLE_CAP;
+            sorted_vectors
+                .iter()
+                .step_by(stride)
+                .take(QUANTIZER_TRAIN_SAMPLE_CAP)
+                .map(|(_, v)| *v)
+                .collect()
+        };
         local_quantizer
             .train_with_quantile(&vec_refs, self.config.quantile)
             .map_err(|e| {

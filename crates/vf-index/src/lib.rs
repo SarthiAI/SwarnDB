@@ -9,7 +9,7 @@ pub mod brute_force;
 pub mod hnsw_types;
 pub mod flat_adj;
 pub mod hnsw;
-pub use hnsw::release_to_os;
+pub use hnsw::{purge_allocator_arenas, release_to_os};
 pub mod hnsw_delta;
 pub mod hnsw_persistence;
 pub mod prefetch;
