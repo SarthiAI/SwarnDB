@@ -44,6 +44,10 @@ These variables control the basic server setup: where it listens, where it store
 
 See the [Authentication](#11-authentication) section below for details on how API key auth works.
 
+### TLS / mTLS
+
+SwarnDB has no TLS configuration. There are no certificate, private-key, or client-CA environment variables, and both the REST and gRPC listeners serve plaintext. Encryption in transit is achieved by terminating TLS at a load balancer, ingress, or reverse proxy in front of SwarnDB, with the Python SDK's `secure=True` flag encrypting the client-to-proxy hop. Mutual TLS (client certificates) is not implemented in the server or the SDK; enforce it at the proxy if you need it. See [TLS and mTLS](deployment.md#tls-and-mtls) in the deployment guide for the full pattern.
+
 ---
 
 ## 4. Connection Configuration
@@ -135,6 +139,10 @@ SwarnDB persists collections to disk through a write-ahead log plus periodic sna
 | Variable | Default | Type | Description |
 |----------|---------|------|-------------|
 | `SWARNDB_MAX_CONCURRENT_COLLECTION_LOADS` | `min(cores, 4)` | usize | Number of collections loaded in parallel during server startup. |
+
+### On-disk layout and backups
+
+Each collection lives in its own subdirectory under `SWARNDB_DATA_DIR`, named after the collection, holding `config.json`, the vector segments (`segment_NNNNNNNN.vfs`), the snapshot files (`hnsw.base`/`hnsw.delta`, plus `graph.base`/`graph.delta` for hybrid collections), the WAL files (`.log`) with `wal_meta.json`, and a `shutdown_clean` marker written on a clean stop. A backup is a copy of this directory tree taken when it is consistent; a restore is replacing it and letting the server replay the WAL on the next start. SwarnDB has no separate backup server or backup API. For the full, concrete procedure see [Backup and Restore](deployment.md#backup-and-restore) in the deployment guide.
 
 ---
 

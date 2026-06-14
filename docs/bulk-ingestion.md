@@ -94,12 +94,16 @@ See [Benchmarks](benchmarks.md) for measured throughput, peak memory, and the fu
 
 ## 4. Health during ingestion
 
-A large ingest does not take the server offline. The liveness and readiness probes stay responsive throughout:
+The health and readiness endpoints are:
 
 - `GET /readyz` and `GET /healthz` report readiness and liveness.
 - `GET /health` reports overall health.
 
-Because the index build (whether inline `immediate` or via `optimize()`) runs off the request runtime, these probes keep answering while a big load is in progress. Orchestrators relying on them will not flap during ingestion. See [Configuration](configuration.md) for the related storage, snapshot, and WAL settings that govern durability during a load.
+For the index-build paths, an ingest does not take the server offline. Because the index build (whether the inline `immediate` build or `optimize()` after a deferred load) runs off the request runtime, these probes keep answering while a big build is in progress, and orchestrators relying on them will not flap.
+
+There is one exception. During a large file-based `bulk_insert_from_path` load, the probes may show elevated latency or return transient non-200 responses for the duration of the load. This is a known limitation: see [Known Issues and Limitations](known-issues.md) for the scope, impact, and mitigations (run the load in a maintenance window, relax the probe timeouts during the load, or use the deferred-insert-plus-optimize path, which keeps the probes responsive).
+
+See [Configuration](configuration.md) for the related storage, snapshot, and WAL settings that govern durability during a load.
 
 ---
 

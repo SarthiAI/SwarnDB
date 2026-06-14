@@ -39,7 +39,7 @@ Basic health check. Always returns 200 while the server is running.
 | Field    | Type   | Description                      |
 |----------|--------|----------------------------------|
 | status   | string | Always `"ok"`                    |
-| version  | string | Server version (e.g., `"0.1.0"`) |
+| version  | string | Server version (e.g., `"1.1.0"`) |
 
 ```bash
 curl http://localhost:8080/health
@@ -48,7 +48,7 @@ curl http://localhost:8080/health
 ```json
 {
   "status": "ok",
-  "version": "0.1.0"
+  "version": "1.1.0"
 }
 ```
 
@@ -191,7 +191,7 @@ Creates a new vector collection.
 | distance_metric   | string | No       | `"cosine"` | One of: `"cosine"`, `"euclidean"`, `"dot_product"`, `"manhattan"`    |
 | default_threshold | float  | No       | `0.0`      | Default similarity threshold for the virtual graph. 0 means no graph edges are auto-computed. |
 | max_vectors       | uint64 | No       | `0`        | Maximum number of vectors. 0 means unlimited.                        |
-| mode              | string | No       | `"vector_only"` | Collection mode: `"vector_only"`, `"auto_similarity"`, or `"hybrid"`. Omitting it defaults to vector-only. See [Graph as a First-Class Layer](graph-first-class.md). |
+| mode              | string | No       | `"vector_only"` | Collection mode: `"vector_only"`, `"auto_similarity"`, or `"hybrid"`. Omitting it defaults to vector-only. See [Typed Graph: Overview](graph-first-class.md). |
 
 **Response:**
 
@@ -1170,7 +1170,7 @@ Combine multiple filters using `and`, `or`, and `not`.
 
 ## Graph
 
-SwarnDB's virtual graph connects vectors that exceed a similarity threshold. The graph is computed automatically during insertion (if a threshold is set) or rebuilt during `optimize()`.
+The virtual graph (SwarnDB's automatic similarity graph) connects vectors that exceed a similarity threshold. The graph is computed automatically during insertion (if a threshold is set) or rebuilt during `optimize()`.
 
 ### Get Related
 
@@ -1330,15 +1330,16 @@ curl -X POST http://localhost:8080/api/v1/collections/documents/graph/threshold 
 
 ### Typed Graph (hybrid mode)
 
-These routes are available on `hybrid` collections only. They manage the first-class typed graph of nodes and edges. See [Graph as a First-Class Layer](graph-first-class.md) for the concepts and field meanings.
+These routes are available on `hybrid` collections only. They manage the first-class typed graph of nodes and edges. See [Typed Graph: Overview](graph-first-class.md) for the concepts and field meanings.
 
 | Method | Route | Description |
 |--------|-------|-------------|
 | POST   | `/api/v1/collections/{collection}/graph/nodes` | Create a typed node. Returns the node id. |
 | GET    | `/api/v1/collections/{collection}/graph/nodes/{node_id}` | Get a typed node. |
+| PATCH  | `/api/v1/collections/{collection}/graph/nodes/{node_id}` | Update a node's property bag (records an audit entry). |
 | DELETE | `/api/v1/collections/{collection}/graph/nodes/{node_id}` | Delete a node and its incident edges. |
 | GET    | `/api/v1/collections/{collection}/graph/nodes/{node_id}/edges` | List edges incident to a node (query params: `direction`, `edge_type`). |
-| POST   | `/api/v1/collections/{collection}/graph/edges` | Create a typed edge. Returns the edge id. |
+| POST   | `/api/v1/collections/{collection}/graph/edges` | Create a typed edge. Returns the edge id. Accepts optional temporal fields. |
 | GET    | `/api/v1/collections/{collection}/graph/edges/{edge_id}` | Get a typed edge. |
 | PATCH  | `/api/v1/collections/{collection}/graph/edges/{edge_id}` | Update a manual edge's properties, confidence, or verified flag. |
 | DELETE | `/api/v1/collections/{collection}/graph/edges/{edge_id}` | Delete a typed edge. |
@@ -1347,7 +1348,294 @@ These routes are available on `hybrid` collections only. They manage the first-c
 | POST   | `/api/v1/collections/{collection}/graph/bulk-import-edges` | Bulk import edges from CSV or JSONL. |
 | POST   | `/api/v1/collections/{collection}/hybrid_query` | Run a composable hybrid query plan. |
 
-A node body carries `kind` (`content` or `entity`), `label`, `properties`, optional `embedding`, `source`, and `created_by`. An edge body carries `source`, `target`, `edge_type`, `properties`, `provenance`, `confidence`, `verified`, and `is_manual`. The bulk-import body carries `format` (`csv` or `jsonl`), `data` (the raw payload), and optional `auto_add_edge_types`; the response reports `total_rows`, `imported`, `failed`, and a per-row `errors` list.
+A node body carries `kind` (`content` or `entity`), `label`, `properties`, optional `embedding`, `source`, and `created_by`. An edge body carries `source`, `target`, `edge_type`, `properties`, `provenance`, `confidence`, `verified`, `is_manual`, and the three optional temporal fields `valid_from`, `valid_until`, and `temporal_context` (see [Temporal Edges](#temporal-edges)). The `PATCH .../graph/nodes/{node_id}` body carries an optional `properties` object (replaces the property bag; only the property bag is mutable, provenance and embedding stay immutable) and an optional `actor` string for the audit trail; the response is the updated node. The bulk-import body carries `format` (`csv` or `jsonl`), `data` (the raw payload), and optional `auto_add_edge_types`; the response reports `total_rows`, `imported`, `failed`, and a per-row `errors` list. The bulk-import payload may also carry the optional temporal columns/keys described under [Temporal Edges](#temporal-edges).
+
+### Update Node (hybrid mode)
+
+```text
+PATCH /api/v1/collections/{collection}/graph/nodes/{node_id}
+```
+
+Updates a typed node's property bag and appends an entry to its audit trail. Only the property bag is mutable; provenance and the embedding are immutable so the node-to-vector bridge cannot desync.
+
+**Path Parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| collection | string | Collection name |
+| node_id    | uint64 | Node ID         |
+
+**Request Body:**
+
+| Parameter  | Type   | Required | Description                                                          |
+|------------|--------|----------|----------------------------------------------------------------------|
+| properties | object | No       | New property bag. When present, replaces the existing properties. Omitted or `null` leaves them unchanged. |
+| actor      | string | No       | Audit actor recorded in the node's history.                          |
+
+**Response:** The updated node object under a `node` field, carrying `id`, `kind`, `properties`, `embedding`, `source`, `created_at`, `created_by`, `updated_at`, and the `history` audit trail. `kind` is `"content"` for content nodes, or `{"entity": {"label": "<label>"}}` for entity nodes.
+
+**Status Codes:** 200 (success), 400 (bad properties payload), 404 (collection or node not found), 409 (collection not in hybrid mode), 500 (storage error)
+
+```bash
+curl -X PATCH http://localhost:8080/api/v1/collections/kb/graph/nodes/42 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "properties": {"status": "reviewed", "owner": "alice"},
+    "actor": "alice"
+  }'
+```
+
+The gRPC equivalent is `UpdateNode(UpdateNodeRequest) returns (UpdateNodeResponse)`. `UpdateNodeRequest` carries `collection`, `node_id`, an optional `properties_json` (replaces the bag when set), and an optional `actor`. `UpdateNodeResponse` returns the updated `TypedNode`.
+
+### Temporal Edges
+
+Typed edges can carry an optional validity window and an optional regime/context label. These fields are additive and default-off: an edge created without them behaves exactly as before.
+
+The three fields appear on `PutEdgeRequest` (gRPC field numbers 10, 11, 12), on the REST `POST .../graph/edges` body, and on every returned `TypedEdge` (gRPC field numbers 12, 13, 14):
+
+| Field            | Type   | Default        | Description                                                                 |
+|------------------|--------|----------------|-----------------------------------------------------------------------------|
+| valid_from       | uint64 | absent (`null`)| Validity window start, unix-epoch milliseconds. Absent means an unbounded start. |
+| valid_until      | uint64 | absent (`null`)| Validity window end, unix-epoch milliseconds, EXCLUSIVE. Absent means an unbounded end. |
+| temporal_context | string | absent (`null`)| Regime, version, or scenario label. Absent (or empty on the REST/gRPC surface) means no context. |
+
+An edge is valid at instant `t` when `(valid_from is absent OR t >= valid_from)` AND `(valid_until is absent OR t < valid_until)`. An edge with both bounds absent is unbounded in time (always valid). On a returned `TypedEdge` these fields serialize as `valid_from`, `valid_until`, and `temporal_context`, each `null` when not set.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/kb/graph/edges \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source": 10,
+    "target": 20,
+    "edge_type": "EMPLOYED_AT",
+    "valid_from": 1704067200000,
+    "valid_until": 1735689600000,
+    "temporal_context": "v2024"
+  }'
+```
+
+**Bulk-import temporal columns/keys.** The `POST .../graph/bulk-import-edges` payload accepts three optional fields per row. For CSV, add the optional header columns `valid_from`, `valid_until`, and `temporal_context` alongside the required `source`, `target`, `edge_type` columns (and the existing optional `properties`, `confidence` columns); an empty cell means absent. For JSONL, add the optional keys `valid_from`, `valid_until`, and `temporal_context` to each row object; a missing key or empty `temporal_context` string means absent. Adding these columns/keys is backward-compatible: payloads that omit them import exactly as before.
+
+```csv
+source,target,edge_type,confidence,valid_from,valid_until,temporal_context
+10,20,EMPLOYED_AT,1.0,1704067200000,1735689600000,v2024
+30,40,EMPLOYED_AT,0.9,,,
+```
+
+```json
+{"source": 10, "target": 20, "edge_type": "EMPLOYED_AT", "valid_from": 1704067200000, "temporal_context": "v2024"}
+```
+
+### Filtered Graph Reads (hybrid mode)
+
+Two gRPC RPCs enumerate the whole typed graph in pages, filtered by kind, label, edge type, and property conditions. They walk a cursor over sorted ids, so a client pages by passing the previous response's `next_cursor` back as the next `after_id`. These are gRPC-only; over REST the same scoping is expressed with the `scan_by_filter` step of a hybrid query plan (see [Hybrid Query Plans](#hybrid-query-plans-hybrid-mode)).
+
+**EnumerateNodes** (`EnumerateNodesRequest` -> `EnumerateNodesResponse`):
+
+| Field          | Type             | Description                                                                 |
+|----------------|------------------|-----------------------------------------------------------------------------|
+| collection     | string           | Collection name.                                                            |
+| after_id       | uint64           | Cursor. Returns nodes with id strictly greater than this. `0` starts at the beginning. |
+| limit          | uint32           | Page size (server-clamped).                                                 |
+| filter_by_kind | bool             | When `true`, restrict to nodes of `kind`. When `false`, `kind` is ignored.  |
+| kind           | TypedNodeKind    | `TYPED_NODE_CONTENT` or `TYPED_NODE_ENTITY`. Applied only when `filter_by_kind` is `true`. |
+| label          | string           | Entity-label filter. Empty means no label filter.                           |
+| predicate      | HybridPredicate  | Optional property condition over node properties, including structural incident-edge-count terms. Absent means no property filter. |
+
+The response carries `nodes` (a page of `TypedNode`), `next_cursor` (the last id in the page; `0` when exhausted), and `has_more`.
+
+**EnumerateEdges** (`EnumerateEdgesRequest` -> `EnumerateEdgesResponse`):
+
+| Field                    | Type            | Description                                                                 |
+|--------------------------|-----------------|-----------------------------------------------------------------------------|
+| collection               | string          | Collection name.                                                            |
+| after_id                 | uint64          | Cursor. Returns edges with id strictly greater than this. `0` starts at the beginning. |
+| limit                    | uint32          | Page size (server-clamped).                                                 |
+| edge_type                | string          | Edge-type filter. Empty means no type filter.                               |
+| predicate                | HybridPredicate | Optional property condition over edge properties. Absent means no filter. Node-only structural incident-edge-count terms are rejected here. |
+| endpoint_label           | string          | Endpoint-node label constraint. An edge passes when one endpoint (source or target) node matches. Empty means no constraint. |
+| endpoint_kind            | TypedNodeKind   | Endpoint-node kind constraint. Applied only when `filter_by_endpoint_kind` is `true`. |
+| filter_by_endpoint_kind  | bool            | When `true`, apply `endpoint_kind`.                                         |
+
+The response carries `edges` (a page of `TypedEdge`), `next_cursor`, and `has_more`.
+
+### Hybrid Query Plans (hybrid mode)
+
+```text
+POST /api/v1/collections/{collection}/hybrid_query
+```
+
+Runs a composable plan of steps. Each step consumes the current frontier and produces the next. Over REST the request body is the plan itself, and the response carries `nodes`, `edges`, and `paths`. The gRPC equivalent is `HybridQuery(HybridQueryRequest) returns (HybridQueryResponse)`, where the request carries `collection`, the `plan`, and an optional `rrf_rank` ranking spec.
+
+**JSON encoding.** Over REST, a plan is `{"steps": [ ... ], "return_kind": "Nodes"}`. The `return_kind` is one of `"Nodes"`, `"Edges"`, or `"Paths"` (PascalCase). Each step is an externally-tagged JSON object keyed by the step name in PascalCase, for example `{"Traverse": { ... }}`. This mirrors the proto `HybridStep` oneof, whose field names are the snake_case forms (`traverse`, `k_hop`, `shortest_path`, `scan_by_filter`, `vector_math`, and so on). The step names and their parameters are below; steps not listed here are unchanged from prior versions.
+
+#### scan_by_filter (source step)
+
+Seeds the frontier by scanning the graph for nodes matching an optional kind, entity label, and property condition. A source step: it takes no vector and no explicit ids. An all-empty filter yields every node.
+
+REST step shape (`ScanByFilter`):
+
+| Field     | Type    | Description                                                                 |
+|-----------|---------|-----------------------------------------------------------------------------|
+| is_entity | bool    | `true` keeps only entity nodes, `false` keeps only content nodes. Omitted (`null`) means no kind filter. |
+| label     | string  | Entity-label filter. Omitted (`null`) means no label filter.                |
+| predicate | object  | Optional property condition (see [Predicates](#predicates)). Omitted means no property condition. |
+
+```json
+{"ScanByFilter": {"is_entity": true, "label": "Person", "predicate": {"Exists": {"field": {"Property": "email"}}}}}
+```
+
+The gRPC step is `HybridScanByFilter` with `filter_by_kind` (bool), `kind` (`TypedNodeKind`), `label` (string), and `predicate` (`HybridPredicate`). When `filter_by_kind` is `true`, `kind == TYPED_NODE_ENTITY` maps to `is_entity: true` and `TYPED_NODE_CONTENT` to `is_entity: false`.
+
+#### Predicates
+
+Predicates are externally-tagged JSON objects keyed by PascalCase variant name. A field reference is one of `{"Property": "<key>"}`, `"Label"`, `"Kind"`, or the node-only structural source `{"IncidentEdgeCount": {"edge_type": "<type>", "direction": "<dir>"}}`. The comparison operator is one of `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`.
+
+The structural `IncidentEdgeCount` reference resolves to the count of a node's incident edges, optionally constrained by `edge_type` (empty means any type) and `direction`. `direction` is one of `outgoing`, `incoming`, or `both`; when omitted it defaults to `outgoing`. This term is node-only: it is meaningful in node scans and node enumeration, and is rejected on edge enumeration.
+
+| Predicate | Shape | Meaning |
+|-----------|-------|---------|
+| Compare   | `{"Compare": {"field": <ref>, "op": "Ge", "value": 3}}` | `field op value` |
+| In        | `{"In": {"field": <ref>, "values": [ ... ]}}` | field value is in the set |
+| NotIn     | `{"NotIn": {"field": <ref>, "values": [ ... ]}}` | field value is not in the set |
+| Exists    | `{"Exists": {"field": <ref>}}` | field resolves to a value |
+| And       | `{"And": [ <pred>, ... ]}` | all match |
+| Or        | `{"Or": [ <pred>, ... ]}` | at least one matches |
+| Not       | `{"Not": <pred>}` | negate |
+| Always    | `"Always"` | always true |
+
+A structural example, "entity nodes with at least three outgoing `KNOWS` edges":
+
+```json
+{"Compare": {"field": {"IncidentEdgeCount": {"edge_type": "KNOWS", "direction": "outgoing"}}, "op": "Ge", "value": 3}}
+```
+
+The gRPC mirror is `HybridPredicate` (a oneof over `HybridCompare`, `HybridInList`, `HybridPredicateList`, and so on), with the field reference as `HybridPropertyRef` (a oneof over `property`, `label`, `kind`, and `HybridIncidentEdgeCount`). On the gRPC surface, comparison values are carried as JSON scalar literals in `value_json` / `values_json`; over REST they are plain JSON.
+
+#### Edge weighting (weight, order_by_weight)
+
+`KHop` and `ShortestPath` steps accept an optional edge-weight spec. When absent, every edge weighs 1.0 and behavior is unchanged.
+
+The weight spec (`weight` on a step) carries:
+
+| Field                | Type   | Description                                                       |
+|----------------------|--------|-------------------------------------------------------------------|
+| use_confidence       | bool   | Fold edge confidence into the weight.                             |
+| min_confidence       | float  | Drop edges below this confidence.                                 |
+| recency_half_life_ms | uint64 | Recency half-life in milliseconds. `0` means no recency decay.    |
+| use_explicit_weight  | bool   | Read a numeric weight from edge properties.                       |
+| explicit_weight_key  | string | Property key for the explicit weight. Empty falls back to `"weight"`. |
+
+`KHop` also accepts `order_by_weight` (bool): node membership is unchanged, only the output order shifts to descending accumulated edge weight. `ShortestPath` accepts `weighted` (bool): when `true`, it minimizes total path cost using the weight spec instead of hop count. The gRPC mirror is `HybridWeightSpec` on `HybridKHop.weight` / `HybridShortestPath.weight`, with `HybridKHop.order_by_weight` and `HybridShortestPath.weighted`.
+
+Edge weighting can also weight the bridge routes of the optional RRF ranking spec: `RrfRankSpec.edge_weight` (gRPC field 6) carries the same `HybridWeightSpec`. Absent means unweighted route counting.
+
+```json
+{"KHop": {
+  "edge_type": "CITES",
+  "max": 2,
+  "predicate": null,
+  "weight": {"use_confidence": true, "min_confidence": 0.5, "recency_half_life_ms": 0, "use_explicit_weight": false, "explicit_weight_key": ""},
+  "order_by_weight": true
+}}
+```
+
+#### Temporal traversal filter (temporal)
+
+`Traverse`, `KHop`, and `ShortestPath` steps accept an optional `temporal` filter (gRPC: `HybridTraverse.temporal` field 3, `HybridKHop.temporal` field 6, `HybridShortestPath.temporal` field 5). When absent, traversal is unfiltered and byte-identical to prior versions.
+
+The filter (REST `temporal` object, gRPC `HybridTemporalFilter`) carries:
+
+| Field             | Type   | Description                                                                 |
+|-------------------|--------|-----------------------------------------------------------------------------|
+| as_of             | uint64 | Instant for the time check, unix-epoch milliseconds. Omitted (`null`) means the server uses "now". |
+| include_unbounded | bool   | Whether edges with no validity window pass the time check.                  |
+| context           | string | Required regime/context. An edge must carry a matching `temporal_context`. Omitted (`null`) means context is ignored. |
+
+> Note on the gRPC default: `include_unbounded` is a plain proto3 bool, so omitting it on the wire yields `false`, which is stricter than the domain default. Because the whole filter message is optional (absence means no filtering at all), a client that sends a filter should set `include_unbounded` explicitly.
+
+```json
+{"Traverse": {
+  "edge_type": "EMPLOYED_AT",
+  "direction": "outgoing",
+  "temporal": {"as_of": 1717200000000, "include_unbounded": true, "context": "v2024"}
+}}
+```
+
+`direction` is one of `outgoing`, `incoming`, or `both`.
+
+#### vector_math (frontier-consuming step)
+
+The `VectorMath` step runs one vector-arithmetic operation over exactly the current node frontier and keeps the top-k. It is graph-then-vector: the graph has already fixed the candidate set, so the op runs over only those nodes.
+
+REST step shape (`VectorMath`):
+
+| Field      | Type   | Description                                                                 |
+|------------|--------|-----------------------------------------------------------------------------|
+| op         | object | The operation, an externally-tagged object (see below).                     |
+| k          | uint   | Number of frontier nodes to keep.                                           |
+| on_missing | string | Policy for frontier nodes that have no vector: `"Skip"` (drop and count) or `"Error"` (fail the query). |
+
+The `op` is one of six externally-tagged objects, matching the proto `HybridVectorMath` oneof (`analogy`, `diversity`, `cone`, `isolation`, `centroid`, `interpolate`):
+
+| op (REST key) | Operands | Behavior |
+|---------------|----------|----------|
+| Analogy     | `a`, `b`, `c` (float arrays) | Rank the frontier by ascending distance to `a - b + c`; top-k. |
+| Diversity   | `query` (float array), `lambda` (float) | MMR over the frontier; returns nodes in selection order, length `min(k, eligible)`. |
+| Cone        | `direction` (float array), `aperture_radians` (float) | Keep nodes whose angle to `direction` is within the aperture; rank by ascending angle; cap at k. |
+| Isolation   | `centroids` (array of float arrays) | Score each node by its minimum distance to any centroid; return the top-k most isolated. |
+| Centroid    | (none) | Compute the centroid of the frontier's own vectors; rank by ascending distance to it; top-k. |
+| Interpolate | `a`, `b` (float arrays), `t` (float) | Rank by ascending distance to the interpolated point between `a` and `b` at `t`; top-k. `t` must be in `[0, 1]`. |
+
+Analogy, Centroid, Interpolate, and Isolation rank by the collection's configured distance metric. Diversity and Cone use their own internal cosine, which is inherent to MMR scoring and cone geometry.
+
+For each frontier node the step resolves a vector in this order: an inline node embedding, else the indexed vector, else the `on_missing` policy. The frontier is bounded by a server cap.
+
+```json
+{"VectorMath": {
+  "op": {"Analogy": {"a": [0.1, 0.2], "b": [0.3, 0.4], "c": [0.5, 0.6]}},
+  "k": 10,
+  "on_missing": "Skip"
+}}
+```
+
+The gRPC step is `HybridVectorMath` (`HybridStep.vector_math`, field 14). Its oneof `op` selects one of `HybridAnalogy`, `HybridDiversity`, `HybridCone`, `HybridIsolation`, `HybridCentroid`, or `HybridInterpolate`; `k` (uint32) and `on_missing` (`HybridOnMissingVector`, `HYBRID_ON_MISSING_SKIP` or `HYBRID_ON_MISSING_ERROR`) follow. `HybridIsolation.centroids` is a list of `HybridVector` wrappers, each carrying a `values` float array, so a list-of-lists of floats can be expressed where proto3 cannot nest repeated fields directly.
+
+#### Example plan
+
+A plan that scans for entity nodes, expands two weighted hops as of a point in time, then ranks the frontier by an analogy:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/kb/hybrid_query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "steps": [
+      {"ScanByFilter": {"is_entity": true, "label": "Person", "predicate": null}},
+      {"KHop": {
+        "edge_type": "KNOWS",
+        "max": 2,
+        "predicate": null,
+        "weight": {"use_confidence": true, "min_confidence": 0.5, "recency_half_life_ms": 0, "use_explicit_weight": false, "explicit_weight_key": ""},
+        "order_by_weight": true,
+        "temporal": {"as_of": 1717200000000, "include_unbounded": true, "context": null}
+      }},
+      {"VectorMath": {"op": {"Centroid": {}}, "k": 10, "on_missing": "Skip"}}
+    ],
+    "return_kind": "Nodes"
+  }'
+```
+
+```json
+{
+  "nodes": [
+    {"id": 42, "node": {"id": 42, "kind": {"entity": {"label": "Person"}}, "properties": {}, "source": "manual", "created_at": 1717200000000}}
+  ],
+  "edges": [],
+  "paths": []
+}
+```
+
+The response `nodes` carry an `id` and, when the typed store resolved it, the full `node`. Returned edges are `TypedEdge` objects (carrying the temporal fields when set). `paths` are arrays of node ids.
 
 ### Extraction (hybrid mode)
 
@@ -1990,8 +2278,9 @@ Defined in `proto/swarndb/v1/graph.proto`.
 | SetThreshold | SetThresholdRequest | SetThresholdResponse | Set similarity threshold    |
 | PutNode         | PutNodeRequest         | PutNodeResponse         | Create a typed node (hybrid mode)             |
 | GetNode         | GetNodeRequest         | GetNodeResponse         | Get a typed node by id (hybrid mode)          |
+| UpdateNode      | UpdateNodeRequest      | UpdateNodeResponse      | Update a node's property bag with an audit entry (hybrid mode) |
 | DeleteNode      | DeleteNodeRequest      | DeleteNodeResponse      | Delete a typed node and its edges (hybrid)    |
-| PutEdge         | PutEdgeRequest         | PutEdgeResponse         | Create a typed edge (hybrid mode)             |
+| PutEdge         | PutEdgeRequest         | PutEdgeResponse         | Create a typed edge, optionally temporal (hybrid mode) |
 | GetEdge         | GetEdgeRequest         | GetEdgeResponse         | Get a typed edge by id (hybrid mode)          |
 | DeleteEdge      | DeleteEdgeRequest      | DeleteEdgeResponse      | Delete a typed edge (hybrid mode)             |
 | ListEdges       | ListEdgesRequest       | ListEdgesResponse       | List edges incident to a node (hybrid mode)   |
@@ -1999,9 +2288,11 @@ Defined in `proto/swarndb/v1/graph.proto`.
 | VerifyEdge      | VerifyEdgeRequest      | VerifyEdgeResponse      | Lock an edge against re-extraction            |
 | RejectEdge      | RejectEdgeRequest      | RejectEdgeResponse      | Delete an edge and remember the pattern       |
 | BulkImportEdges | BulkImportEdgesRequest | BulkImportEdgesResponse | Bulk import edges from CSV or JSONL           |
+| EnumerateNodes  | EnumerateNodesRequest  | EnumerateNodesResponse  | Paged, filtered whole-graph node read (cursor over sorted ids, hybrid mode) |
+| EnumerateEdges  | EnumerateEdgesRequest  | EnumerateEdgesResponse  | Paged, filtered whole-graph edge read (cursor over sorted ids, hybrid mode) |
 | HybridQuery     | HybridQueryRequest     | HybridQueryResponse     | Run a composable hybrid query plan            |
 
-The RPCs above `PutNode` are unchanged. Everything from `PutNode` down is additive and active only on `hybrid` collections; see [Graph as a First-Class Layer](graph-first-class.md).
+The RPCs above `PutNode` are unchanged. Everything from `PutNode` down is additive and active only on `hybrid` collections; see [Typed Graph: Overview](graph-first-class.md).
 
 #### ExtractionService
 
@@ -2099,9 +2390,9 @@ client.vectors.insert(
 )
 
 # Search
-results = client.search.search(
+results = client.search.query(
     collection="documents",
-    query=[0.1, 0.2, 0.3, ...],
+    vector=[0.1, 0.2, 0.3, ...],
     k=10,
     include_metadata=True,
     include_graph=True,
@@ -2132,9 +2423,9 @@ clusters = client.math.cluster(
 from swarndb import AsyncSwarnDBClient
 
 async_client = AsyncSwarnDBClient("localhost:50051")
-results = await async_client.search.search(
+results = await async_client.search.query(
     collection="documents",
-    query=[0.1, 0.2, 0.3, ...],
+    vector=[0.1, 0.2, 0.3, ...],
     k=10
 )
 ```

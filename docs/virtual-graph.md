@@ -1,8 +1,10 @@
 # Virtual Graph Layer
 
-SwarnDB's virtual graph layer is the feature that separates it from every other vector database. While traditional vector databases return a flat list of nearest neighbors, SwarnDB automatically builds a similarity graph on top of your vectors, enabling multi-hop discovery, relationship traversal, and graph-amplified search.
+The virtual graph (SwarnDB's automatic similarity graph) gives you multi-hop discovery and graph-amplified search over your vectors with zero setup. While a plain vector search returns a flat list of nearest neighbors, SwarnDB automatically builds a similarity graph on top of your vectors, so you can traverse relationships and expand a search through structure without building or maintaining anything yourself.
 
 This guide explains how the virtual graph works, how to configure it, and how to use it effectively.
+
+> **Orientation.** This documents the virtual graph (the automatic similarity graph), which is one of two graph surfaces in SwarnDB. The other is the typed graph: an explicit, curated graph of typed nodes and edges with provenance, queried with composable hybrid queries on `hybrid` collections. If you want explicit relationships you build yourself (rather than edges derived from similarity), start with the [Typed Graph: Overview](graph-first-class.md) overview and the [Typed Graph: Complete Guide](graph-guide.md). For where the virtual graph fits among collection modes, see [Core Concepts](core-concepts.md).
 
 ---
 
@@ -348,9 +350,9 @@ from swarndb.search import Filter
 
 client = SwarnDBClient("localhost:50051")
 
-results = client.search.search(
+results = client.search.query(
     "articles",
-    query=[0.1, 0.2, 0.3, 0.4],
+    vector=[0.1, 0.2, 0.3, 0.4],
     k=5,
     include_graph=True,
     graph_threshold=0.8,
@@ -478,7 +480,7 @@ Map relationships between articles, products, or documents. The graph reveals cl
 edges = client.graph.get_related("articles", vector_id=article_id, max_results=20)
 
 # Use graph-enriched search to find articles with rich context
-results = client.search.search(
+results = client.search.query(
     "articles", vector=query_vector, k=10,
     include_graph=True, graph_threshold=0.8
 )
@@ -511,3 +513,12 @@ nodes = client.graph.traverse(
 | Set threshold | `/api/v1/collections/{collection}/graph/threshold` | POST |
 | Graph-enriched search | `/api/v1/collections/{collection}/search` (with `include_graph: true`) | POST |
 | Optimize (rebuild graph) | `/api/v1/collections/{collection}/optimize` | POST |
+
+---
+
+## Related docs
+
+- [Typed Graph: Overview](graph-first-class.md): the short overview of both graph surfaces and which one to use.
+- [Typed Graph: Complete Guide](graph-guide.md): the complete how-to and API reference for the typed graph (the explicit, curated graph on `hybrid` collections).
+- [Core Concepts](core-concepts.md): collection modes, including where the virtual graph (`auto_similarity`) fits.
+- [API Reference](api-reference.md): the full REST routes and gRPC contracts for the graph operations above.

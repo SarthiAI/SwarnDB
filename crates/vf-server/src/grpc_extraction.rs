@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! gRPC surface for the LLM extraction service. Every handler gates on
 //! collection readiness and Hybrid mode, then delegates to the shared

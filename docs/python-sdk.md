@@ -1,6 +1,6 @@
 # Python SDK
 
-The SwarnDB Python SDK provides synchronous and asynchronous clients for interacting with a SwarnDB server over gRPC. It covers collections, vectors, search, the virtual graph, the first-class typed graph and hybrid queries, LLM extraction, and vector math operations.
+The SwarnDB Python SDK provides synchronous and asynchronous clients for interacting with a SwarnDB server over gRPC. It covers collections, vectors, search, the virtual graph (SwarnDB's automatic similarity graph), the first-class typed graph and hybrid queries, LLM extraction, and vector math operations.
 
 **Source:** [github.com/SarthiAI/swarndb](https://github.com/SarthiAI/swarndb)
 
@@ -552,7 +552,7 @@ print(f"Total batch time: {batch.total_time_us}us")
 
 Access via `client.graph`. SwarnDB's virtual graph automatically connects similar vectors based on a similarity threshold. On `hybrid` collections, `client.graph` also manages a first-class typed graph and a composable hybrid query builder.
 
-For the complete, end-to-end treatment of the whole graph surface (virtual graph, typed nodes and edges, all 12 hybrid-query steps, all 3 terminals, sub-plans, all 14 predicate helpers, edge curation, the audit trail, and async patterns), see the [Graph Guide](graph-guide.md). This section is the quick reference.
+For the complete, end-to-end treatment of the whole graph surface (virtual graph, typed nodes and edges, all 12 hybrid-query steps, all 3 terminals, sub-plans, all 14 predicate helpers, edge curation, the audit trail, and async patterns), see the [Typed Graph: Complete Guide](graph-guide.md). This section is the quick reference.
 
 ### Set Collection Threshold
 
@@ -633,7 +633,7 @@ with SwarnDBClient(host="localhost", port=50051) as client:
 
 ### Typed Graph (hybrid mode)
 
-On a `hybrid` collection, `client.graph` also manages a first-class typed graph of nodes and edges. See [Graph as a First-Class Layer](graph-first-class.md) for the full picture.
+On a `hybrid` collection, `client.graph` also manages a first-class typed graph of nodes and edges. See [Typed Graph: Overview](graph-first-class.md) for the full picture.
 
 ```python
 # Nodes
@@ -676,7 +676,99 @@ report = client.graph.bulk_import_edges("docs_graph", csv_data, format="csv", au
 print(report.total_rows, report.imported, report.failed, report.errors)
 ```
 
-Verify and reject are not symmetric: verify keeps the edge and marks it trustworthy (and protects it from re-extraction), while reject deletes it and can record a rule so the same wrong relationship is not re-proposed later. See the [Graph Guide](graph-guide.md) for the full curation and re-extraction semantics.
+Verify and reject are not symmetric: verify keeps the edge and marks it trustworthy (and protects it from re-extraction), while reject deletes it and can record a rule so the same wrong relationship is not re-proposed later. See the [Typed Graph: Complete Guide](graph-guide.md) for the full curation and re-extraction semantics.
+
+#### Updating a node (mutable property bag, immutable provenance)
+
+`client.graph.update_node` revises a node's property bag and records an audit entry. Only the property bag is mutable: the provenance (`source`, `created_at`, `created_by`) and the `embedding` are immutable and are never touched. Omitting `properties` performs an audit-only touch (the bag stays as it was). The call returns the updated `TypedNode`.
+
+```python
+node = client.graph.update_node(
+    "docs_graph", node_id,
+    properties={"name": "Ada Lovelace", "note": "first programmer"},
+    actor="curator",
+)
+print(node.properties, node.updated_at)
+
+# Audit-only touch: omit properties to leave the bag unchanged.
+client.graph.update_node("docs_graph", node_id, actor="curator")
+```
+
+**Signature:**
+
+```python
+update_node(collection, node_id, *, properties=None, actor="") -> TypedNode
+```
+
+#### Temporal edges (opt-in validity window and context)
+
+`put_edge` takes three optional temporal keyword arguments. All default off, so omitting them creates an always-valid, context-free edge exactly as before. Pass them to give an edge a validity window and a regime label:
+
+- `valid_from` and `valid_until` are unix-epoch milliseconds; `valid_until` is exclusive. Either may be `None` (unbounded on that side).
+- `temporal_context` is a free-form string regime label (for example `"forecast"` or `"as-reported"`).
+
+```python
+edge_id = client.graph.put_edge(
+    "docs_graph",
+    source=42, target=node_id, edge_type="EMPLOYED_AT",
+    valid_from=1704067200000,        # 2024-01-01, unix-epoch millis
+    valid_until=1735689600000,        # 2025-01-01, exclusive
+    temporal_context="as-reported",
+)
+
+edge = client.graph.get_edge("docs_graph", edge_id)
+print(edge.valid_from, edge.valid_until, edge.temporal_context)
+```
+
+These three fields read back on the `TypedEdge` returned by `get_edge`, `list_edges`, and the enumeration methods; each is `None` when the edge was created without it.
+
+#### Reading nodes and edges by filter (paginated enumeration)
+
+To walk the whole graph (rather than start from a vector or a known id), use the paginated read methods. They return a `NodePage` / `EdgePage` carrying the rows plus a `next_cursor` and `has_more`. Pass the previous `next_cursor` back as `after_id` to page forward; the page size is server-clamped.
+
+```python
+from swarndb import Predicate
+
+# One page of entity nodes labeled "Person".
+page = client.graph.enumerate_nodes(
+    "docs_graph",
+    kind="entity",                    # "content" or "entity"
+    label="Person",
+    predicate=Predicate.exists("name"),
+    after_id=0, limit=500,
+)
+for node in page.nodes:
+    print(node.id, node.label, node.properties)
+if page.has_more:
+    next_page = client.graph.enumerate_nodes("docs_graph", after_id=page.next_cursor)
+
+# One page of CITES edges, optionally constrained by an endpoint node.
+epage = client.graph.enumerate_edges(
+    "docs_graph",
+    edge_type="CITES",
+    endpoint_label="Paper",
+    endpoint_kind="content",          # an endpoint (source or target) must match
+    after_id=0, limit=500,
+)
+for edge in epage.edges:
+    print(edge.id, edge.source, edge.target)
+```
+
+**Signatures:**
+
+```python
+enumerate_nodes(collection, *, after_id=0, limit=1000, kind=None, label="", predicate=None) -> NodePage
+enumerate_edges(collection, *, after_id=0, limit=1000, edge_type="", predicate=None, endpoint_label="", endpoint_kind=None) -> EdgePage
+```
+
+For convenience, `iter_nodes` and `iter_edges` walk every page to exhaustion and yield each row, so you do not manage the cursor yourself:
+
+```python
+for node in client.graph.iter_nodes("docs_graph", kind="entity", label="Person"):
+    ...
+for edge in client.graph.iter_edges("docs_graph", edge_type="CITES"):
+    ...
+```
 
 ### Hybrid Query Builder (hybrid mode)
 
@@ -717,7 +809,186 @@ for node in result.nodes:
 # populated, matching the terminal you called.
 ```
 
-The async client mirrors this; build the same chain and `await` the terminal call. For the full hybrid-query surface (every step, sub-plan composition, and the predicate JSON wire encoding) see the [Graph Guide](graph-guide.md).
+The async client mirrors this; build the same chain and `await` the terminal call. For the full hybrid-query surface (every step, sub-plan composition, and the predicate JSON wire encoding) see the [Typed Graph: Complete Guide](graph-guide.md).
+
+#### Seeding by graph filter: `scan_by_filter`
+
+`scan_by_filter` is a source step (like `vector_similar` or `from_nodes`) that needs no vector and no ids. It seeds the frontier from nodes matching an optional `kind`, entity `label`, and `predicate` (a property condition, including the structural incident-edge-count term below). Chain the normal traversal and refinement steps after it.
+
+```python
+from swarndb import Predicate
+
+result = (
+    client.graph.query("docs_graph")
+    .scan_by_filter(
+        kind="entity",                       # "content" or "entity"
+        label="Person",
+        predicate=Predicate.exists("orcid"),
+    )
+    .traverse("AUTHORED_BY", direction=Direction.INCOMING)
+    .limit(50)
+    .return_nodes()
+)
+```
+
+**Signature:**
+
+```python
+scan_by_filter(*, kind=None, label="", predicate=None) -> builder
+```
+
+#### Quality-weighted traversal and ranking (opt-in)
+
+A `WeightSpec` folds edge quality (confidence, recency decay, or an explicit numeric property) into the per-edge weight used by `k_hop`, `shortest_path`, and `rank_rrf`. It is imported from `swarndb`. All of its fields default off, so omitting a `WeightSpec` (or passing one built with no arguments) keeps every edge at weight 1.0 and leaves traversal and ranking unchanged.
+
+`WeightSpec` fields:
+
+| Field                  | Type    | Default    | Description                                                        |
+|------------------------|---------|------------|--------------------------------------------------------------------|
+| `use_confidence`       | `bool`  | `False`    | Fold each edge's confidence into its weight                        |
+| `min_confidence`       | `float` | `0.0`      | Drop edges below this confidence                                   |
+| `recency_half_life_ms` | `int`   | `0`        | Recency decay half-life in milliseconds (0 = no decay)             |
+| `use_explicit_weight`  | `bool`  | `False`    | Read the weight from a numeric edge property                       |
+| `explicit_weight_key`  | `str`   | `"weight"` | Property key to read when `use_explicit_weight` is set             |
+
+Pass `weight` (and, on `k_hop`, `order_by_weight=True` to order the frontier by accumulated weight) to enable it:
+
+```python
+from swarndb import WeightSpec, Predicate
+
+# k_hop weighted by confidence, frontier ordered by accumulated weight.
+result = (
+    client.graph.query("docs_graph")
+    .vector_similar(query_vector, k=20)
+    .k_hop(
+        "CITES", max=2,
+        weight=WeightSpec(use_confidence=True, min_confidence=0.5),
+        order_by_weight=True,
+    )
+    .limit(10)
+    .return_nodes()
+)
+
+# Weighted shortest path: cost-weighted instead of hop count.
+paths = (
+    client.graph.query("docs_graph")
+    .from_node(42)
+    .shortest_path(
+        ["CITES"], target=99,
+        weighted=True,
+        weight=WeightSpec(use_explicit_weight=True, explicit_weight_key="cost"),
+    )
+    .return_paths()
+)
+
+# RRF ranking weighted by bridge-route edge quality.
+fused = (
+    client.graph.query("docs_graph")
+    .vector_similar(query_vector, k=10)
+    .traverse("mentions", direction="outgoing")
+    .k_hop("CITES", max=2)
+    .traverse("mentions", direction="incoming")
+    .rank_rrf(k=10, relation_edge_types=["CITES"],
+              edge_weight=WeightSpec(use_confidence=True))
+    .return_nodes()
+)
+```
+
+**Relevant signatures:**
+
+```python
+k_hop(edge_type=None, max=1, predicate=None, *, weight=None, order_by_weight=False,
+      as_of=None, include_unbounded=True, context=None) -> builder
+shortest_path(edge_types, target, *, weighted=False, weight=None,
+              as_of=None, include_unbounded=True, context=None) -> builder
+rank_rrf(k, *, rrf_k=60, k_hop_max=2, relation_edge_types=None,
+         hub_damping=0.0, edge_weight=None) -> builder
+```
+
+#### Temporal traversal (opt-in)
+
+`traverse`, `k_hop`, and `shortest_path` each take three optional temporal keyword arguments that restrict a hop to edges valid at a point in time and regime. They mirror the temporal fields on `put_edge`. All default to no filtering, so omitting them leaves the hop unchanged:
+
+- `as_of` is a unix-epoch milliseconds instant; the hop keeps only edges whose validity window contains it.
+- `include_unbounded` (default `True`) decides whether edges with no validity window (always-valid edges) are kept.
+- `context` is a regime label; the hop keeps only edges in that context.
+
+```python
+result = (
+    client.graph.query("docs_graph")
+    .from_node(42)
+    .traverse(
+        "EMPLOYED_AT", direction="outgoing",
+        as_of=1719792000000,          # 2024-07-01, unix-epoch millis
+        include_unbounded=False,
+        context="as-reported",
+    )
+    .return_nodes()
+)
+```
+
+#### Vector-math over the graph frontier (opt-in)
+
+Six frontier steps rank or filter the current node frontier by vector geometry. They are opt-in refinement steps: they run only when you add them, and they operate exactly over the frontier the graph has already produced (no ANN). Each takes `on_missing` to govern frontier nodes that carry no vector, `"skip"` (the default, which drops and counts them) or `"error"` (which fails the query). On `diversity_rank` the relevance-versus-diversity trade-off parameter is named `lambda_` (with the trailing underscore, since `lambda` is a Python keyword).
+
+```python
+# Analogy: rank by distance to a - b + c.
+client.graph.query("docs_graph").from_nodes(ids).analogy_rank(a, b, c, k=10).return_nodes()
+
+# Diversity (MMR): lambda_ in [0, 1] trades relevance vs. diversity.
+client.graph.query("docs_graph").from_nodes(ids).diversity_rank(query_vec, lambda_=0.7, k=10).return_nodes()
+
+# Cone: keep nodes within an angular cone around a direction.
+import math
+client.graph.query("docs_graph").from_nodes(ids).cone_filter(direction, math.pi / 6, k=10).return_nodes()
+
+# Isolation: rank the most isolated first (min distance to any centroid).
+client.graph.query("docs_graph").from_nodes(ids).isolation_rank(centroids, k=10).return_nodes()
+
+# Centroid: rank by closeness to the frontier's own mean (most representative first).
+client.graph.query("docs_graph").from_nodes(ids).centroid_rank(k=10).return_nodes()
+
+# Interpolate: rank by distance to the point between a and b at fraction t.
+client.graph.query("docs_graph").from_nodes(ids).interpolate_rank(a, b, t=0.5, k=10).return_nodes()
+```
+
+**Signatures:**
+
+```python
+analogy_rank(a, b, c, k, *, on_missing="skip") -> builder
+diversity_rank(query, lambda_, k, *, on_missing="skip") -> builder
+cone_filter(direction, aperture_radians, k, *, on_missing="skip") -> builder
+isolation_rank(centroids, k, *, on_missing="skip") -> builder
+centroid_rank(k, *, on_missing="skip") -> builder
+interpolate_rank(a, b, t, k, *, on_missing="skip") -> builder
+```
+
+#### Structural predicate: incident-edge count
+
+Alongside the property predicates, `Predicate.incident_edges` is a node-only structural term: it compares the count of a node's incident edges against a value, optionally constrained by `edge_type` and `direction`. The comparison operator is one of the `graph_pb2.HYBRID_CMP_*` constants. Use it inside `filter`, `scan_by_filter`, or the enumeration `predicate` argument.
+
+```python
+from swarndb import Predicate
+from swarndb._proto import graph_pb2
+
+# Nodes with at least three outgoing CITES edges.
+hubs = (
+    client.graph.query("docs_graph")
+    .scan_by_filter(
+        predicate=Predicate.incident_edges(
+            graph_pb2.HYBRID_CMP_GE, 3,
+            edge_type="CITES", direction="outgoing",
+        ),
+    )
+    .return_nodes()
+)
+```
+
+**Signature:**
+
+```python
+Predicate.incident_edges(op, value, *, edge_type=None, direction="outgoing") -> predicate
+```
 
 #### One-call graph-augmented retrieval: `graph_rag` (recommended)
 
@@ -737,18 +1008,19 @@ Signature:
 ```python
 graph_rag(
     collection, query_vector, k=10, *,
-    mentions_edge_type="mentions", relation_edge_types=None,
-    k_hop_max=2, rrf_k=60, hub_damping=0.0, ef_search=None,
+    fusion="vector_rank", mentions_edge_type="mentions",
+    relation_edge_types=None, k_hop_max=2, rrf_k=60,
+    hub_damping=0.0, ef_search=None,
 ) -> HybridQueryResult
 ```
 
-`vector_rank` is the default because, on real data at scale, it ties plain vector retrieval on overall accuracy and wins on the hard multi-hop and adversarial questions, while the older RRF fusion regressed below plain vector retrieval. RRF stays fully supported as an explicit opt-in (build the chain in the [Graph Guide](graph-guide.md) section 4.5 and call `.rank_rrf(...)`); it is just no longer the default. Plain `client.graph.query(...).vector_similar(...).return_nodes()` stays the zero-cost vector-only default. The async client mirrors it: `await client.graph.graph_rag(...)`. See the [Graph Guide](graph-guide.md) section 4.6 for the exact composed plan and the explicit equivalent.
+`vector_rank` is the default because, on real data at scale, it ties plain vector retrieval on overall accuracy and wins on the hard multi-hop and adversarial questions, while the older RRF fusion regressed below plain vector retrieval. RRF stays fully supported as an explicit opt-in via `graph_rag(..., fusion="rrf")`, which opts into Reciprocal Rank Fusion in one call (the explicit chain in the [Typed Graph: Complete Guide](graph-guide.md) section 4.5 ending in `.rank_rrf(...)` is the customizable equivalent); it is just no longer the default. Plain `client.graph.query(...).vector_similar(...).return_nodes()` stays the zero-cost vector-only default. The async client mirrors it: `await client.graph.graph_rag(...)`. See the [Typed Graph: Complete Guide](graph-guide.md) section 4.6 for the exact composed plan and the explicit equivalent.
 
 ---
 
 ## 7a. LLM Extraction (hybrid mode)
 
-Access via `client.extraction`. These methods work only on `hybrid` collections and turn text chunks into typed entities and edges using your own LLM. See [LLM Extraction](llm-extraction.md) for the concepts and the [Graph Guide](graph-guide.md) for the full extraction API (cost preview, jobs, proposals, partial-success, truncation auto-retry, and incremental re-extraction) with runnable examples; the server needs `SWARNDB_MASTER_KEY` set to store api keys.
+Access via `client.extraction`. These methods work only on `hybrid` collections and turn text chunks into typed entities and edges using your own LLM. See [LLM Extraction](llm-extraction.md) for the concepts and the [Typed Graph: Complete Guide](graph-guide.md) for the full extraction API (cost preview, jobs, proposals, partial-success, truncation auto-retry, and incremental re-extraction) with runnable examples; the server needs `SWARNDB_MASTER_KEY` set to store api keys.
 
 ```python
 from swarndb import Chunk, EntityLabel, EdgeType
@@ -1289,6 +1561,64 @@ A node visited during graph traversal.
 | `depth`           | `int`        | Hop distance from start            |
 | `path_similarity` | `float`      | Cumulative similarity along path   |
 | `path`            | `list[int]`  | Vector IDs along the traversal path|
+
+### TypedNode
+
+A node in the first-class typed graph (Hybrid mode). Returned by `get_node`, `update_node`, the enumeration methods, and node query terminals.
+
+| Field         | Type             | Description                                              |
+|---------------|------------------|----------------------------------------------------------|
+| `id`          | `int`            | Node ID                                                  |
+| `kind`        | `str`            | `"content"` or `"entity"`                                |
+| `label`       | `str`            | Entity label (empty for content nodes)                   |
+| `properties`  | `dict[str, Any]` | Mutable property bag                                     |
+| `embedding`   | `list[float]`    | Inline embedding (immutable; empty when none)            |
+| `source`      | `str`            | Provenance source (immutable)                            |
+| `created_at`  | `int`            | Creation time, unix-epoch millis (immutable)            |
+| `created_by`  | `str`            | Creator (immutable)                                      |
+| `history`     | `list[NodeAudit]`| Audit trail of `NodeAudit(action, actor, at)`           |
+| `updated_at`  | `int`            | Last-update time, unix-epoch millis                      |
+
+### TypedEdge
+
+A typed, directed edge in the first-class graph (Hybrid mode). Returned by `get_edge`, `list_edges`, the enumeration methods, and edge query terminals.
+
+| Field              | Type              | Description                                                              |
+|--------------------|-------------------|--------------------------------------------------------------------------|
+| `id`               | `int`             | Edge ID                                                                  |
+| `source`           | `int`             | Source node ID                                                           |
+| `target`           | `int`             | Target node ID                                                           |
+| `edge_type`        | `str`             | Edge type                                                               |
+| `properties`       | `dict[str, Any]`  | Property bag                                                             |
+| `provenance`       | `dict[str, Any]`  | Provenance bag                                                           |
+| `confidence`       | `float`           | Confidence score                                                        |
+| `verified`         | `bool`            | Whether the edge has been verified                                      |
+| `is_manual`        | `bool`            | Whether the edge was created manually                                   |
+| `created_at`       | `int`             | Creation time, unix-epoch millis                                        |
+| `history`          | `list[EdgeAudit]` | Audit trail of `EdgeAudit(action, actor, at)`                           |
+| `valid_from`       | `int` or `None`   | Start of the validity window, unix-epoch millis; `None` when unbounded   |
+| `valid_until`      | `int` or `None`   | End of the validity window (exclusive); `None` when unbounded            |
+| `temporal_context` | `str` or `None`   | Regime label; `None` when context-free                                  |
+
+### NodePage
+
+One page of a paginated node enumeration, returned by `enumerate_nodes`.
+
+| Field         | Type              | Description                                          |
+|---------------|-------------------|------------------------------------------------------|
+| `nodes`       | `list[TypedNode]` | Nodes in this page                                   |
+| `next_cursor` | `int`             | Pass as `after_id` to fetch the next page; 0 when exhausted |
+| `has_more`    | `bool`            | Whether more pages remain                            |
+
+### EdgePage
+
+One page of a paginated edge enumeration, returned by `enumerate_edges`.
+
+| Field         | Type              | Description                                          |
+|---------------|-------------------|------------------------------------------------------|
+| `edges`       | `list[TypedEdge]` | Edges in this page                                   |
+| `next_cursor` | `int`             | Pass as `after_id` to fetch the next page; 0 when exhausted |
+| `has_more`    | `bool`            | Whether more pages remain                            |
 
 ### GhostVector
 

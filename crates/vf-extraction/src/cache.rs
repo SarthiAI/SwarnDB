@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! The extraction cache: a hot-value LRU over an append-only jsonl index on
 //! disk, with a full-coverage on-disk offset index so no entry that is on disk

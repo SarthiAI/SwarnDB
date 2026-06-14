@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! Serializable hybrid query plan: an ordered list of steps plus the kind of
 //! result to materialize. Plans travel on the wire and are produced by the
@@ -202,7 +201,18 @@ pub enum Step {
     /// breaks ties. `on_missing` governs frontier nodes with no vector. This is
     /// the DEFAULT graph-augmented ranking step (graph-first scope-then-rank,
     /// ADR-024): the graph scopes the candidate set, then this ranks it exactly.
-    VectorRank { vector: Vec<f32>, k: usize, on_missing: OnMissingVector },
+    /// `predicate` is the opt-in filter-then-rank condition (ADR-034): when Some,
+    /// the engine narrows the CURRENT frontier to nodes satisfying it BEFORE ranking
+    /// (pre-filter, never post-filter); an empty frontier ranks to empty. To rank
+    /// over the complete set of all nodes matching a condition, seed with
+    /// `scan_by_filter` first. None means no filtering, byte-identical to legacy.
+    VectorRank {
+        vector: Vec<f32>,
+        k: usize,
+        on_missing: OnMissingVector,
+        #[serde(default)]
+        predicate: Option<Predicate>,
+    },
     /// Run a vector-math operation over the current node frontier, keeping top-k
     /// (P17). Frontier-consuming (graph -> vector): the graph has already fixed
     /// the candidate set, so each op runs over exactly these nodes. Reuses the

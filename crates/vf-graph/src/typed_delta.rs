@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! Typed graph delta log (the v3 delta stream). Mirrors `graph_delta.rs` but
 //! records typed node and edge operations rather than similarity edges.

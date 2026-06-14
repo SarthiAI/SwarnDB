@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! Type-state query builder. The frontier kind is tracked in the type system so
 //! illegal compositions fail at compile time rather than at run time.
@@ -276,7 +275,29 @@ impl QueryBuilder<OnNodes> {
     /// `on_missing` governs frontier nodes that have no vector (entity nodes):
     /// `Skip` (default) drops and counts them, `Error` fails the query.
     pub fn vector_rank(mut self, vector: Vec<f32>, k: usize, on_missing: OnMissingVector) -> QueryBuilder<OnNodes> {
-        self.steps.push(Step::VectorRank { vector, k, on_missing });
+        self.steps.push(Step::VectorRank { vector, k, on_missing, predicate: None });
+        self
+    }
+
+    /// Filter-then-rank variant of `vector_rank` (ADR-034): narrow the CURRENT
+    /// frontier to nodes satisfying `predicate` BEFORE ranking (pre-filter, never
+    /// post-filter), then run the same exact similarity ranking inside that narrowed
+    /// set. An empty frontier ranks to empty (empty in, empty out). To rank over the
+    /// complete set of all nodes matching a condition, seed with `scan_by_filter`
+    /// first: `scan_by_filter(predicate).vector_rank(vector, k)`.
+    pub fn vector_rank_filtered(
+        mut self,
+        vector: Vec<f32>,
+        k: usize,
+        on_missing: OnMissingVector,
+        predicate: Predicate,
+    ) -> QueryBuilder<OnNodes> {
+        self.steps.push(Step::VectorRank {
+            vector,
+            k,
+            on_missing,
+            predicate: Some(predicate),
+        });
         self
     }
 

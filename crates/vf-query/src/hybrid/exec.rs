@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! Hybrid execution engine. Runs a [`QueryPlan`] against a vector index and a
 //! typed graph store, threading a runtime frontier through the steps and
@@ -49,6 +48,11 @@ const VECTOR_RANK_DISTANCE_COMPUTATIONS_TOTAL: &str =
 const VECTOR_RANK_LATENCY_SECONDS: &str = "swarndb_vector_rank_latency_seconds";
 /// Count of VectorRank steps rejected because the frontier exceeded the cap.
 const VECTOR_RANK_CAP_EXCEEDED_TOTAL: &str = "swarndb_vector_rank_cap_exceeded_total";
+/// Count of VectorRank steps that applied the opt-in filter-then-rank predicate (ADR-034).
+const VECTOR_RANK_FILTERED_TOTAL: &str = "swarndb_vector_rank_filtered_total";
+/// Count of nodes dropped by the filter-then-rank predicate before ranking (ADR-034).
+const VECTOR_RANK_PREDICATE_FILTERED_OUT_TOTAL: &str =
+    "swarndb_vector_rank_predicate_filtered_out_total";
 
 // ── VectorMath metric names (P17) ───────────────────────────────────────────
 /// Count of VectorMath steps executed, labelled by op.
@@ -655,7 +659,8 @@ impl<'a> HybridExecutor<'a> {
                 vector,
                 k,
                 on_missing,
-            } => self.step_vector_rank(vector, *k, *on_missing, frontier),
+                predicate,
+            } => self.step_vector_rank(vector, *k, *on_missing, predicate.as_ref(), frontier),
             Step::VectorMath { op, k, on_missing } => {
                 self.step_vector_math(op, *k, *on_missing, frontier)
             }
@@ -755,11 +760,12 @@ impl<'a> HybridExecutor<'a> {
         vector: &[f32],
         k: usize,
         on_missing: OnMissingVector,
+        predicate: Option<&super::predicate::Predicate>,
         frontier: Frontier,
     ) -> Result<Frontier, HybridQueryError> {
         // Consumes a node frontier only. The type-state builder guarantees this;
         // the guard is defensive for hand-built plans.
-        let ids = match frontier {
+        let incoming = match frontier {
             Frontier::Nodes(ids) => ids,
             _ => {
                 return Err(HybridQueryError::InvalidPlan(
@@ -769,8 +775,36 @@ impl<'a> HybridExecutor<'a> {
         };
 
         metrics::counter!(VECTOR_RANK_TOTAL).increment(1);
-        metrics::histogram!(VECTOR_RANK_FRONTIER_SIZE).record(ids.len() as f64);
+        metrics::histogram!(VECTOR_RANK_FRONTIER_SIZE).record(incoming.len() as f64);
         let started = Instant::now();
+
+        // Filter-then-rank (ADR-034). The predicate narrows the CURRENT frontier to
+        // nodes satisfying it BEFORE ranking (pre-filter, never post-filter). Empty
+        // in always yields empty out, on both paths: an upstream that legitimately
+        // filtered to zero nodes is honored, never replaced by a global store scan.
+        // To rank over the complete set of all nodes matching a condition, seed with
+        // scan_by_filter first. None = byte-identical legacy path (ids ranked as-is).
+        let ids = match predicate {
+            None => incoming,
+            Some(pred) => {
+                metrics::counter!(VECTOR_RANK_FILTERED_TOTAL).increment(1);
+                // Store-aware eval so structural terms resolve; an unmaterialized
+                // node fails any property predicate and is dropped (mirrors
+                // Step::Filter's on-missing discipline). An empty frontier filters
+                // to empty, exactly like the None path's empty-in/empty-out.
+                let before = incoming.len();
+                let kept: Vec<NodeId> = incoming
+                    .into_iter()
+                    .filter(|id| match self.store.get_node(*id) {
+                        Some(node) => pred.eval_node_with_store(&node, self.store),
+                        None => matches!(pred, super::predicate::Predicate::Always),
+                    })
+                    .collect();
+                metrics::counter!(VECTOR_RANK_PREDICATE_FILTERED_OUT_TOTAL)
+                    .increment((before - kept.len()) as u64);
+                kept
+            }
+        };
 
         // Cap guard: never silently truncate. An oversized frontier is a planning
         // problem the caller must narrow (or raise the cap deliberately).

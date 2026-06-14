@@ -295,7 +295,9 @@ Results are sorted by score in ascending order (most similar first).
 
 ## Exploring the Graph
 
-SwarnDB's **virtual graph** automatically discovers relationships between your vectors based on similarity. This lets you traverse connections between data points, similar to a graph database, but built entirely from vector proximity.
+The **virtual graph (SwarnDB's automatic similarity graph)** automatically discovers relationships between your vectors based on similarity. This lets you traverse connections between data points, similar to a graph database, but built entirely from vector proximity.
+
+SwarnDB has two graph surfaces, and you choose between them with a collection's mode. The **virtual graph** shown here is automatic: edges are derived from vector similarity, so you get "related vectors" and multi-hop discovery with zero setup (turned on by `mode="auto_similarity"`). The **typed graph** is explicit: you build and curate typed nodes and edges with provenance and run composable hybrid queries (turned on by `mode="hybrid"`). This section covers the virtual graph; for the typed graph, start with the [Typed Graph: Overview](graph-first-class.md) overview.
 
 ### Step 1: Set a similarity threshold
 
@@ -462,7 +464,7 @@ Now that you have SwarnDB running and know the basics, explore these topics:
 - **[Core Concepts](core-concepts.md)**: Understand how HNSW indexing, the virtual graph, and metadata filtering work under the hood.
 - **[API Reference](api-reference.md)**: Complete documentation for every REST and gRPC endpoint.
 - **[Python SDK](python-sdk.md)**: Full reference for the Python client, including advanced features like batch operations and graph-enriched search.
-- **[Graph as a First-Class Layer](graph-first-class.md)**: Build a typed graph of entities and relationships alongside your vectors with hybrid collections.
+- **[Typed Graph: Overview](graph-first-class.md)**: The typed graph overview and which graph to use (start here); pair it with the [Typed Graph: Complete Guide](graph-guide.md) for the complete how-to.
 - **[LLM Extraction](llm-extraction.md)**: Turn text chunks into typed entities and edges using your own LLM (bring your own key).
 - **[Bulk Ingestion](bulk-ingestion.md)**: Load vectors at scale and control when the search index is built.
 - **[Configuration](configuration.md)**: Tune SwarnDB for your workload with environment variables and runtime settings.

@@ -2,8 +2,8 @@ apiVersion: v2
 name: swarndb
 description: A Helm chart for SwarnDB - high-performance vector database
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 1.1.0
+appVersion: "1.1.0"
 keywords:
   - vector-database
   - similarity-search

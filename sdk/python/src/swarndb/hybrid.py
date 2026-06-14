@@ -304,7 +304,7 @@ class _BaseHybridQueryBuilder:
         self._steps.append(graph_pb2.HybridStep(vector_similar=sim))
         return self
 
-    def vector_rank(self, vector, k, *, on_missing="skip"):
+    def vector_rank(self, vector, k, *, on_missing="skip", predicate=None):
         """Rank the current node frontier by similarity to `vector`, keeping the
         top `k`. Graph-first (scope by structure, then rank by meaning): the graph
         has already fixed the candidate set, so scoring is exact over exactly those
@@ -312,6 +312,9 @@ class _BaseHybridQueryBuilder:
         order (most similar first), smaller node id breaking ties. `on_missing`
         governs frontier nodes with no vector: "skip" (default) drops and counts
         them, "error" fails the query.
+
+        `predicate` (optional) narrows the candidate set before ranking (filter
+        then search), so only matching nodes are scored.
         """
         on_missing_map = {
             "skip": graph_pb2.HYBRID_ON_MISSING_SKIP,
@@ -321,6 +324,8 @@ class _BaseHybridQueryBuilder:
         if key not in on_missing_map:
             raise ValueError(f"on_missing must be 'skip' or 'error', got {on_missing!r}")
         rank = graph_pb2.HybridVectorRank(vector=list(vector), k=k, on_missing=on_missing_map[key])
+        if predicate is not None:
+            rank.predicate.CopyFrom(predicate)
         self._steps.append(graph_pb2.HybridStep(vector_rank=rank))
         return self
 

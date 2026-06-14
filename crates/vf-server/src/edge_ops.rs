@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! Shared bulk-edge parsing and application logic for manual edge import.
 //! Both the gRPC and (later) REST surfaces parse a CSV or JSONL payload into

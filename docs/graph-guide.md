@@ -1,18 +1,18 @@
-# Graph Guide
+# Typed Graph: Complete Guide
 
-This is the single, end-to-end reference for everything the graph layer in SwarnDB provides and how to drive it from the Python SDK. Every method, field, state, and metric named here is taken from the live SDK source.
+This is the complete, end-to-end how-to and API reference for the **typed graph** (the explicit, first-class graph available on `hybrid` collections) and how to drive it from the Python SDK. Every method, field, state, and metric named here is taken from the live SDK source.
 
-There are two graph surfaces, and they coexist on the same collection:
+SwarnDB has two graph surfaces. This guide is the reference for the typed graph; the other surface, the virtual graph, has its own dedicated doc:
 
-1. The **virtual graph**, which exists on every collection. SwarnDB connects similar vectors automatically using a similarity threshold; you never build it by hand. It powers `get_related`, `traverse`, and graph-enriched search.
-2. The **first-class typed graph**, which is only present on collections created in `hybrid` mode. Here you store typed nodes (content and entity) and typed, directed, labelled edges, run a composable hybrid query that mixes vector similarity with graph walks, and optionally let an LLM extract entities and relationships from your text.
+1. The **virtual graph (SwarnDB's automatic similarity graph)**, available on `auto_similarity` collections. SwarnDB connects similar vectors automatically using a similarity threshold; you never build it by hand. Section 1 below is a short recap; the full treatment, including REST, tuning, and graph-enriched search, is in [Virtual Graph](virtual-graph.md).
+2. The **typed graph**, present only on collections created in `hybrid` mode and the subject of this guide. Here you store typed nodes (content and entity) and typed, directed, labelled edges, run a composable hybrid query that mixes vector similarity with graph walks, and optionally let an LLM extract entities and relationships from your text.
 
 Vector-only users can ignore the typed graph entirely: it is opt-in and adds nothing to the cost of a plain vector collection.
 
 Related docs:
 
-- [Graph as a First-Class Layer](graph-first-class.md): the product concept and design.
-- [Virtual Graph](virtual-graph.md): the similarity graph in depth.
+- [Typed Graph: Overview](graph-first-class.md): the short overview and where to start; explains the two graph surfaces and which one to use.
+- [Virtual Graph](virtual-graph.md): the virtual graph (the automatic similarity graph) in depth.
 - [LLM Extraction](llm-extraction.md): the extraction concept and ontology templates.
 - [Python SDK](python-sdk.md): the full SDK reference; the graph and extraction sections cross-link here.
 - [API Reference](api-reference.md): the gRPC service contracts.
@@ -21,105 +21,19 @@ Throughout, `client` is a connected `SwarnDBClient`. Every method shown on `clie
 
 ---
 
-## 1. The virtual graph (every collection)
+## 1. The virtual graph (recap)
 
-The virtual graph connects vectors whose similarity is at or above a threshold. You tune the threshold, then read the graph. After changing a threshold, call `client.collections.optimize(collection)` to rebuild the graph so the change takes effect.
+The virtual graph (SwarnDB's automatic similarity graph) lives on `auto_similarity` collections. It connects vectors whose similarity is at or above a threshold, built automatically as you insert, with no curation. This is a short recap so the typed-graph reference below stands on its own; the full how-to (REST, tuning, graph-enriched search, deferred mode, use cases) is in [Virtual Graph](virtual-graph.md).
 
-### 1.1 Set the threshold: `set_threshold`
+The key calls, all on `client.graph`:
 
-```python
-# Collection-level threshold: governs the whole graph.
-client.graph.set_threshold("products", threshold=0.75)
+- `set_threshold(collection, threshold, *, vector_id=0)`: set the collection-level threshold (a higher threshold means fewer, tighter edges), or a per-vector override when `vector_id` is non-zero. After changing a collection-level threshold, call `client.collections.optimize(collection)` to rebuild the graph.
+- `get_related(collection, vector_id, *, threshold=0.0, max_results=10) -> list[GraphEdge]`: read a vector's direct neighbours, each a `GraphEdge` with `target_id` and `similarity`.
+- `traverse(collection, start_id, *, depth=2, threshold=0.0, max_results=100) -> list[TraversalNode]`: walk multiple hops outward, returning `TraversalNode`s with `id`, `depth`, `path_similarity`, and `path`.
 
-# Per-vector override: a tighter threshold just for vector 42.
-client.graph.set_threshold("products", threshold=0.9, vector_id=42)
+Graph-enriched search (returning neighbours alongside ranked results) lives on `client.search.query(..., include_graph=True)`. For the threshold-precedence rules, tuning guidance, REST routes, and worked use cases, see [Virtual Graph](virtual-graph.md).
 
-# Rebuild the graph so the new threshold takes effect.
-client.collections.optimize("products")
-```
-
-Signature:
-
-```python
-set_threshold(collection, threshold, *, vector_id=0) -> bool
-```
-
-`vector_id=0` (the default) sets the collection-level threshold. Any other id sets a per-vector override that applies only to edges leaving that vector. The call returns `True` on success.
-
-A higher threshold means fewer, tighter edges (only very similar vectors connect); a lower threshold means more, looser edges. Start near the collection's `default_threshold` and adjust based on how dense you want the graph.
-
-### 1.2 Read direct neighbours: `get_related`
-
-```python
-edges = client.graph.get_related(
-    "products",
-    vector_id=42,
-    threshold=0.7,     # minimum edge similarity for this read
-    max_results=20,
-)
-for edge in edges:
-    print(edge.target_id, round(edge.similarity, 3))
-```
-
-Signature:
-
-```python
-get_related(collection, vector_id, *, threshold=0.0, max_results=10) -> list[GraphEdge]
-```
-
-Each `GraphEdge` carries two fields: `target_id` (the connected vector's id) and `similarity` (the edge weight). The `threshold` here is a read-time filter applied on top of the graph's stored edges, so you can ask for a tighter view without rebuilding.
-
-### 1.3 Multi-hop traversal: `traverse`
-
-`traverse` walks outward from a starting vector through chains of similarity, returning every vector it reaches within the depth limit.
-
-```python
-nodes = client.graph.traverse(
-    "products",
-    start_id=42,
-    depth=3,           # maximum number of hops
-    threshold=0.6,     # minimum similarity for each edge on the path
-    max_results=50,
-)
-for node in nodes:
-    print(node.id, node.depth, round(node.path_similarity, 3), node.path)
-```
-
-Signature:
-
-```python
-traverse(collection, start_id, *, depth=2, threshold=0.0, max_results=100) -> list[TraversalNode]
-```
-
-Each `TraversalNode` carries: `id` (the reached vector), `depth` (how many hops from the start), `path_similarity` (the cumulative similarity along the path that reached it), and `path` (the list of vector ids from the start to this node).
-
-### 1.4 Tuning the virtual graph
-
-- `threshold`: the single biggest lever. Higher gives a sparser, higher-precision graph; lower gives a denser, higher-recall graph. Set it per collection with `set_threshold`, and use the per-read `threshold` on `get_related` and `traverse` to tighten a single query without a rebuild.
-- `depth` (on `traverse`): how far to walk. Depth 1 is the same set as `get_related`. Each extra hop expands reach but loosens relevance, since `path_similarity` compounds along the path.
-- `max_results`: a hard cap on the number of returned items. Keep it sized to what you will actually consume; it bounds both work and payload.
-
-A typical end-to-end flow:
-
-```python
-with SwarnDBClient(host="localhost", port=50051) as client:
-    client.collections.create("articles", dimension=128, distance_metric="cosine")
-    for i in range(100):
-        client.vectors.insert(
-            "articles",
-            vector=[float(i % 10) / 10.0 + j * 0.01 for j in range(128)],
-            metadata={"topic": f"topic_{i % 5}"},
-        )
-
-    client.graph.set_threshold("articles", threshold=0.8)
-    client.collections.optimize("articles")
-
-    neighbours = client.graph.get_related("articles", vector_id=1, max_results=10)
-    reachable = client.graph.traverse("articles", start_id=1, depth=2, max_results=25)
-    print(len(neighbours), "neighbours,", len(reachable), "reachable within 2 hops")
-```
-
-Graph-enriched search (returning neighbours alongside ranked results) lives on `client.search.query(..., include_graph=True)`; see the Python SDK doc for that path.
+The rest of this guide covers the typed graph, which is the explicit, curated graph on `hybrid` collections.
 
 ---
 
@@ -182,6 +96,27 @@ delete_node(collection, node_id) -> bool
 ```
 
 Returns `True` if the node existed and was removed. Deleting a node also removes the edges incident to it.
+
+### 2.4 Update a node's properties: `update_node`
+
+You can change a node's property bag after it is created, while everything that anchors the node stays put. The node's provenance (its `source`, `created_at`, and `created_by`) and its `embedding` are immutable: only `properties` can change. The embedding is held fixed on purpose, because a content node shares its id with the vector it stands for (the NodeId == VectorId bridge), and letting the embedding drift would break that link.
+
+```python
+node = client.graph.update_node(
+    "docs_graph", node_id,
+    properties={"name": "Ada Lovelace", "verified_by": "curator"},
+    actor="curator",
+)
+print(node.properties, node.updated_at)
+```
+
+Signature:
+
+```python
+update_node(collection, node_id, *, properties=None, actor="") -> TypedNode
+```
+
+The whole property bag is replaced by what you pass in `properties`; omitting `properties` leaves the bag unchanged and records an audit-only touch. The `actor` is written to the node's audit history. Returns the updated `TypedNode`, whose `updated_at` reflects the change and whose `history` carries a `NodeAudit` entry (each with `action`, `actor`, and `at`) for the update.
 
 ---
 
@@ -368,6 +303,35 @@ bulk_import_edges(
 
 When `auto_add_edge_types=False` (the default), any edge whose type is not already in the ontology fails its row. Set it to `True` to let the import register new edge types as it goes.
 
+### 3.9 Temporal edges: validity windows and context
+
+An edge can optionally carry a validity window and a context label, so the same graph can hold facts that were true over different stretches of time, or under different regimes. This is opt-in: leave the fields out and the edge is always valid and context-free, exactly as before.
+
+```python
+edge_id = client.graph.put_edge(
+    "people_graph",
+    source=alice_id, target=acme_id, edge_type="WORKS_AT",
+    valid_from=1577836800000,        # unix-epoch millis; when the fact starts
+    valid_until=1640995200000,       # unix-epoch millis, EXCLUSIVE; when it stops
+    temporal_context="employment-v2",
+)
+```
+
+The three optional fields on `put_edge`:
+
+- `valid_from`: the start of the window, in unix-epoch milliseconds. Omit it for an unbounded start (valid since forever).
+- `valid_until`: the end of the window, in unix-epoch milliseconds, and it is EXCLUSIVE (the instant equal to `valid_until` is already outside the window). Omit it for an unbounded end (still valid).
+- `temporal_context`: a free-form label naming the regime or version this edge belongs to (for example `"employment-v2"`). Omit it for a context-free edge.
+
+When you read an edge back, these surface on the `TypedEdge` as `valid_from`, `valid_until`, and `temporal_context`, each `None` when the edge does not set it.
+
+```python
+edge = client.graph.get_edge("people_graph", edge_id)
+print(edge.valid_from, edge.valid_until, edge.temporal_context)
+```
+
+To query against these windows, see the time-filtered traversal in Section 4.8.
+
 ---
 
 ## 4. The hybrid query builder (hybrid mode)
@@ -393,13 +357,14 @@ A `HybridQueryResult` carries `nodes`, `edges`, and `paths`; exactly one is popu
 
 ### 4.1 The steps
 
-There are 12 steps, grouped by role. Each returns the builder so you can keep chaining.
+The steps group by role. Each returns the builder so you can keep chaining. The source, traversal, set-combination, and refinement steps are below; the opt-in quality, temporal, scan, and vector-math steps follow in Sections 4.7 through 4.12.
 
 **Source steps** (seed the working set):
 
 - `vector_similar(vector, k, *, ef_search=None)`: seed with the `k` nearest neighbours of a vector. `ef_search` tunes HNSW search quality for this seed: higher means better recall and more work. Left unset, it uses the collection default.
 - `from_node(node_id)`: seed with a single node id.
 - `from_nodes(node_ids)`: seed with an explicit list of node ids.
+- `scan_by_filter(*, kind=None, label="", predicate=None)`: seed by scanning the graph for nodes that match a filter, with no vector input (see Section 4.9).
 
 ```python
 client.graph.query("docs_graph").vector_similar(query_vector, k=20, ef_search=200)
@@ -481,7 +446,7 @@ result = (
 
 ### 4.4 The predicate helpers
 
-`Predicate` builds the filter expressions used by `filter(...)` and the `k_hop` gate. There are 14 helpers. By default a predicate references a key in the node's property bag; `label_eq` is the one exception, referencing the node label instead. Scalar values are encoded as JSON literals on the wire, which is how the server matches them.
+`Predicate` builds the filter expressions used by `filter(...)` and the `k_hop` gate. By default a predicate references a key in the node's property bag; `label_eq` references the node label instead, and `incident_edges` (Section 4.11) references the node's edge count instead. Scalar values are encoded as JSON literals on the wire, which is how the server matches them.
 
 Comparisons:
 
@@ -611,8 +576,9 @@ Signature:
 ```python
 graph_rag(
     collection, query_vector, k=10, *,
-    mentions_edge_type="mentions", relation_edge_types=None,
-    k_hop_max=2, rrf_k=60, hub_damping=0.0, ef_search=None,
+    fusion="vector_rank", mentions_edge_type="mentions",
+    relation_edge_types=None, k_hop_max=2, rrf_k=60,
+    hub_damping=0.0, ef_search=None,
 ) -> HybridQueryResult
 ```
 
@@ -622,11 +588,298 @@ When `relation_edge_types` is empty or `None`, it falls back to the structural f
 
 Why `vector_rank` is the default: on real data at scale it ties plain vector retrieval on overall answer accuracy and wins on the hard multi-hop and adversarial questions, while the older RRF fusion regressed below plain vector retrieval. So the default graph-augmented path gives you a real lift on the hard questions and never a worse result than plain vector search.
 
-RRF stays fully supported as an explicit opt-in; it is just no longer the default. To use it, build the explicit chain from Section 4.5 and call `.rank_rrf(...)` before the terminal (the same composed plan, ending in RRF instead of `vector_rank`).
+RRF stays fully supported as an explicit opt-in; it is just no longer the default. The one-call path is `graph_rag(..., fusion="rrf")`, which runs the same composed plan but ends in RRF instead of `vector_rank` (and then applies `rrf_k` and `hub_damping`). Building the explicit chain from Section 4.5 and calling `.rank_rrf(...)` before the terminal is the customizable equivalent, for when you need to tune the composition yourself.
 
 When you only want plain vector results, stay on `client.graph.query(...).vector_similar(...).return_nodes()`, which does no graph work. Use `graph_rag` when you want the graph-augmented result in one call; the explicit Section 4.5 chain stays available when you need to customise the composition or opt in to RRF.
 
 The async client mirrors this: `await client.graph.graph_rag(...)`.
+
+### 4.7 Quality-aware traversal and ranking: `WeightSpec`
+
+By default every edge counts the same when you walk the graph. Quality-aware traversal lets you weight an edge by how much you trust it, so stronger relationships steer the walk and the ranking. This is opt-in and off by default: a query that does not pass a `WeightSpec` is unchanged, and so is every plain vector query.
+
+An edge's weight can be built from three signals, which combine together:
+
+- its confidence (the `confidence` you store on the edge),
+- an explicit numeric weight you keep in a property (any property key, defaulting to `"weight"`), and
+- recency, so older edges decay toward a smaller weight over a half-life you choose.
+
+You describe which signals to use with a `WeightSpec`, imported from `swarndb`:
+
+```python
+from swarndb import WeightSpec
+
+w = WeightSpec(
+    use_confidence=True,           # fold the edge's confidence into the weight
+    min_confidence=0.2,            # floor confidence at 0.2 before using it
+    recency_half_life_ms=2_592_000_000,  # 30 days in ms; older edges decay
+    use_explicit_weight=True,      # also read a numeric weight from a property
+    explicit_weight_key="weight",  # which property holds it (default "weight")
+)
+```
+
+The `WeightSpec` fields:
+
+- `use_confidence` (default `False`): when `True`, the edge's stored confidence multiplies into the weight.
+- `min_confidence` (default `0.0`): a floor applied to confidence before it is used, so very low confidence does not drag the weight to nothing.
+- `recency_half_life_ms` (default `0`, meaning no decay): when positive, older edges are down-weighted with this half-life in milliseconds (an edge one half-life old carries about half the weight of a brand-new one).
+- `use_explicit_weight` (default `False`): when `True`, a numeric value read from the edge's property bag multiplies into the weight.
+- `explicit_weight_key` (default `"weight"`): which property key holds that explicit number.
+
+Leaving every field at its default makes the spec a no-op (every edge weighs the same), so passing such a spec changes nothing.
+
+A `WeightSpec` plugs into three places:
+
+**Weighted `k_hop` ordering.** Pass `weight=` and set `order_by_weight=True` to order the expanded frontier by accumulated edge weight (strongest paths first). The set of nodes reached is the same as the unweighted hop; only the order changes.
+
+```python
+result = (
+    client.graph.query("docs_graph")
+    .from_node(42)
+    .k_hop("CITES", max=3, weight=w, order_by_weight=True)
+    .return_nodes()
+)
+```
+
+**Weighted `shortest_path`.** Set `weighted=True` and pass `weight=` so the path cost is driven by edge weight instead of plain hop count. Stronger edges cost less, so the path that wins is the one made of the most trustworthy links, not simply the one with the fewest hops.
+
+```python
+result = (
+    client.graph.query("docs_graph")
+    .from_node(paper_a)
+    .shortest_path(["CITES"], target=paper_b, weighted=True, weight=w)
+    .return_paths()
+)
+```
+
+**Weighted hybrid RRF ranking.** Pass `edge_weight=` to `rank_rrf(...)` so the graph-proximity arm folds edge quality into its bridge routes, letting strong relationships pull a candidate up more than weak ones.
+
+```python
+result = (
+    client.graph.query("docs_graph")
+    .vector_similar(query_vector, k=10)
+    .traverse("mentions", direction="outgoing")
+    .k_hop("CITES", max=2)
+    .traverse("mentions", direction="incoming")
+    .rank_rrf(k=10, relation_edge_types=["CITES"], edge_weight=w)
+    .return_nodes()
+)
+```
+
+In every case, omitting the spec (or passing one with all defaults) keeps the unweighted behaviour.
+
+### 4.8 Time-filtered traversal: `as_of`, `include_unbounded`, `context`
+
+When your edges carry validity windows (Section 3.9), you can ask the graph what it looked like at a particular instant, or under a particular context. Three keyword arguments are available on `traverse`, `k_hop`, and `shortest_path`. They are opt-in: leave them out and the traversal runs exactly as before over every edge.
+
+```python
+# 1577836800000 is some instant in unix-epoch millis.
+result = (
+    client.graph.query("people_graph")
+    .from_node(alice_id)
+    .traverse(
+        "WORKS_AT",
+        direction="outgoing",
+        as_of=1577836800000,        # only edges valid at this instant
+        include_unbounded=True,     # also keep edges that carry no window
+        context="employment-v2",    # only edges in this context
+    )
+    .return_nodes()
+)
+```
+
+The three arguments:
+
+- `as_of`: a unix-epoch-millisecond instant. Only edges whose window covers that instant are crossed (remember `valid_until` is exclusive). Left unset, the server uses "now".
+- `include_unbounded` (default `True`): whether edges that carry no validity window at all still pass the time check. With the default they do; set it to `False` to keep only edges that explicitly declare a window covering `as_of`.
+- `context`: when set, only edges whose `temporal_context` matches are crossed. Left unset, context is ignored and edges of any context are eligible.
+
+The same three arguments work identically on `k_hop` and `shortest_path`:
+
+```python
+client.graph.query("people_graph").from_node(a).k_hop(
+    "WORKS_AT", max=3, as_of=1577836800000, context="employment-v2"
+)
+client.graph.query("people_graph").from_node(a).shortest_path(
+    ["WORKS_AT"], target=b, as_of=1577836800000
+)
+```
+
+If you pass none of these (the default), the traversal is byte-identical to a non-temporal query and sees every edge.
+
+### 4.9 Start from a filtered scan: `scan_by_filter`
+
+Sometimes you do not have a starting vector or a node id, you just want to begin from "every node that looks like this" and traverse from there. `scan_by_filter` is a source step that produces the initial set by scanning the graph for matching nodes, all in the same query.
+
+```python
+from swarndb import Predicate
+
+result = (
+    client.graph.query("docs_graph")
+    .scan_by_filter(
+        kind="entity",                          # "content" or "entity"
+        label="Company",                        # entity label to match
+        predicate=Predicate.eq("sector", "fintech"),  # a property condition
+    )
+    .traverse("EMPLOYS", direction="outgoing")
+    .return_nodes()
+)
+```
+
+Signature:
+
+```python
+scan_by_filter(*, kind=None, label="", predicate=None)
+```
+
+Each part is optional. `kind` narrows to content or entity nodes, `label` narrows entity nodes to one label, and `predicate` applies any property condition (including the structural incident-edge count from Section 4.11). With all three left out, the scan yields every node. After the scan you chain the normal traversal, filter, and ranking steps just as you would after any other source step.
+
+For attribute or condition-constrained retrieval, filter-then-search is the recommended pattern: follow `scan_by_filter` with `vector_rank(query_vector, k)`. The scan fixes the candidate set to only the nodes that satisfy the condition, so the ranking returns the correct top-k among exactly those nodes, rather than ranking the whole collection and hoping the matches surface.
+
+### 4.10 Filtered graph reads: nodes and edges by filter
+
+When you simply want to list parts of the graph, with no vector input, there are paged read calls on `client.graph`. They walk the graph in id order, a page at a time, narrowing by label, kind, edge type, and property conditions.
+
+```python
+from swarndb import Predicate
+
+# One page of entity nodes labelled "Company" in the fintech sector.
+page = client.graph.enumerate_nodes(
+    "docs_graph",
+    kind="entity",
+    label="Company",
+    predicate=Predicate.eq("sector", "fintech"),
+    limit=500,
+)
+for node in page.nodes:
+    print(node.id, node.label, node.properties)
+
+# To get the next page, pass the returned cursor back as after_id.
+if page.has_more:
+    next_page = client.graph.enumerate_nodes(
+        "docs_graph", kind="entity", label="Company",
+        after_id=page.next_cursor, limit=500,
+    )
+```
+
+Signature:
+
+```python
+enumerate_nodes(
+    collection, *,
+    after_id=0, limit=1000, kind=None, label="", predicate=None,
+) -> NodePage
+```
+
+A `NodePage` carries `nodes`, `next_cursor` (pass it back as `after_id` to fetch the next page; `0` when exhausted), and `has_more`. `after_id` starts at `0` for the first page.
+
+Edges read the same way, with a filter on edge type, edge properties, and the endpoint nodes:
+
+```python
+page = client.graph.enumerate_edges(
+    "docs_graph",
+    edge_type="CITES",
+    predicate=Predicate.ge("confidence", 0.9),   # over edge properties
+    endpoint_label="Paper",                       # an endpoint node's label
+    endpoint_kind="content",                      # an endpoint node's kind
+    limit=500,
+)
+for edge in page.edges:
+    print(edge.id, edge.source, edge.target, edge.edge_type)
+```
+
+Signature:
+
+```python
+enumerate_edges(
+    collection, *,
+    after_id=0, limit=1000, edge_type="", predicate=None,
+    endpoint_label="", endpoint_kind=None,
+) -> EdgePage
+```
+
+An `EdgePage` mirrors `NodePage` with `edges`, `next_cursor`, and `has_more`. An edge passes the `endpoint_label` / `endpoint_kind` filter when either of its endpoints (source or target) matches. The page size you ask for is clamped by the server.
+
+For convenience, `iter_nodes` and `iter_edges` walk every page for you and yield one item at a time, so you can iterate the whole graph without managing the cursor:
+
+```python
+for node in client.graph.iter_nodes("docs_graph", kind="entity", label="Company"):
+    print(node.id, node.label)
+
+for edge in client.graph.iter_edges("docs_graph", edge_type="CITES"):
+    print(edge.source, "->", edge.target)
+```
+
+Signatures:
+
+```python
+iter_nodes(collection, *, page_size=1000, kind=None, label="") -> Iterator[TypedNode]
+iter_edges(collection, *, page_size=1000, edge_type="") -> Iterator[TypedEdge]
+```
+
+### 4.11 Filter by how connected a node is: `Predicate.incident_edges`
+
+Beyond matching on properties and labels, you can filter nodes by a structural fact: how many edges touch them. `Predicate.incident_edges` compares the count of a node's incident edges against a number, optionally narrowed to one edge type and direction. Use it anywhere a predicate is accepted (`filter`, the `k_hop` gate, `scan_by_filter`, and the filtered reads above).
+
+```python
+from swarndb import Predicate
+from swarndb._proto import graph_pb2
+
+# Nodes with at least three outgoing CITES edges (well-cited content).
+well_cited = Predicate.incident_edges(
+    graph_pb2.HYBRID_CMP_GE, 3,
+    edge_type="CITES",
+    direction="outgoing",
+)
+
+result = (
+    client.graph.query("docs_graph")
+    .scan_by_filter(kind="content")
+    .filter(well_cited)
+    .return_nodes()
+)
+```
+
+Signature:
+
+```python
+Predicate.incident_edges(op, value, *, edge_type=None, direction="outgoing")
+```
+
+`op` is one of the `graph_pb2.HYBRID_CMP_*` comparison constants (the same set the other comparison predicates use, for example `HYBRID_CMP_EQ`, `HYBRID_CMP_GE`, `HYBRID_CMP_LT`), and `value` is the count to compare against. `edge_type` left as `None` counts edges of any type, and `direction` is one of `"outgoing"`, `"incoming"`, or `"both"`. The count is resolved against the graph store, so this predicate needs the typed graph to evaluate.
+
+### 4.12 Vector math over a graph-built frontier
+
+The vector-rank step in Section 4.5 ranks a graph-scoped set by plain similarity. There is a richer family of vector operations that work the same way: first you scope a set of nodes with the graph (any chain of source and traversal steps), then you apply one vector operation exactly over that set. Because the graph has already fixed the candidate set, each operation runs exactly over those nodes, not an approximate search.
+
+There are six builder methods, each a terminal-style step you place after the graph scoping and before `return_nodes()`:
+
+- `analogy_rank(a, b, c, k, *, on_missing="skip")`: rank the frontier by closeness to the analogy point `a - b + c`, keeping the top `k`. This answers "a is to b as c is to what?" over exactly the scoped nodes.
+- `diversity_rank(query, lambda_, k, *, on_missing="skip")`: pick up to `k` nodes that are both relevant to `query` and varied among themselves, using Maximal Marginal Relevance. `lambda_` in [0, 1] trades relevance against diversity. Results come back in selection order.
+- `cone_filter(direction, aperture_radians, k, *, on_missing="skip")`: keep only the nodes that point within `aperture_radians` of the `direction` vector (a cone around a direction in vector space), ordered by how tightly they align, capped at `k`.
+- `isolation_rank(centroids, k, *, on_missing="skip")`: rank nodes by how far they sit from a set of reference points (`centroids`, a list of vectors), surfacing the most isolated, off-to-the-side nodes first. Keeps the top `k`.
+- `centroid_rank(k, *, on_missing="skip")`: compute the average of the frontier's own vectors, then rank the frontier by closeness to that average, surfacing the most representative nodes first. Keeps the top `k`.
+- `interpolate_rank(a, b, t, k, *, on_missing="skip")`: rank the frontier by closeness to a point interpolated between vectors `a` and `b` at fraction `t` in [0, 1], keeping the top `k`. This finds nodes that sit "partway between" two anchors.
+
+A short example, scoping with the graph and then ranking the scoped set by analogy:
+
+```python
+result = (
+    client.graph.query("words_graph")
+    .from_node(seed_id)
+    .k_hop("RELATED", max=2)
+    .analogy_rank(vec_king, vec_man, vec_woman, k=10)
+    .return_nodes()
+)
+for node in result.nodes:
+    print(node.id, node.label)
+```
+
+**Vectorless nodes and `on_missing`.** A frontier node that carries no vector cannot take part in a vector operation. The `on_missing` argument decides what happens: `"skip"` (the default) drops those nodes from the operation and counts them, while `"error"` fails the query if any scoped node has no vector. Use `"skip"` when a mix of vectored and vectorless nodes is expected, and `"error"` when every node is supposed to have a vector and you want to catch it if one does not.
+
+**Which similarity is used.** `diversity_rank` and `cone_filter` use an internal cosine similarity, because that is inherent to how Maximal Marginal Relevance scores and how a cone is defined. The other four (`analogy_rank`, `centroid_rank`, `interpolate_rank`, and `isolation_rank`) rank by the collection's configured distance metric, so they line up with how that collection measures nearness everywhere else.
+
+**A note on scope size.** Because each operation runs exactly over the scoped frontier, the frontier must stay within a configured size cap. If a graph scope produces a frontier larger than the cap, the query is rejected with a clear error rather than silently dropping nodes, so you scope the graph more tightly before the vector operation (or, if you must, raise the cap on the server via `SWARNDB_MAX_FRONTIER_FOR_RANK`). The same cap applies to `vector_rank`.
 
 ---
 

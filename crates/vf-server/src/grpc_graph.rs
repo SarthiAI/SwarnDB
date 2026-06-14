@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -421,6 +420,8 @@ fn proto_step_to_domain(s: HybridStep) -> Result<HStep, Status> {
             vector: v.vector,
             k: v.k as usize,
             on_missing: proto_on_missing_to_domain(v.on_missing),
+            // Optional filter-then-rank condition (ADR-034); absent = None.
+            predicate: proto_khop_predicate(v.predicate)?,
         }),
         Some(PStep::VectorMath(vm)) => proto_vector_math_to_domain(vm),
         None => Err(Status::invalid_argument("empty hybrid step")),

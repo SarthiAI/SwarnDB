@@ -305,6 +305,8 @@ The deployment includes three types of probes:
 - **Liveness probe**: Restarts the pod if SwarnDB becomes unresponsive (checks `/health` every 15 seconds)
 - **Readiness probe**: Removes the pod from the service if it is not ready to handle requests (checks `/readyz` every 10 seconds; returns 503 while collections are recovering after an unclean shutdown)
 
+**Known limitation:** During a large file-based `bulk_insert_from_path` load, the health probes can show elevated latency or transient non-200 responses, which can cause an orchestrator with tight timeouts to restart the pod mid-load. See [Known Issues and Limitations](known-issues.md) for the mitigations.
+
 ## Helm
 
 Helm provides a templated, configurable deployment with sensible defaults.
@@ -406,9 +408,155 @@ To roll back if something goes wrong:
 helm rollback swarndb
 ```
 
+## TLS and mTLS
+
+SwarnDB does not terminate TLS itself. Both listeners serve plaintext: the REST API is plain HTTP and the gRPC API is plaintext HTTP/2, on the ports set by `SWARNDB_REST_PORT` and `SWARNDB_GRPC_PORT`. There are no server-side certificate, private-key, or client-CA settings, and none of the `SWARNDB_*` environment variables configure TLS. Do not look for a server TLS knob: there is not one.
+
+The supported pattern is to terminate TLS in front of SwarnDB at a load balancer, ingress controller, or reverse proxy (for example an L7 load balancer, an NGINX or Envoy ingress, or a cloud load balancer), and keep SwarnDB's plaintext ports reachable only from that proxy and your internal network.
+
+### Recommended setup
+
+1. Put a TLS-terminating proxy in front of SwarnDB. The proxy holds the server certificate and private key and forwards decrypted traffic to SwarnDB over the internal network. For REST, this is ordinary HTTPS termination. For gRPC, the proxy must terminate TLS and forward HTTP/2 (gRPC) to port 50051.
+2. Bind SwarnDB so its ports are not publicly reachable. Keep `SWARNDB_HOST` on the internal interface, and use network policies, security groups, or firewall rules so only the proxy can reach ports 8080 and 50051.
+3. Point clients at the proxy's TLS endpoint. The Python SDK encrypts client-to-proxy traffic when you pass `secure=True`:
+
+   ```python
+   from swarndb import SwarnDBClient
+
+   client = SwarnDBClient(
+       host="swarndb.example.com",   # the TLS endpoint of your proxy
+       port=443,                       # the proxy's TLS gRPC port
+       api_key="my-secret-key-1",
+       secure=True,
+   )
+   ```
+
+   With `secure=True`, the SDK opens a TLS gRPC channel that verifies the server certificate against the system trust store, and its REST calls use `https`. With the default `secure=False`, both gRPC and REST are plaintext, which is appropriate only when the SDK and SwarnDB share a trusted private network.
+
+### Mutual TLS (client certificates)
+
+Mutual TLS is not provided by SwarnDB and is not provided by the Python SDK. The server has no client-CA setting to validate client certificates, and the SDK's `secure=True` flag verifies the server's certificate but does not present a client certificate. If you require mTLS, enforce it at the terminating proxy (the proxy validates client certificates, then forwards plaintext to SwarnDB). For client-to-server identity within SwarnDB itself, use API key authentication (`SWARNDB_API_KEYS`); see [Configuration](configuration.md#11-authentication).
+
 ## Configuration Reference
 
 For a complete list of all environment variables and their defaults, see [Configuration](configuration.md).
+
+## Backup and Restore
+
+SwarnDB stores everything for a collection as plain files under the data directory. A backup is therefore a copy of that directory taken at a point when the on-disk state is consistent, and a restore is putting those files back and letting the server replay its write-ahead log on the next start. There is no separate backup server or backup API to call: the unit of backup is the data volume itself.
+
+### What is on disk
+
+Every collection lives in its own subdirectory under `SWARNDB_DATA_DIR` (the container's `/data` volume in the Docker examples above), named after the collection. Inside each collection directory you will find:
+
+- `config.json`: the collection's settings (dimension, metric, index parameters).
+- `segment_NNNNNNNN.vfs`: the on-disk vector segments.
+- Snapshot files (`hnsw.base`, `hnsw.delta`, and, for hybrid collections, `graph.base` and `graph.delta`): the persisted index state as of the last snapshot.
+- WAL files (`.log`) plus `wal_meta.json`: the write-ahead log of mutations since the last snapshot.
+- `shutdown_clean`: a marker written on a clean shutdown so the next start can take the fast recovery path.
+
+A correct backup captures the whole collection directory (all of the above), not just the segments. Backing up the entire `SWARNDB_DATA_DIR` captures every collection at once.
+
+### Taking a consistent backup
+
+The cleanest backup is taken from a stopped server. The recommended sequence:
+
+1. Force a snapshot of each collection so the latest writes are folded into the snapshot files and the WAL is short. For every collection, call the force-snapshot endpoint and confirm the LSN advanced:
+
+   ```bash
+   curl -X POST http://localhost:8080/api/v1/collections/<collection>/snapshot
+   # -> { "last_snapshot_lsn": 1024 }
+   ```
+
+   You can confirm a write is durable with the persistence-status endpoint, which reports `last_snapshot_lsn`, `current_lsn`, and `next_lsn`:
+
+   ```bash
+   curl http://localhost:8080/api/v1/collections/<collection>/persistence_status
+   ```
+
+2. Stop the server so no further writes land while you copy. With Docker:
+
+   ```bash
+   docker stop swarndb
+   ```
+
+3. Copy the data directory or snapshot the volume. With a bind mount this is a plain directory copy:
+
+   ```bash
+   cp -a /path/on/host/swarndb-data /path/on/host/swarndb-data.backup-$(date +%Y%m%d)
+   ```
+
+   With a named Docker volume, archive it through a throwaway container:
+
+   ```bash
+   docker run --rm \
+     -v swarndb_data:/data:ro \
+     -v "$(pwd)":/backup \
+     alpine tar czf /backup/swarndb-backup-$(date +%Y%m%d).tar.gz -C /data .
+   ```
+
+4. Start the server again:
+
+   ```bash
+   docker start swarndb
+   ```
+
+On Kubernetes, the equivalent is to take a volume snapshot of the PersistentVolumeClaim, ideally after forcing a snapshot per collection. A storage-layer VolumeSnapshot that captures the PVC atomically is preferable to copying files out of a running pod.
+
+### A note on online (hot) backups
+
+Copying the data directory while the server is still running and accepting writes is possible, but it is not guaranteed to be point-in-time consistent: a snapshot can be rewritten or the WAL can roll over partway through your copy, and you may capture a mix of old and new files. The force-snapshot step before copying narrows but does not close this window. For a guaranteed-consistent backup, stop the server (or use a storage-layer snapshot that captures the whole volume atomically) before copying. If you must back up hot, force a snapshot first, copy the whole collection directory including the WAL, and treat the result as crash-consistent rather than clean: recovery will still replay the WAL on restore, but verify the restored copy before relying on it.
+
+### Restoring from a backup
+
+Restore replaces the data directory with your backup and lets the server recover on start:
+
+1. Stop the server:
+
+   ```bash
+   docker stop swarndb
+   ```
+
+2. Replace the data directory with the backup contents. Make sure you restore the full collection directories, including the WAL files and the snapshot files, not just the segments. For a bind mount:
+
+   ```bash
+   rm -rf /path/on/host/swarndb-data/*
+   cp -a /path/on/host/swarndb-data.backup-YYYYMMDD/. /path/on/host/swarndb-data/
+   ```
+
+   For a named volume, extract the archive back into it:
+
+   ```bash
+   docker run --rm \
+     -v swarndb_data:/data \
+     -v "$(pwd)":/backup \
+     alpine sh -c "rm -rf /data/* && tar xzf /backup/swarndb-backup-YYYYMMDD.tar.gz -C /data"
+   ```
+
+3. Start the server. On startup SwarnDB inspects each collection directory and recovers it: if the clean-shutdown marker and a snapshot base are present it loads directly from the snapshot; otherwise it loads the snapshot and replays the WAL on top, or rebuilds from the WAL if no snapshot base exists. A restored copy that was taken from a stopped server recovers cleanly; a crash-consistent copy still recovers by replaying the WAL.
+
+   ```bash
+   docker start swarndb
+   ```
+
+4. Confirm recovery completed before sending traffic. The readiness endpoint returns 503 while any collection is still recovering and 200 once every collection is loaded:
+
+   ```bash
+   curl -f http://localhost:8080/readyz
+   ```
+
+   You can also inspect the boot recovery path per collection via `GET /recovery_status`.
+
+After a successful restore you may optionally reclaim space by pruning superseded WAL segments and compacting segments per collection:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/collections/<collection>/prune-wal
+curl -X POST http://localhost:8080/api/v1/collections/<collection>/compact
+```
+
+### Restore testing
+
+Treat a backup as unverified until you have restored it. Periodically restore into a throwaway environment, start the server, wait for `/readyz` to return 200, and run a search against each collection to confirm the data is intact.
 
 ## Production Checklist
 
@@ -439,16 +587,19 @@ Before going to production, review each item in this checklist:
 
 - [ ] Set the log level to `info` for production (avoid `debug` or `trace`)
 - [ ] Configure log rotation to prevent disk exhaustion (50 MB max, 5 files)
-- [ ] Monitor the `/health` and `/ready` endpoints from your monitoring system
+- [ ] Monitor the `/health` and `/readyz` endpoints from your monitoring system
 
 **Backups**
 
-- [ ] Schedule regular backups of the data volume
-- [ ] Test backup restoration to verify data integrity
-- [ ] Document the backup and restore procedure for your team
+- [ ] Schedule regular backups of the data volume (see [Backup and Restore](#backup-and-restore))
+- [ ] Force a snapshot per collection before each backup, and copy the full data directory (segments, snapshot files, and WAL)
+- [ ] Test backup restoration to verify data integrity, then confirm `/readyz` returns 200 and searches return results
 
-**Networking**
+**Networking and TLS**
 
-- [ ] Use TLS termination at the load balancer or ingress level
-- [ ] Restrict gRPC port (50051) to internal services only if the REST API is the public interface
+- [ ] Terminate TLS at the load balancer, ingress, or a reverse proxy. SwarnDB does not serve TLS itself; both the REST and gRPC listeners are plaintext (see [TLS and mTLS](#tls-and-mtls))
+- [ ] Point the Python SDK at the TLS endpoint with `secure=True` so client-to-proxy traffic is encrypted
+- [ ] Keep the plaintext gRPC port (50051) and REST port (8080) reachable only from the proxy or internal network, never exposed directly to the public internet
+- [ ] If you need mutual TLS (client certificates), enforce it at the proxy; the server and the SDK do not perform mTLS
+- [ ] Restrict the gRPC port (50051) to internal services only if the REST API is the public interface
 - [ ] Configure appropriate connection limits for your expected traffic

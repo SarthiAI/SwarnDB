@@ -308,6 +308,9 @@ message HybridVectorRank {
   repeated float vector = 1;
   uint32 k = 2;
   HybridOnMissingVector on_missing = 3;
+  // Optional filter-then-rank condition (ADR-034). Absent = no filtering,
+  // byte-identical to today. Reuses HybridPredicate; a pinned client never sends it.
+  HybridPredicate predicate = 4;
 }
 
 // P17. A frontier-consuming vector-math step. Reuses HybridOnMissingVector.

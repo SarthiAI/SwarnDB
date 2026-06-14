@@ -53,10 +53,10 @@ When you create a collection, you specify:
 A collection is created in one of three modes, fixed at creation time:
 
 - **`vector_only`**: pure vector search and metadata filtering, no graph.
-- **`auto_similarity`**: the automatic similarity graph (the legacy behavior, used when no mode is specified on older collections).
-- **`hybrid`**: a first-class typed graph of nodes and edges alongside your vectors, with a composable query engine and optional LLM extraction.
+- **`auto_similarity`**: the virtual graph (SwarnDB's automatic similarity graph), where edges appear automatically between similar vectors. This is the automatic option, and the mode a collection resolves to when none was recorded. See [Virtual Graph](virtual-graph.md).
+- **`hybrid`**: the typed graph of nodes and edges alongside your vectors, with a composable query engine and optional LLM extraction. See the [Typed Graph: Complete Guide](graph-guide.md).
 
-When you omit the mode, the collection defaults to vector-only. For what each mode does and how to choose, see [Graph as a First-Class Layer](graph-first-class.md).
+SwarnDB has two graph surfaces, and the mode picks which one is active: the **virtual graph** (automatic, edges derived from similarity, the `auto_similarity` mode) and the **typed graph** (explicit, curated or LLM-extracted, the `hybrid` mode). When you omit the mode, the collection defaults to vector-only. For what each mode does and how to choose, see the [Typed Graph: Overview](graph-first-class.md) overview.
 
 ### Collection status
 
@@ -209,6 +209,12 @@ For billion-scale datasets where memory is the constraint, SwarnDB offers IVF+PQ
 ```
 
 **Tradeoff**: IVF+PQ uses far less memory than HNSW, but recall is typically 5 to 15% lower. Use it when your dataset exceeds available RAM.
+
+### c. Quantization (SQ8)
+
+Indexes can also store vectors in a compressed form. The mode you select when you create a collection is **SQ8 (8-bit scalar quantization)**: each value is encoded as a single byte, and the original full-precision vectors are kept on the side to rescore candidates, which keeps recall close to plain HNSW. SQ8 collections also restart on the same fast path as plain HNSW, so choosing it does not cost you a slower startup. The engine additionally implements product quantization (PQ), binary quantization (BQ), and the hybrid IVF+HNSW+PQ index.
+
+For what each mode is, when to choose it, and how to turn it on (the exact REST field and SDK keyword), see [Quantization](quantization.md).
 
 ---
 

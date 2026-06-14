@@ -6,14 +6,14 @@ build-backend = "hatchling.build"
 name = "swarndb"
 dynamic = ["version"]
 description = "Official Python SDK for SwarnDB, the vector database that thinks in graphs. Combines HNSW + IVF-PQ indexing with virtual graph traversal and 15+ vector math operations."
-license = {text = "ELv2"}
+license = {text = "Elastic-2.0"}
 requires-python = ">=3.9"
 authors = [
     { name = "Chirotpal Das" },
 ]
 keywords = ["vector-database", "similarity-search", "embeddings", "grpc", "numpy", "hnsw", "graph-database", "vector-search", "machine-learning", "ai", "swarndb"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",

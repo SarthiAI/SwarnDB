@@ -182,6 +182,24 @@ print(estimate.chunks, estimate.estimated_input_tokens,
 
 `pricing_known` tells you whether SwarnDB had a price for the model; if not, the token counts are still accurate but the dollar figure is a best effort.
 
+### Read the actual cost after a job
+
+`cost_preview` is an estimate you read before the work. After a job runs, the same job status carries the **actuals**: what the provider actually reported, distinct from the pre-job guess. So you can compare what you were quoted against what you really spent.
+
+```python
+status = client.extraction.extraction_status("docs_graph", job_id)
+# status.actual_input_tokens, status.actual_output_tokens
+# status.actual_cost_usd
+# status.usage_provider_reported
+```
+
+`usage_provider_reported` is the honesty flag. It stays `True` only while every priced call reported its own token usage. The first time a call's tokens had to be estimated instead, it flips to `False` for the rest of the job, so you always know whether the actuals are fully provider-reported or partly estimated.
+
+Two more things stay honest rather than guessing:
+
+- **Cache hits cost nothing.** A chunk served from the [extraction cache](#the-extraction-cache) never calls the provider, so it adds zero tokens and zero cost to the actuals. The actuals reflect only the calls that actually ran. That is why the actual figures can land well below the pre-job estimate, which counted every chunk.
+- **An unknown model reports zero cost, never a made-up number.** If SwarnDB has no price for your model, `actual_cost_usd` stays at zero rather than inventing a figure. The token counts are still real; only the dollar amount is withheld. This mirrors `pricing_known` on the estimate side.
+
 ### Start a job and poll it
 
 Extraction runs as an asynchronous job so a large batch does not block your request:
@@ -271,6 +289,64 @@ summary = client.extraction.reextract_document("docs_graph", doc_id="paper-1", c
 
 `reextract_document` re-extracts only the changed and new chunks, and cleans up after the deleted ones: it removes the auto-edges that came from chunks that no longer exist and any content nodes that are now orphaned. The summary tells you exactly what moved.
 
+### Re-extract a whole corpus, resumably
+
+`reextract_document` handles one document. When you need to re-extract many documents (a whole corpus, or any set of them), looping over `reextract_document` from your own code is fragile: a single hiccup partway through loses all the progress you made, and there is no way to pick up where you left off. The corpus re-extraction API gives you one managed run over the whole set that survives a restart or a cancellation and resumes without redoing the work that already finished.
+
+You hand it a set of documents, each as a `(doc_id, chunks)` pair (or a dict with `doc_id` / `chunks`), and it drives them through the exact same per-document re-extract path one at a time. Progress is written to disk after each document, so a crash loses at most the one document that was in flight. A document supplied with no chunks is treated as a full deletion, the same as the per-document path.
+
+```python
+docs = [
+    ("paper-1", new_chunks_1),
+    ("paper-2", new_chunks_2),
+    # ... as many as you supply
+]
+
+corpus_job_id = client.extraction.start_corpus_reextraction("docs_graph", docs)
+
+status = client.extraction.corpus_reextraction_status("docs_graph", corpus_job_id)
+# status.state: "queued" | "running" | "completed"
+#             | "completed_with_errors" | "failed" | "cancelled"
+# status.total_documents, status.processed_documents,
+# status.failed_documents, status.skipped_documents,
+# status.changed_chunks, status.added_chunks, status.deleted_chunks,
+# status.edges_deleted, status.nodes_deleted,
+# status.entities_written, status.edges_written, status.error
+# status.documents: per-document progress, each with .doc_id, .state,
+#   .job_id, .changed, .added, .deleted
+
+client.extraction.cancel_corpus_reextraction("docs_graph", corpus_job_id)  # stop the run
+```
+
+The run proceeds in the background; poll `corpus_reextraction_status` for progress. Pass `doc_ids` to restrict the run to a subset of the documents you supplied; leaving it empty runs every supplied document.
+
+#### Resuming an interrupted run
+
+The `corpus_job_id` doubles as the **resume token**. If a run is interrupted (a crash, a restart, a cancellation), start it again with the same documents and pass the prior id as `resume_token`. The run continues the same job and skips every document it already completed, so you never pay to re-extract finished work:
+
+```python
+# A fresh run mints a new corpus_job_id.
+corpus_job_id = client.extraction.start_corpus_reextraction("docs_graph", docs)
+
+# ... the server restarts mid-run ...
+
+# Resume: same documents, prior id as the resume token. Completed documents
+# are skipped; the reported counts stay cumulative across the resume.
+client.extraction.start_corpus_reextraction(
+    "docs_graph", docs, resume_token=corpus_job_id
+)
+```
+
+The counts you read back after a resume are cumulative across the whole run, not just the documents the resumed pass touched. Skipped documents are counted in `skipped_documents` and show up in `status.documents` with a `skipped` state.
+
+#### Partial success across the corpus
+
+Partial success works the same way it does for a single job (see [Resilience and partial success](#resilience-and-partial-success)), lifted to the document level. A single document that finishes with some failed chunks does not fail the whole corpus run: it pushes the master state to `completed_with_errors`, never to `failed`. The master run only reports `failed` when not a single document succeeded across the whole run, which usually points at a setup problem rather than a bad document. Everything that succeeded is in the graph either way. Because a resumed run counts the documents an earlier pass already completed as successes, a resume that re-attempts only documents that keep failing still reports `completed_with_errors`, not a false `failed`.
+
+#### An honest limitation: you supply the document set
+
+SwarnDB does not enumerate the documents in a collection for you. There is no server-side "every document in this collection" call, so "re-extract the whole corpus" really means "re-extract every document you hand me". You decide which `(doc_id, chunks)` pairs make up the corpus and supply them. This is stated plainly here, in the proto comments, and in the SDK docstrings rather than hidden behind the API: the run is only as complete as the set you provide.
+
 ---
 
 ## 5. A note on embeddings
@@ -283,7 +359,7 @@ This keeps the two concerns separate: embeddings are yours, and the extraction L
 
 ## See also
 
-- [Graph as a First-Class Layer](graph-first-class.md): the typed graph, manual curation, and the hybrid query engine that extraction feeds.
+- [Typed Graph: Overview](graph-first-class.md): the typed graph, manual curation, and the hybrid query engine that extraction feeds.
 - [Configuration](configuration.md): `SWARNDB_MASTER_KEY` and the extraction worker, cache, and pricing settings.
 - [API Reference](api-reference.md): the ExtractionService RPCs and REST routes.
 - [Python SDK](python-sdk.md): the full `ExtractionAPI` method reference (sync and async).

@@ -420,14 +420,16 @@ class HybridVectorSimilar(_message.Message):
     def __init__(self, vector: _Optional[_Iterable[float]] = ..., k: _Optional[int] = ..., ef_search: _Optional[int] = ...) -> None: ...
 
 class HybridVectorRank(_message.Message):
-    __slots__ = ("vector", "k", "on_missing")
+    __slots__ = ("vector", "k", "on_missing", "predicate")
     VECTOR_FIELD_NUMBER: _ClassVar[int]
     K_FIELD_NUMBER: _ClassVar[int]
     ON_MISSING_FIELD_NUMBER: _ClassVar[int]
+    PREDICATE_FIELD_NUMBER: _ClassVar[int]
     vector: _containers.RepeatedScalarFieldContainer[float]
     k: int
     on_missing: HybridOnMissingVector
-    def __init__(self, vector: _Optional[_Iterable[float]] = ..., k: _Optional[int] = ..., on_missing: _Optional[_Union[HybridOnMissingVector, str]] = ...) -> None: ...
+    predicate: HybridPredicate
+    def __init__(self, vector: _Optional[_Iterable[float]] = ..., k: _Optional[int] = ..., on_missing: _Optional[_Union[HybridOnMissingVector, str]] = ..., predicate: _Optional[_Union[HybridPredicate, _Mapping]] = ...) -> None: ...
 
 class HybridVector(_message.Message):
     __slots__ = ("values",)

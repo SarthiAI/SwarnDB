@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Chirotpal Das
-// Licensed under the Business Source License 1.1
-// Change Date: 2030-03-06
-// Change License: MIT
+// Licensed under the Elastic License 2.0 (ELv2).
+// See the LICENSE file at the repository root for full terms.
 
 //! An adapter for any OpenAI-compatible chat-completions endpoint. It posts the
 //! system and user prompts in JSON mode, parses the model's JSON content into an
