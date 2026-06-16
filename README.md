@@ -23,7 +23,7 @@ Most teams bolt a vector database to a graph database and then spend their lives
 
 SwarnDB removes the seam. It is a production-grade engine, written in Rust, where **a vector and a graph node are the same object**: one identity, one storage path, one crash-recovery path. So a single query can move between *what is similar* and *what is connected* without ever leaving the engine.
 
-And if all you want is a fast, accurate vector store, that is exactly what you get out of the box. The graph is opt-in, per collection, ready the moment your problem grows past nearest-neighbor.
+And if all you want is a fast, accurate vector store, that is exactly what you get out of the box. When you do want the graph, it is a real, typed graph: directed, typed edges that carry confidence and provenance, which you create explicitly or have an LLM extract. It is not a similarity graph inferred from your vectors. It is opt-in, per collection, ready the moment your problem grows past nearest-neighbor.
 
 <p align="center">
   <img src="assets/diagrams/01-one-store.png" alt="SwarnDB unifies similarity search and a graph into one store, with nothing to sync" width="900">
@@ -33,7 +33,7 @@ And if all you want is a fast, accurate vector store, that is exactly what you g
 
 ## The one idea
 
-In SwarnDB, the id of a vector *is* the id of its graph node. There is no foreign key, no mirror table, no eventual consistency between two stores. The thing you searched for and the thing you traverse from are literally the same row.
+In SwarnDB, the id of a vector *is* the id of its graph node. There is no foreign key, no mirror table, no eventual consistency between two stores. The thing you searched for and the thing you traverse from are literally the same row. Sharing identity is about the node, not the edges: the edges are explicit and typed, the ones you write with `put_edge` or extract with an LLM, never inferred from similarity.
 
 That single decision is what makes a query like this possible: **scope by structure, then rank by meaning, in one plan.**
 
@@ -266,7 +266,7 @@ Opt in per collection via `mode="hybrid"` at create time. All of the following i
 - **Vector math over a graph-built frontier** so analogy, diversity, cone, and centroid operations run exactly over the candidate set the graph produced
 - **Manual edge CRUD and bulk import** with create, read, update, verify, reject, audit history, and CSV/JSONL bulk loading
 
-The virtual graph (SwarnDB's automatic similarity graph) is also available as a separate mode (`mode="auto_similarity"`), off by default.
+Separately, an optional virtual graph (automatic similarity edges, not your typed edges) is available as a secondary mode (`mode="auto_similarity"`), off by default. It is a convenience for similarity-only traversal; the first-class typed graph described above is SwarnDB's graph.
 
 ### Math Engine
 
